@@ -1,4 +1,7 @@
-use std::{env, fs, path::PathBuf};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
 use serde::{de::DeserializeOwned, Serialize};
@@ -8,6 +11,8 @@ use crate::models::{AppConfig, ClipboardData, LaunchData, SearchHistoryData};
 #[derive(Debug, Clone)]
 pub struct AppStore {
     data_dir: PathBuf,
+    organizer_root: PathBuf,
+    launchers_root: PathBuf,
 }
 
 impl AppStore {
@@ -15,26 +20,46 @@ impl AppStore {
         let app_root = app_data_root()?;
         fs::create_dir_all(&app_root).with_context(|| format!("create {}", app_root.display()))?;
 
-        let setting_path = app_root.join("data-path.txt");
-        let data_dir = if setting_path.exists() {
-            let configured = fs::read_to_string(&setting_path)
-                .with_context(|| format!("read {}", setting_path.display()))?
-                .trim()
-                .to_owned();
-            if configured.is_empty() {
-                app_root.join("Data")
-            } else {
-                PathBuf::from(configured)
-            }
-        } else {
-            let default_dir = app_root.join("Data");
-            fs::write(&setting_path, default_dir.to_string_lossy().as_bytes())
-                .with_context(|| format!("write {}", setting_path.display()))?;
-            default_dir
-        };
+        let data_dir = configured_path(&app_root, "data-path.txt", app_root.join("Data"))?;
+        let organizer_root = configured_path(
+            &app_root,
+            "organizer-path.txt",
+            data_dir.join("DesktopOrganizer"),
+        )?;
+        let launchers_root =
+            configured_path(&app_root, "launchers-path.txt", data_dir.join("Launchers"))?;
 
         fs::create_dir_all(&data_dir).with_context(|| format!("create {}", data_dir.display()))?;
-        Ok(Self { data_dir })
+        Ok(Self {
+            data_dir,
+            organizer_root,
+            launchers_root,
+        })
+    }
+
+    pub fn set_runtime_directory(target: &str, path: &Path) -> Result<Self> {
+        if path.as_os_str().is_empty() {
+            anyhow::bail!("目录不能为空");
+        }
+
+        fs::create_dir_all(path).with_context(|| format!("create {}", path.display()))?;
+        let normalized = path
+            .canonicalize()
+            .unwrap_or_else(|_| path.to_path_buf())
+            .display()
+            .to_string();
+        let app_root = app_data_root()?;
+        fs::create_dir_all(&app_root).with_context(|| format!("create {}", app_root.display()))?;
+        let file_name = match target {
+            "data" => "data-path.txt",
+            "organizer" => "organizer-path.txt",
+            "launchers" => "launchers-path.txt",
+            _ => anyhow::bail!("未知目录类型"),
+        };
+
+        fs::write(app_root.join(file_name), normalized.as_bytes())
+            .with_context(|| format!("write {}", file_name))?;
+        Self::open()
     }
 
     pub fn config_path(&self) -> PathBuf {
@@ -62,11 +87,11 @@ impl AppStore {
     }
 
     pub fn organizer_root(&self) -> PathBuf {
-        self.data_dir.join("DesktopOrganizer")
+        self.organizer_root.clone()
     }
 
     pub fn launchers_root(&self) -> PathBuf {
-        self.data_dir.join("Launchers")
+        self.launchers_root.clone()
     }
 
     pub fn ensure_runtime_dirs(&self) -> Result<()> {
@@ -134,4 +159,22 @@ impl AppStore {
 fn app_data_root() -> Result<PathBuf> {
     let appdata = env::var_os("APPDATA").context("APPDATA environment variable is missing")?;
     Ok(PathBuf::from(appdata).join("DustDesk"))
+}
+
+fn configured_path(app_root: &Path, file_name: &str, default_dir: PathBuf) -> Result<PathBuf> {
+    let path_file = app_root.join(file_name);
+    if path_file.exists() {
+        let configured = fs::read_to_string(&path_file)
+            .with_context(|| format!("read {}", path_file.display()))?
+            .trim()
+            .to_owned();
+        if !configured.is_empty() {
+            return Ok(PathBuf::from(configured));
+        }
+    } else {
+        fs::write(&path_file, default_dir.to_string_lossy().as_bytes())
+            .with_context(|| format!("write {}", path_file.display()))?;
+    }
+
+    Ok(default_dir)
 }

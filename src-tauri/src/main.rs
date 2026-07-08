@@ -518,6 +518,65 @@ fn open_special(target: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn update_runtime_directory(target: String, path: String) -> Result<AppSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || update_runtime_directory_impl(target, path))
+        .await
+        .map_err(to_message)?
+}
+
+fn update_runtime_directory_impl(target: String, path: String) -> Result<AppSnapshot, String> {
+    let target = target.trim().to_owned();
+    if !matches!(target.as_str(), "data" | "organizer" | "launchers") {
+        return Err("未知目录类型".to_owned());
+    }
+
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("目录不能为空".to_owned());
+    }
+
+    let old_store = AppStore::open().map_err(to_message)?;
+    let old_data_dir = old_store.data_dir();
+    let old_organizer_root = old_store.organizer_root();
+    let old_launchers_root = old_store.launchers_root();
+    let new_store =
+        AppStore::set_runtime_directory(&target, Path::new(path)).map_err(to_message)?;
+    new_store.ensure_runtime_dirs().map_err(to_message)?;
+    let new_data_dir = new_store.data_dir();
+    let new_organizer_root = new_store.organizer_root();
+    let new_launchers_root = new_store.launchers_root();
+
+    match target.as_str() {
+        "data" => {
+            copy_directory_contents(&old_data_dir, &new_data_dir)?;
+            copy_directory_contents(&old_organizer_root, &new_organizer_root)?;
+            copy_directory_contents(&old_launchers_root, &new_launchers_root)?;
+            rewrite_runtime_path_prefixes(
+                &new_store,
+                &[
+                    (&old_data_dir, &new_data_dir),
+                    (&old_organizer_root, &new_organizer_root),
+                    (&old_launchers_root, &new_launchers_root),
+                ],
+            )?;
+        }
+        "organizer" => {
+            copy_directory_contents(&old_organizer_root, &new_organizer_root)?;
+            rewrite_runtime_path_prefixes(
+                &new_store,
+                &[(&old_organizer_root, &new_organizer_root)],
+            )?;
+        }
+        "launchers" => {
+            copy_directory_contents(&old_launchers_root, &new_launchers_root)?;
+        }
+        _ => {}
+    }
+
+    load_snapshot_impl()
+}
+
+#[tauri::command]
 fn open_path(path: String) -> Result<(), String> {
     open_path_impl(Path::new(&path))
 }
@@ -1371,6 +1430,91 @@ fn normalize_path_input(path: &str) -> Result<String, String> {
         return Err("路径为空".to_owned());
     }
     Ok(trimmed.to_owned())
+}
+
+fn copy_directory_contents(source: &Path, target: &Path) -> Result<(), String> {
+    if !source.exists() {
+        return Ok(());
+    }
+    if !source.is_dir() {
+        return Err(format!("源路径不是目录：{}", source.display()));
+    }
+
+    fs::create_dir_all(target).map_err(to_message)?;
+    let source_key = normalize_path_for_compare(source);
+    let target_key = normalize_path_for_compare(target);
+    if source_key == target_key || target_key.starts_with(&format!("{source_key}\\")) {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(source).map_err(to_message)?.flatten() {
+        let source_path = entry.path();
+        let Some(file_name) = source_path.file_name() else {
+            continue;
+        };
+        let target_path = target.join(file_name);
+        if source_path.is_dir() {
+            copy_directory_contents(&source_path, &target_path)?;
+        } else if !target_path.exists() {
+            fs::copy(&source_path, &target_path).map_err(to_message)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn rewrite_runtime_path_prefixes(
+    store: &AppStore,
+    replacements: &[(&PathBuf, &PathBuf)],
+) -> Result<(), String> {
+    with_config_mutation(|| {
+        let mut config = store.load_config();
+        let mut changed = false;
+
+        for category in &mut config.desktop_categories {
+            for item_path in &mut category.item_paths {
+                if let Some(next_path) = rewrite_path_prefix(item_path, replacements) {
+                    *item_path = next_path;
+                    changed = true;
+                }
+            }
+        }
+
+        for search_path in &mut config.settings.search_paths {
+            if let Some(next_path) = rewrite_path_prefix(search_path, replacements) {
+                *search_path = next_path;
+                changed = true;
+            }
+        }
+
+        if changed {
+            store.save_config(&config).map_err(to_message)?;
+        }
+
+        Ok(())
+    })
+}
+
+fn rewrite_path_prefix(path_text: &str, replacements: &[(&PathBuf, &PathBuf)]) -> Option<String> {
+    let path = PathBuf::from(path_text);
+    for (old_root, new_root) in replacements {
+        if same_path_text(
+            &old_root.display().to_string(),
+            &new_root.display().to_string(),
+        ) || !is_path_within(&path, old_root)
+        {
+            continue;
+        }
+
+        if let Ok(relative) = path.strip_prefix(old_root) {
+            return Some(new_root.join(relative).display().to_string());
+        }
+
+        if let Some(file_name) = path.file_name() {
+            return Some(new_root.join(file_name).display().to_string());
+        }
+    }
+    None
 }
 
 fn same_path_text(left: &str, right: &str) -> bool {
@@ -2944,6 +3088,7 @@ fn main() {
             classify_desktop_items,
             create_desktop_entries,
             open_special,
+            update_runtime_directory,
             open_path,
             start_all_launchers,
             show_desktop_widget,

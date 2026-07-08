@@ -540,6 +540,7 @@ interface DustDeskState {
   mergeDesktopWidgets: () => Promise<void>
   hideCurrentWindow: () => Promise<void>
   openSpecial: (target: "organizer" | "launchers" | "data" | "desktop") => Promise<void>
+  updateRuntimeDirectory: (target: "organizer" | "launchers" | "data", path: string) => Promise<AppSnapshot>
   openPath: (path: string) => Promise<void>
   showPathInFolder: (path: string) => Promise<void>
   startAllLaunchers: () => Promise<number>
@@ -794,6 +795,15 @@ export const useDustDeskStore = create<DustDeskState>()(
     },
     openSpecial: async (target) => {
       await call("open_special", { target })
+    },
+    updateRuntimeDirectory: async (target, path) => {
+      const snapshot = await call<AppSnapshot>("update_runtime_directory", { target, path })
+      set((state) => {
+        state.snapshot = snapshot
+        state.selectedCategory = Math.min(state.selectedCategory, Math.max(0, snapshot.categories.length - 1))
+      })
+      void get().resolveSnapshotIcons({ includeDesktopItems: true })
+      return snapshot
     },
     openPath: async (path) => {
       await call("open_path", { path })

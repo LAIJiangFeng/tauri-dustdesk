@@ -11,6 +11,7 @@ import { truncate } from "@/lib/utils"
 import { useDustDeskStore } from "@/stores/dustdesk-store"
 
 const MODIFIER_CODES = new Set(["ControlLeft", "ControlRight", "ShiftLeft", "ShiftRight", "AltLeft", "AltRight", "MetaLeft", "MetaRight"])
+type RuntimeDirectoryTarget = "data" | "organizer" | "launchers"
 
 function shortcutKeyFromEvent(event: KeyboardEvent) {
   if (MODIFIER_CODES.has(event.code)) return ""
@@ -35,6 +36,7 @@ function shortcutFromEvent(event: KeyboardEvent) {
 export function SettingsPage() {
   const snapshot = useDustDeskStore((state) => state.snapshot)
   const openSpecial = useDustDeskStore((state) => state.openSpecial)
+  const updateRuntimeDirectory = useDustDeskStore((state) => state.updateRuntimeDirectory)
   const updateClipboardShortcut = useDustDeskStore((state) => state.updateClipboardShortcut)
   const updateSearchSettings = useDustDeskStore((state) => state.updateSearchSettings)
   const shortcutInputRef = useRef<HTMLInputElement | null>(null)
@@ -50,6 +52,9 @@ export function SettingsPage() {
   const [searchPathInput, setSearchPathInput] = useState("")
   const [isRecordingSearchShortcut, setIsRecordingSearchShortcut] = useState(false)
   const [isSavingSearch, setIsSavingSearch] = useState(false)
+  const [savingDirectoryTarget, setSavingDirectoryTarget] = useState<RuntimeDirectoryTarget | "">("")
+  const [directoryError, setDirectoryError] = useState("")
+  const [directorySuccess, setDirectorySuccess] = useState("")
   const [searchError, setSearchError] = useState("")
   const [searchSuccess, setSearchSuccess] = useState("")
   const effectiveSearchPaths = searchPathsDraft.length > 0 ? searchPathsDraft : [snapshot.organizer_root].filter(Boolean)
@@ -215,6 +220,29 @@ export function SettingsPage() {
     setSearchPathsDraft((paths) => paths.filter((_, itemIndex) => itemIndex !== index))
     setSearchError("")
     setSearchSuccess("")
+  }
+
+  const chooseRuntimeDirectory = async (target: RuntimeDirectoryTarget, currentPath: string) => {
+    setDirectoryError("")
+    setDirectorySuccess("")
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: `选择${runtimeDirectoryLabel(target)}`,
+        defaultPath: currentPath || undefined,
+      })
+      if (typeof selected !== "string") return
+
+      setSavingDirectoryTarget(target)
+      const snapshot = await updateRuntimeDirectory(target, selected)
+      setSearchPathsDraft(snapshot.settings.search_paths)
+      setDirectorySuccess(`${runtimeDirectoryLabel(target)}已修改`)
+    } catch (reason) {
+      setDirectoryError(reason instanceof Error ? reason.message : String(reason))
+    } finally {
+      setSavingDirectoryTarget("")
+    }
   }
 
   return (
@@ -433,6 +461,8 @@ export function SettingsPage() {
           <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
             {rows.map((row) => {
               const Icon = row.icon
+              const directoryTarget: RuntimeDirectoryTarget | null = row.target === "desktop" ? null : row.target
+              const isSavingDirectory = Boolean(directoryTarget && savingDirectoryTarget === directoryTarget)
               return (
                 <Card key={row.name}>
                   <CardContent className="flex min-h-56 flex-col gap-4 p-5">
@@ -445,18 +475,38 @@ export function SettingsPage() {
                         {truncate(row.value || "等待读取", 98)}
                       </p>
                     </div>
-                    <Button className="mt-auto" variant="secondary" size="sm" onClick={() => void openSpecial(row.target)}>
-                      打开
-                    </Button>
+                    <div className="mt-auto grid gap-2">
+                      <Button variant="secondary" size="sm" onClick={() => void openSpecial(row.target)}>
+                        打开
+                      </Button>
+                      {directoryTarget ? (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={isSavingDirectory}
+                          onClick={() => void chooseRuntimeDirectory(directoryTarget, row.value)}
+                        >
+                          {isSavingDirectory ? "修改中" : "修改目录"}
+                        </Button>
+                      ) : null}
+                    </div>
                   </CardContent>
                 </Card>
               )
             })}
           </div>
+          {directorySuccess ? <p className="mt-3 text-xs leading-5 text-emerald-600 dark:text-emerald-400">{directorySuccess}</p> : null}
+          {directoryError ? <p className="mt-3 text-xs leading-5 text-destructive">{directoryError}</p> : null}
         </ScrollArea>
       </CardContent>
     </Card>
   )
+}
+
+function runtimeDirectoryLabel(target: RuntimeDirectoryTarget) {
+  if (target === "data") return "数据目录"
+  if (target === "organizer") return "收纳目录"
+  return "快捷启动目录"
 }
 
 function defaultSearchPaths(organizerRoot: string, paths: string[]) {

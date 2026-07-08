@@ -1,0 +1,89 @@
+name: Release Windows Installer
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows-installer:
+    name: Build Windows NSIS installer
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build installer
+        run: npx tauri build --bundles nsis
+        env:
+          CARGO_BUILD_JOBS: 1
+
+      - name: Read app version
+        id: app
+        shell: pwsh
+        run: |
+          $config = Get-Content -Raw src-tauri/tauri.conf.json | ConvertFrom-Json
+          $version = [string]$config.version
+          $tag = "v$version-${{ github.run_number }}"
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Collect installer
+        id: installer
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem -Path src-tauri/target/release/bundle/nsis -Filter "*.exe" -Recurse |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+
+          if (-not $installer) {
+            throw "NSIS installer exe was not found."
+          }
+
+          $outDir = "release-assets"
+          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+          $assetName = "DustDesk-${{ steps.app.outputs.version }}-windows-x64-setup.exe"
+          $assetPath = Join-Path $outDir $assetName
+          Copy-Item -LiteralPath $installer.FullName -Destination $assetPath -Force
+
+          "asset_path=$assetPath" >> $env:GITHUB_OUTPUT
+          "asset_name=$assetName" >> $env:GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.app.outputs.tag }}
+          name: DustDesk ${{ steps.app.outputs.version }} build ${{ github.run_number }}
+          body: |
+            Windows installer for DustDesk.
+
+            Download the `.exe` installer below. The installer supports selecting an install directory and defaults to a DustDesk folder.
+          files: ${{ steps.installer.outputs.asset_path }}
+          overwrite_files: true
+          make_latest: true

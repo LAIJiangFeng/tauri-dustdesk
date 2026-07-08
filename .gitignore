@@ -1,0 +1,48 @@
+# Dependencies
+node_modules/
+
+# Frontend build output
+dist/
+
+# Tauri / Rust build output
+src-tauri/target/
+target/
+
+# Runtime logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# TypeScript incremental build cache
+*.tsbuildinfo
+
+# Generated JavaScript from local TypeScript config compilation
+vite.config.js
+vite.config.d.ts
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# OS / editor files
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Tauri signing and updater secrets
+*.p12
+*.pfx
+*.key
+*.pem
+*.sig
+
+# Release staging artifacts
+release-assets/

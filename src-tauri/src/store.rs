@@ -17,17 +17,29 @@ pub struct AppStore {
 
 impl AppStore {
     pub fn open() -> Result<Self> {
-        let app_root = app_data_root()?;
-        fs::create_dir_all(&app_root).with_context(|| format!("create {}", app_root.display()))?;
+        let settings_root = app_settings_root()?;
+        let install_root = app_install_root()?;
+        fs::create_dir_all(&settings_root)
+            .with_context(|| format!("create {}", settings_root.display()))?;
 
-        let data_dir = configured_path(&app_root, "data-path.txt", app_root.join("Data"))?;
-        let organizer_root = configured_path(
-            &app_root,
-            "organizer-path.txt",
-            data_dir.join("DesktopOrganizer"),
+        let data_dir = configured_path(
+            &settings_root,
+            "data-path.txt",
+            install_root.join("Data"),
+            &[settings_root.join("Data")],
         )?;
-        let launchers_root =
-            configured_path(&app_root, "launchers-path.txt", data_dir.join("Launchers"))?;
+        let organizer_root = configured_path(
+            &settings_root,
+            "organizer-path.txt",
+            install_root.join("DesktopOrganizer"),
+            &[settings_root.join("Data").join("DesktopOrganizer")],
+        )?;
+        let launchers_root = configured_path(
+            &settings_root,
+            "launchers-path.txt",
+            install_root.join("Launchers"),
+            &[settings_root.join("Data").join("Launchers")],
+        )?;
 
         fs::create_dir_all(&data_dir).with_context(|| format!("create {}", data_dir.display()))?;
         Ok(Self {
@@ -48,8 +60,9 @@ impl AppStore {
             .unwrap_or_else(|_| path.to_path_buf())
             .display()
             .to_string();
-        let app_root = app_data_root()?;
-        fs::create_dir_all(&app_root).with_context(|| format!("create {}", app_root.display()))?;
+        let settings_root = app_settings_root()?;
+        fs::create_dir_all(&settings_root)
+            .with_context(|| format!("create {}", settings_root.display()))?;
         let file_name = match target {
             "data" => "data-path.txt",
             "organizer" => "organizer-path.txt",
@@ -57,7 +70,7 @@ impl AppStore {
             _ => anyhow::bail!("未知目录类型"),
         };
 
-        fs::write(app_root.join(file_name), normalized.as_bytes())
+        fs::write(settings_root.join(file_name), normalized.as_bytes())
             .with_context(|| format!("write {}", file_name))?;
         Self::open()
     }
@@ -156,20 +169,43 @@ impl AppStore {
     }
 }
 
-fn app_data_root() -> Result<PathBuf> {
+fn app_settings_root() -> Result<PathBuf> {
     let appdata = env::var_os("APPDATA").context("APPDATA environment variable is missing")?;
     Ok(PathBuf::from(appdata).join("DustDesk"))
 }
 
-fn configured_path(app_root: &Path, file_name: &str, default_dir: PathBuf) -> Result<PathBuf> {
-    let path_file = app_root.join(file_name);
+fn app_install_root() -> Result<PathBuf> {
+    let executable = env::current_exe().context("current executable path is unavailable")?;
+    executable
+        .parent()
+        .map(Path::to_path_buf)
+        .context("current executable parent directory is unavailable")
+}
+
+fn configured_path(
+    settings_root: &Path,
+    file_name: &str,
+    default_dir: PathBuf,
+    legacy_defaults: &[PathBuf],
+) -> Result<PathBuf> {
+    let path_file = settings_root.join(file_name);
     if path_file.exists() {
         let configured = fs::read_to_string(&path_file)
             .with_context(|| format!("read {}", path_file.display()))?
             .trim()
             .to_owned();
         if !configured.is_empty() {
-            return Ok(PathBuf::from(configured));
+            let configured_path = PathBuf::from(&configured);
+            if legacy_defaults
+                .iter()
+                .any(|legacy| same_path_for_config(&configured_path, legacy))
+            {
+                fs::write(&path_file, default_dir.to_string_lossy().as_bytes())
+                    .with_context(|| format!("write {}", path_file.display()))?;
+                return Ok(default_dir);
+            }
+
+            return Ok(configured_path);
         }
     } else {
         fs::write(&path_file, default_dir.to_string_lossy().as_bytes())
@@ -177,4 +213,15 @@ fn configured_path(app_root: &Path, file_name: &str, default_dir: PathBuf) -> Re
     }
 
     Ok(default_dir)
+}
+
+fn same_path_for_config(left: &Path, right: &Path) -> bool {
+    normalize_path_for_config(left) == normalize_path_for_config(right)
+}
+
+fn normalize_path_for_config(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
 }

@@ -64,9 +64,9 @@ let desktopSnapshotLoadPromise: Promise<void> | null = null
 let desktopSnapshotLoadedAt = 0
 
 const demoSnapshot: AppSnapshot = {
-  data_dir: "%APPDATA%\\DustDesk\\Data",
-  organizer_root: "%APPDATA%\\DustDesk\\Data\\DesktopOrganizer",
-  launchers_root: "%APPDATA%\\DustDesk\\Data\\Launchers",
+  data_dir: "<安装目录>\\Data",
+  organizer_root: "<安装目录>\\DesktopOrganizer",
+  launchers_root: "<安装目录>\\Launchers",
   settings: defaultSettings,
   categories: [
     { name: "开发", is_collapsed: false, item_paths: [], item_details: [] },

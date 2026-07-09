@@ -128,7 +128,13 @@ export function DesktopWidgetPage() {
   const [isClassifyingDesktop, setIsClassifyingDesktop] = useState(false)
   const [isRestoringDesktop, setIsRestoringDesktop] = useState(false)
   const [isMergingCategories, setIsMergingCategories] = useState(false)
-  const desktopOperationLabel = isClassifyingDesktop ? "正在智能收纳桌面..." : isRestoringDesktop ? "正在还原桌面..." : isMergingCategories ? "正在合并分类..." : ""
+  const desktopOperationLabel = isClassifyingDesktop
+    ? notice || "正在智能收纳桌面..."
+    : isRestoringDesktop
+      ? notice || "正在还原桌面..."
+      : isMergingCategories
+        ? "正在合并分类..."
+        : ""
   const hasSnapshot = Boolean(snapshot.data_dir)
   const dragRef = useRef<{
     id: string
@@ -193,9 +199,20 @@ export function DesktopWidgetPage() {
     let unlisten: (() => void) | undefined
     void safeListen<DesktopOperationEvent>("dustdesk://desktop-operation", (event) => {
       const payload = event.payload
-      if (payload.status === "started") return
+      if (payload.status === "started") {
+        setNotice(payload.message)
+        if (payload.kind === "classify") {
+          setIsClassifyingDesktop(true)
+        } else if (payload.kind === "restore") {
+          setIsRestoringDesktop(true)
+        }
+        return
+      }
       if (payload.status === "progress") {
         setNotice(payload.message)
+        if (payload.kind === "restore") {
+          setIsRestoringDesktop(true)
+        }
         return
       }
       if (payload.kind === "classify") {

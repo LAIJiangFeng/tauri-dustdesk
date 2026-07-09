@@ -47,7 +47,13 @@ export function OrganizerPage() {
   const [isRestoringDesktop, setIsRestoringDesktop] = useState(false)
   const [isMergingCategories, setIsMergingCategories] = useState(false)
   const deferredQuery = useDeferredValue(query.trim().toLowerCase())
-  const desktopOperationLabel = isClassifyingDesktop ? "正在智能收纳桌面..." : isRestoringDesktop ? "正在还原桌面..." : isMergingCategories ? "正在合并分类..." : ""
+  const desktopOperationLabel = isClassifyingDesktop
+    ? (notice ?? "正在智能收纳桌面...")
+    : isRestoringDesktop
+      ? (notice ?? "正在还原桌面...")
+      : isMergingCategories
+        ? "正在合并分类..."
+        : ""
   const category = snapshot.categories[selectedCategory]
   const desktopItems = deferredQuery
     ? snapshot.desktop_items.filter((item) => `${item.name} ${item.path} ${item.extension}`.toLowerCase().includes(deferredQuery))
@@ -103,9 +109,20 @@ export function OrganizerPage() {
     let unlisten: (() => void) | undefined
     void safeListen<DesktopOperationEvent>("dustdesk://desktop-operation", (event) => {
       const payload = event.payload
-      if (payload.status === "started") return
+      if (payload.status === "started") {
+        setNotice(payload.message)
+        if (payload.kind === "classify") {
+          setIsClassifyingDesktop(true)
+        } else if (payload.kind === "restore") {
+          setIsRestoringDesktop(true)
+        }
+        return
+      }
       if (payload.status === "progress") {
         setNotice(payload.message)
+        if (payload.kind === "restore") {
+          setIsRestoringDesktop(true)
+        }
         return
       }
       if (payload.kind === "classify") {

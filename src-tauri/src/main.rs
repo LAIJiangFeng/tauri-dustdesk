@@ -4287,10 +4287,43 @@ fn request_real_app_exit(app: tauri::AppHandle) {
     }
 
     tauri::async_runtime::spawn_blocking(move || {
-        cleanup_desktop_card_windows_impl(&app);
-        if let Err(error) = restore_all_organized_items_to_desktop_and_clear_markers() {
+        emit_desktop_operation(
+            &app,
+            DesktopOperationPayload {
+                kind: "restore",
+                status: "started",
+                message: "正在退出并还原桌面...".to_owned(),
+                moved: 0,
+                skipped: 0,
+                restored: 0,
+                total: 0,
+                current_path: String::new(),
+                category_counts: Vec::new(),
+            },
+        );
+
+        let progress_app = app.clone();
+        if let Err(error) =
+            restore_all_organized_items_to_desktop_with_progress(move |current, total, path| {
+                emit_desktop_operation(
+                    &progress_app,
+                    DesktopOperationPayload {
+                        kind: "restore",
+                        status: "progress",
+                        message: restore_progress_message(current, total, path),
+                        moved: 0,
+                        skipped: 0,
+                        restored: current,
+                        total,
+                        current_path: path.display().to_string(),
+                        category_counts: Vec::new(),
+                    },
+                );
+            })
+        {
             eprintln!("failed to restore organized desktop items on exit: {error}");
         }
+        cleanup_desktop_card_windows_impl(&app);
         app.exit(0);
     });
 }

@@ -39,14 +39,15 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { usePersistCurrentWindowLayout } from "@/hooks/use-persist-current-window-layout"
 import { useTheme } from "@/hooks/use-theme"
-import { allowPathLikeDrag, didDragEndOutsideWindow, readDustDeskPathDrag, writeDustDeskPathDrag } from "@/lib/dustdesk-dnd"
 import {
-  repaintCurrentWindow,
-  safeCurrentWebviewDragDropEvent,
-  safeListen,
-  startCurrentWindowDragging,
-  startCurrentWindowResizeDragging,
-} from "@/lib/tauri-window"
+  allowPathLikeDrag,
+  desktopDropPositionFromDragEnd,
+  didDragEndOutsideWindow,
+  readDustDeskPathDrag,
+  type DesktopDropPosition,
+  writeDustDeskPathDrag,
+} from "@/lib/dustdesk-dnd"
+import { repaintCurrentWindow, safeCurrentWebviewDragDropEvent, safeListen, startCurrentWindowDragging, startCurrentWindowResizeDragging } from "@/lib/tauri-window"
 import { cn, displayPathName, extensionFromPath } from "@/lib/utils"
 import { useDustDeskStore } from "@/stores/dustdesk-store"
 import type { DesktopItem, DesktopOperationEvent } from "@/types"
@@ -129,8 +130,18 @@ export function DesktopWidgetPage() {
   const [isMergingCategories, setIsMergingCategories] = useState(false)
   const desktopOperationLabel = isClassifyingDesktop ? "正在智能收纳桌面..." : isRestoringDesktop ? "正在还原桌面..." : isMergingCategories ? "正在合并分类..." : ""
   const hasSnapshot = Boolean(snapshot.data_dir)
-  const dragRef = useRef<{ id: string; x: number; y: number; rect: CardLayout } | null>(null)
-  const resizeRef = useRef<{ id: string; x: number; y: number; rect: CardLayout } | null>(null)
+  const dragRef = useRef<{
+    id: string
+    x: number
+    y: number
+    rect: CardLayout
+  } | null>(null)
+  const resizeRef = useRef<{
+    id: string
+    x: number
+    y: number
+    rect: CardLayout
+  } | null>(null)
   const pendingClassifyActionRef = useRef<"split-all" | null>(null)
   const previousSplitCategoryIndicesRef = useRef<number[]>([])
 
@@ -151,10 +162,7 @@ export function DesktopWidgetPage() {
   }, [snapshot.categories])
 
   const splitCategorySet = useMemo(() => new Set(splitCategoryIndices), [splitCategoryIndices])
-  const groupedCategories = useMemo(
-    () => categories.filter((category) => !splitCategorySet.has(category.index)),
-    [categories, splitCategorySet],
-  )
+  const groupedCategories = useMemo(() => categories.filter((category) => !splitCategorySet.has(category.index)), [categories, splitCategorySet])
   const activeCategory = groupedCategories.find((category) => category.id === activeCategoryId) ?? groupedCategories[0]
 
   useEffect(() => {
@@ -259,24 +267,23 @@ export function DesktopWidgetPage() {
     let unlisten: (() => void) | undefined
 
     void safeCurrentWebviewDragDropEvent((event) => {
-        const payload = event.payload
-        if (payload.type === "leave") {
-          setHoverZone("")
-          return
-        }
-
-        const zone = "position" in payload ? dropZoneFromPoint(payload.position.x, payload.position.y) : ""
-        setHoverZone(zone)
-
-        if (payload.type !== "drop") return
+      const payload = event.payload
+      if (payload.type === "leave") {
         setHoverZone("")
-        const target = parseDropTarget(zone || activeCategory?.id || "category:0")
-        if (!target) return
-        void handleDroppedPaths(target, payload.paths)
-      })
-      .then((value) => {
-        unlisten = value
-      })
+        return
+      }
+
+      const zone = "position" in payload ? dropZoneFromPoint(payload.position.x, payload.position.y) : ""
+      setHoverZone(zone)
+
+      if (payload.type !== "drop") return
+      setHoverZone("")
+      const target = parseDropTarget(zone || activeCategory?.id || "category:0")
+      if (!target) return
+      void handleDroppedPaths(target, payload.paths)
+    }).then((value) => {
+      unlisten = value
+    })
 
     return () => {
       unlisten?.()
@@ -342,9 +349,9 @@ export function DesktopWidgetPage() {
     }
   }
 
-  async function handleRestoreDragOut(index: number, path: string) {
+  async function handleRestoreDragOut(index: number, path: string, position: DesktopDropPosition) {
     try {
-      const restored = await restoreItemToDesktopLight(index, path)
+      const restored = await restoreItemToDesktopLight(index, path, position)
       setNotice(`已移回桌面：${displayPathName(restored)}`)
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error))
@@ -650,7 +657,11 @@ export function DesktopWidgetPage() {
         )}
         {desktopOperationLabel ? <WidgetOperationOverlay label={desktopOperationLabel} /> : null}
       </section>
-      {notice ? <div className="pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full bg-slate-950/70 px-3 py-1 text-xs text-white/80 ring-1 ring-white/10">{notice}</div> : null}
+      {notice ? (
+        <div className="pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full bg-slate-950/70 px-3 py-1 text-xs text-white/80 ring-1 ring-white/10">
+          {notice}
+        </div>
+      ) : null}
       <button
         type="button"
         className="no-drag absolute bottom-0 right-0 size-6 cursor-nwse-resize rounded-br-2xl border-b-2 border-r-2 border-white/35"
@@ -770,18 +781,8 @@ function OrganizerTop({
 }) {
   return (
     <div className="no-drag flex h-12 shrink-0 items-center gap-2 border-b border-white/10 px-2">
-      <CategoryScroller
-        categories={categories}
-        activeId={activeId}
-        hoverZone={hoverZone}
-        onActiveChange={onActiveChange}
-        onSplitCategory={onSplitCategory}
-      />
-      <FrameActions
-        menuProps={menuProps}
-        openSettings={openSettings}
-        onOpenSettings={onOpenSettings}
-      />
+      <CategoryScroller categories={categories} activeId={activeId} hoverZone={hoverZone} onActiveChange={onActiveChange} onSplitCategory={onSplitCategory} />
+      <FrameActions menuProps={menuProps} openSettings={openSettings} onOpenSettings={onOpenSettings} />
     </div>
   )
 }
@@ -805,11 +806,7 @@ function CategoryFrameTop({
         <span className="truncate text-sm font-semibold">{category.label}</span>
         <Badge className="bg-white/10 text-white hover:bg-white/10">{category.count}</Badge>
       </button>
-      <FrameActions
-        menuProps={menuProps}
-        openSettings={openSettings}
-        onOpenSettings={onOpenSettings}
-      />
+      <FrameActions menuProps={menuProps} openSettings={openSettings} onOpenSettings={onOpenSettings} />
     </div>
   )
 }
@@ -834,24 +831,12 @@ function LauncherTop({
         <RocketLaunch className="size-3.5" weight="duotone" />
         启动
       </Button>
-      <FrameActions
-        menuProps={menuProps}
-        openSettings={openSettings}
-        onOpenSettings={onOpenSettings}
-      />
+      <FrameActions menuProps={menuProps} openSettings={openSettings} onOpenSettings={onOpenSettings} />
     </div>
   )
 }
 
-function FrameActions({
-  menuProps,
-  openSettings,
-  onOpenSettings,
-}: {
-  menuProps: SettingsMenuProps
-  openSettings: boolean
-  onOpenSettings: () => void
-}) {
+function FrameActions({ menuProps, openSettings, onOpenSettings }: { menuProps: SettingsMenuProps; openSettings: boolean; onOpenSettings: () => void }) {
   return (
     <div className="relative shrink-0">
       <Button size="icon-sm" variant="secondary" onClick={onOpenSettings}>
@@ -908,28 +893,19 @@ function SettingsMenu({
 
 function MenuButton({ icon: Icon, label, disabled, onClick }: { icon: Icon; label: string; disabled?: boolean; onClick: () => void }) {
   return (
-    <button type="button" disabled={disabled} className="flex w-full items-center gap-1.5 rounded-lg px-2 py-1 text-left text-[11px] font-semibold text-white/80 transition hover:bg-white/10 hover:text-white disabled:cursor-wait disabled:opacity-55" onClick={onClick}>
+    <button
+      type="button"
+      disabled={disabled}
+      className="flex w-full items-center gap-1.5 rounded-lg px-2 py-1 text-left text-[11px] font-semibold text-white/80 transition hover:bg-white/10 hover:text-white disabled:cursor-wait disabled:opacity-55"
+      onClick={onClick}
+    >
       <Icon className="size-3.5" weight="duotone" />
       <span>{label}</span>
     </button>
   )
 }
 
-function RangeRow({
-  label,
-  min,
-  max,
-  step,
-  value,
-  onChange,
-}: {
-  label: string
-  min: number
-  max: number
-  step: number
-  value: number
-  onChange: (value: number) => void
-}) {
+function RangeRow({ label, min, max, step, value, onChange }: { label: string; min: number; max: number; step: number; value: number; onChange: (value: number) => void }) {
   return (
     <label className="block rounded-lg px-2 py-1 text-[11px] font-semibold text-white/80">
       <span className="mb-1 flex justify-between">
@@ -974,12 +950,7 @@ function CategoryScroller({
               hoverZone === category.id && "bg-emerald-300/25 text-white ring-1 ring-emerald-200/50",
             )}
           >
-            <button
-              type="button"
-              className="inline-flex min-w-0 items-center gap-1.5 rounded-l-xl px-2.5 py-1.5"
-              title="点击切换分类"
-              onClick={() => onActiveChange(category.id)}
-            >
+            <button type="button" className="inline-flex min-w-0 items-center gap-1.5 rounded-l-xl px-2.5 py-1.5" title="点击切换分类" onClick={() => onActiveChange(category.id)}>
               <Icon className="size-4 shrink-0" weight="duotone" style={{ color: category.color }} />
               <span className="max-w-24 truncate">{category.label}</span>
               <span className="rounded-full bg-white/10 px-1.5 text-[10px] text-white/60">{category.count}</span>
@@ -1014,7 +985,7 @@ function CategoryItems({
   onOpen: (path: string) => Promise<void>
   onShowInFolder: (path: string) => Promise<void>
   onRestoreToDesktop: (index: number, path: string) => Promise<string>
-  onRestoreDragOut: (index: number, path: string) => Promise<void>
+  onRestoreDragOut: (index: number, path: string, position: DesktopDropPosition) => Promise<void>
 }) {
   const items = category?.item_details ?? []
   if (items.length === 0) {
@@ -1036,11 +1007,25 @@ function CategoryItems({
             dragEffectAllowed="copyMove"
             settings={settings}
             onOpen={onOpen}
-            onDragEndOutside={() => onRestoreDragOut(categoryIndex, item.path)}
+            onDragEndOutside={(position) => onRestoreDragOut(categoryIndex, item.path, position)}
             actions={[
-              { label: "打开", icon: "open", onSelect: () => onOpen(item.path) },
-              { label: "在资源管理器中显示", icon: "folder", onSelect: () => onShowInFolder(item.path) },
-              { label: "移回桌面", icon: "restore", onSelect: async () => { await onRestoreToDesktop(categoryIndex, item.path) } },
+              {
+                label: "打开",
+                icon: "open",
+                onSelect: () => onOpen(item.path),
+              },
+              {
+                label: "在资源管理器中显示",
+                icon: "folder",
+                onSelect: () => onShowInFolder(item.path),
+              },
+              {
+                label: "移回桌面",
+                icon: "restore",
+                onSelect: async () => {
+                  await onRestoreToDesktop(categoryIndex, item.path)
+                },
+              },
             ]}
           />
         ))}
@@ -1083,9 +1068,22 @@ function LauncherItems({
               settings={settings}
               onOpen={onOpen}
               actions={[
-                { label: "启动", icon: "open", onSelect: () => onOpen(item.path) },
-                { label: "在资源管理器中显示", icon: "folder", onSelect: () => onShowInFolder(item.path) },
-                { label: "从快捷启动移除", icon: "remove", tone: "danger", onSelect: () => onRemoveLauncher(item.path) },
+                {
+                  label: "启动",
+                  icon: "open",
+                  onSelect: () => onOpen(item.path),
+                },
+                {
+                  label: "在资源管理器中显示",
+                  icon: "folder",
+                  onSelect: () => onShowInFolder(item.path),
+                },
+                {
+                  label: "从快捷启动移除",
+                  icon: "remove",
+                  tone: "danger",
+                  onSelect: () => onRemoveLauncher(item.path),
+                },
               ]}
             />
           ))}
@@ -1133,7 +1131,7 @@ function WidgetItem({
   dragEffectAllowed?: DataTransfer["effectAllowed"]
   settings: WidgetSettings
   onOpen: (path: string) => Promise<void>
-  onDragEndOutside?: () => unknown
+  onDragEndOutside?: (position: DesktopDropPosition) => unknown
   actions?: ItemContextMenuAction[]
 }) {
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null)
@@ -1150,7 +1148,7 @@ function WidgetItem({
       }}
       onDragEnd={(event: ReactDragEvent<HTMLButtonElement>) => {
         if (!dragPath || !onDragEndOutside || !didDragEndOutsideWindow(event)) return
-        void Promise.resolve(onDragEndOutside()).catch(() => undefined)
+        void Promise.resolve(onDragEndOutside(desktopDropPositionFromDragEnd(event))).catch(() => undefined)
       }}
       onDoubleClick={() => void onOpen(path)}
       onContextMenu={(event) => {
@@ -1196,7 +1194,10 @@ function layoutFor(id: string, index: number, layouts: Record<string, CardLayout
 function frameIndex(id: string, categories: CategoryTab[]) {
   if (id === "organizer") return 0
   if (id === "launcher") return 1
-  return Math.max(0, categories.findIndex((category) => category.id === id))
+  return Math.max(
+    0,
+    categories.findIndex((category) => category.id === id),
+  )
 }
 
 function dropZoneFromPoint(physicalX: number, physicalY: number) {

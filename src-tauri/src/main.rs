@@ -23,7 +23,7 @@ use models::{
     PathIconResult, SearchHistoryData, SearchHistoryItem, SearchItem, SearchItemKind,
     SearchOverlayData,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use store::AppStore;
 use tauri::{
     menu::{Menu, MenuItem},
@@ -64,6 +64,14 @@ struct DesktopOperationPayload {
     skipped: usize,
     restored: usize,
     category_counts: Vec<CategoryClassifyCount>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopDropPosition {
+    screen_x: f64,
+    screen_y: f64,
+    scale_factor: Option<f64>,
 }
 
 #[tauri::command]
@@ -306,16 +314,20 @@ async fn restore_item_to_desktop(
     app: tauri::AppHandle,
     index: usize,
     path: String,
+    position: Option<DesktopDropPosition>,
 ) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || restore_item_to_desktop_impl(&app, index, path))
-        .await
-        .map_err(to_message)?
+    tauri::async_runtime::spawn_blocking(move || {
+        restore_item_to_desktop_impl(&app, index, path, position)
+    })
+    .await
+    .map_err(to_message)?
 }
 
 fn restore_item_to_desktop_impl(
     app: &tauri::AppHandle,
     index: usize,
     path: String,
+    position: Option<DesktopDropPosition>,
 ) -> Result<String, String> {
     let restored_path = with_config_mutation(|| {
         let path = normalize_path_input(&path)?;
@@ -328,6 +340,7 @@ fn restore_item_to_desktop_impl(
         store.save_config(&config).map_err(to_message)?;
         Ok(restored_path)
     })?;
+    position_desktop_icon(&restored_path, position);
     emit_desktop_cards_changed(app);
     Ok(restored_path.display().to_string())
 }
@@ -1516,6 +1529,380 @@ fn restore_path_to_desktop(source: &Path, desktop: &Path) -> Result<PathBuf, Str
 fn notify_shell_desktop_restore(path: &Path, desktop: &Path) {
     notify_shell_path_created(path);
     notify_shell_directory_updated(desktop);
+}
+
+#[cfg(windows)]
+fn position_desktop_icon(path: &Path, position: Option<DesktopDropPosition>) {
+    let Some((screen_x, screen_y)) = desktop_drop_position_to_physical(position) else {
+        return;
+    };
+
+    for _ in 0..12 {
+        if let Some(listview) = desktop_listview_window() {
+            if let Some(index) = desktop_listview_find_item(listview, path) {
+                if desktop_listview_set_item_position(listview, index, screen_x, screen_y) {
+                    return;
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(60));
+    }
+}
+
+#[cfg(not(windows))]
+fn position_desktop_icon(_path: &Path, _position: Option<DesktopDropPosition>) {}
+
+#[cfg(windows)]
+fn desktop_drop_position_to_physical(position: Option<DesktopDropPosition>) -> Option<(i32, i32)> {
+    let position = position?;
+    if !position.screen_x.is_finite() || !position.screen_y.is_finite() {
+        return None;
+    }
+
+    let scale_factor = position
+        .scale_factor
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(1.0);
+    let x = (position.screen_x * scale_factor).round();
+    let y = (position.screen_y * scale_factor).round();
+
+    Some((f64_to_i32_saturating(x), f64_to_i32_saturating(y)))
+}
+
+#[cfg(windows)]
+fn f64_to_i32_saturating(value: f64) -> i32 {
+    if value < i32::MIN as f64 {
+        i32::MIN
+    } else if value > i32::MAX as f64 {
+        i32::MAX
+    } else {
+        value as i32
+    }
+}
+
+#[cfg(windows)]
+fn desktop_listview_window() -> Option<windows_sys::Win32::Foundation::HWND> {
+    use std::ptr::{null, null_mut};
+
+    use windows_sys::Win32::UI::WindowsAndMessaging::{EnumWindows, FindWindowW};
+
+    unsafe {
+        let progman = FindWindowW(windows_sys::core::w!("Progman"), null());
+        if let Some(listview) = desktop_listview_under_window(progman) {
+            return Some(listview);
+        }
+
+        let mut listview: windows_sys::Win32::Foundation::HWND = null_mut();
+        EnumWindows(
+            Some(enum_desktop_listview_window),
+            (&mut listview as *mut _) as isize,
+        );
+        if listview.is_null() {
+            return None;
+        }
+        Some(listview)
+    }
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn enum_desktop_listview_window(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    lparam: windows_sys::Win32::Foundation::LPARAM,
+) -> windows_sys::core::BOOL {
+    if let Some(listview) = unsafe { desktop_listview_under_window(hwnd) } {
+        unsafe {
+            *(lparam as *mut windows_sys::Win32::Foundation::HWND) = listview;
+        }
+        return 0;
+    }
+    1
+}
+
+#[cfg(windows)]
+unsafe fn desktop_listview_under_window(
+    parent: windows_sys::Win32::Foundation::HWND,
+) -> Option<windows_sys::Win32::Foundation::HWND> {
+    use std::ptr::{null, null_mut};
+
+    use windows_sys::Win32::UI::WindowsAndMessaging::FindWindowExW;
+
+    if parent.is_null() {
+        return None;
+    }
+
+    let shell_view = unsafe {
+        FindWindowExW(
+            parent,
+            null_mut(),
+            windows_sys::core::w!("SHELLDLL_DefView"),
+            null(),
+        )
+    };
+    if shell_view.is_null() {
+        return None;
+    }
+
+    let listview = unsafe {
+        FindWindowExW(
+            shell_view,
+            null_mut(),
+            windows_sys::core::w!("SysListView32"),
+            null(),
+        )
+    };
+    if listview.is_null() {
+        None
+    } else {
+        Some(listview)
+    }
+}
+
+#[cfg(windows)]
+fn desktop_listview_find_item(
+    listview: windows_sys::Win32::Foundation::HWND,
+    path: &Path,
+) -> Option<i32> {
+    let candidates = desktop_icon_name_candidates(path);
+    if candidates.is_empty() {
+        return None;
+    }
+
+    for candidate in candidates {
+        if let Some(index) = desktop_listview_find_text(listview, &candidate) {
+            return Some(index);
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn desktop_icon_name_candidates(path: &Path) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Some(file_name) = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+    {
+        push_unique_string(&mut candidates, file_name);
+    }
+    if let Some(stem) = path
+        .file_stem()
+        .map(|name| name.to_string_lossy().to_string())
+    {
+        push_unique_string(&mut candidates, stem);
+    }
+    candidates
+}
+
+#[cfg(windows)]
+fn push_unique_string(values: &mut Vec<String>, value: String) {
+    if value.is_empty() || values.iter().any(|existing| existing == &value) {
+        return;
+    }
+    values.push(value);
+}
+
+#[cfg(windows)]
+fn desktop_listview_find_text(
+    listview: windows_sys::Win32::Foundation::HWND,
+    text: &str,
+) -> Option<i32> {
+    use std::{
+        ffi::c_void,
+        mem::{size_of, zeroed},
+        ptr::{null, null_mut},
+    };
+
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        System::{
+            Diagnostics::Debug::WriteProcessMemory,
+            Memory::{
+                VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
+            },
+            Threading::{
+                OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_WRITE,
+            },
+        },
+        UI::WindowsAndMessaging::{GetWindowThreadProcessId, SendMessageW},
+    };
+
+    const LVFI_STRING: u32 = 0x0002;
+    const LVM_FINDITEMW: u32 = 0x1000 + 83;
+
+    #[repr(C)]
+    struct LvFindInfoW {
+        flags: u32,
+        psz: *const u16,
+        l_param: isize,
+        pt: windows_sys::Win32::Foundation::POINT,
+        vk_direction: u32,
+    }
+
+    unsafe {
+        let mut process_id = 0u32;
+        GetWindowThreadProcessId(listview, &mut process_id);
+        if process_id == 0 {
+            return None;
+        }
+
+        let process = OpenProcess(
+            PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_WRITE,
+            0,
+            process_id,
+        );
+        if process.is_null() {
+            return None;
+        }
+
+        let wide_text = text
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let find_info_size = size_of::<LvFindInfoW>();
+        let text_size = wide_text.len() * size_of::<u16>();
+        let block_size = find_info_size + text_size;
+        let remote_block = VirtualAllocEx(
+            process,
+            null(),
+            block_size,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE,
+        );
+        if remote_block.is_null() {
+            CloseHandle(process);
+            return None;
+        }
+
+        let remote_text = (remote_block as usize + find_info_size) as *mut c_void;
+        let find_info = LvFindInfoW {
+            flags: LVFI_STRING,
+            psz: remote_text.cast(),
+            l_param: 0,
+            pt: zeroed(),
+            vk_direction: 0,
+        };
+
+        let wrote_info = WriteProcessMemory(
+            process,
+            remote_block,
+            (&find_info as *const LvFindInfoW).cast(),
+            find_info_size,
+            null_mut(),
+        ) != 0;
+        let wrote_text = WriteProcessMemory(
+            process,
+            remote_text,
+            wide_text.as_ptr().cast(),
+            text_size,
+            null_mut(),
+        ) != 0;
+
+        let result = if wrote_info && wrote_text {
+            SendMessageW(listview, LVM_FINDITEMW, usize::MAX, remote_block as isize)
+        } else {
+            -1
+        };
+
+        VirtualFreeEx(process, remote_block, 0, MEM_RELEASE);
+        CloseHandle(process);
+
+        if result >= 0 {
+            Some(result as i32)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(windows)]
+fn desktop_listview_set_item_position(
+    listview: windows_sys::Win32::Foundation::HWND,
+    index: i32,
+    screen_x: i32,
+    screen_y: i32,
+) -> bool {
+    use std::{
+        ffi::c_void,
+        mem::size_of,
+        ptr::{null, null_mut},
+    };
+
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, POINT},
+        Graphics::Gdi::ScreenToClient,
+        System::{
+            Diagnostics::Debug::WriteProcessMemory,
+            Memory::{
+                VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
+            },
+            Threading::{
+                OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_WRITE,
+            },
+        },
+        UI::WindowsAndMessaging::{GetWindowThreadProcessId, SendMessageW},
+    };
+
+    const LVM_SETITEMPOSITION32: u32 = 0x1000 + 49;
+
+    unsafe {
+        let mut point = POINT {
+            x: screen_x,
+            y: screen_y,
+        };
+        if ScreenToClient(listview, &mut point) == 0 {
+            return false;
+        }
+
+        let mut process_id = 0u32;
+        GetWindowThreadProcessId(listview, &mut process_id);
+        if process_id == 0 {
+            return false;
+        }
+
+        let process = OpenProcess(
+            PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_WRITE,
+            0,
+            process_id,
+        );
+        if process.is_null() {
+            return false;
+        }
+
+        let point_size = size_of::<POINT>();
+        let remote_point = VirtualAllocEx(
+            process,
+            null(),
+            point_size,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE,
+        );
+        if remote_point.is_null() {
+            CloseHandle(process);
+            return false;
+        }
+
+        let wrote_point = WriteProcessMemory(
+            process,
+            remote_point,
+            (&point as *const POINT).cast::<c_void>(),
+            point_size,
+            null_mut(),
+        ) != 0;
+        let result = if wrote_point {
+            SendMessageW(
+                listview,
+                LVM_SETITEMPOSITION32,
+                index as usize,
+                remote_point as isize,
+            )
+        } else {
+            0
+        };
+
+        VirtualFreeEx(process, remote_point, 0, MEM_RELEASE);
+        CloseHandle(process);
+        result != 0
+    }
 }
 
 #[cfg(windows)]

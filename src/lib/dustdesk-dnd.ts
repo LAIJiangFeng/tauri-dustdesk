@@ -11,6 +11,12 @@ interface DragEndPoint {
   dataTransfer: DataTransfer
 }
 
+export interface DesktopDropPosition {
+  screenX: number
+  screenY: number
+  scaleFactor: number
+}
+
 export function writeDustDeskPathDrag(dataTransfer: DataTransfer, path: string, effectAllowed: DataTransfer["effectAllowed"] = "copy") {
   dataTransfer.effectAllowed = effectAllowed
   dataTransfer.setData(dustdeskPathDragType, path)
@@ -80,21 +86,23 @@ function isLocalPathText(value: string) {
 export function didDragEndOutsideWindow(event: DragEndPoint) {
   if (event.dataTransfer.dropEffect === "copy") return false
 
-  if (
-    event.clientX < 0 ||
-    event.clientY < 0 ||
-    event.clientX > globalThis.innerWidth ||
-    event.clientY > globalThis.innerHeight
-  ) {
+  if (event.clientX < 0 || event.clientY < 0 || event.clientX > globalThis.innerWidth || event.clientY > globalThis.innerHeight) {
     return true
   }
 
   const windowLeft = globalThis.screenX
   const windowTop = globalThis.screenY
-  return (
-    event.screenX < windowLeft ||
-    event.screenY < windowTop ||
-    event.screenX > windowLeft + globalThis.outerWidth ||
-    event.screenY > windowTop + globalThis.outerHeight
-  )
+  return event.screenX < windowLeft || event.screenY < windowTop || event.screenX > windowLeft + globalThis.outerWidth || event.screenY > windowTop + globalThis.outerHeight
+}
+
+export function desktopDropPositionFromDragEnd(event: DragEndPoint): DesktopDropPosition {
+  return {
+    screenX: finiteNumber(event.screenX),
+    screenY: finiteNumber(event.screenY),
+    scaleFactor: Math.max(0.25, finiteNumber(globalThis.devicePixelRatio || 1, 1)),
+  }
+}
+
+function finiteNumber(value: number, fallback = 0) {
+  return Number.isFinite(value) ? value : fallback
 }

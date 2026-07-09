@@ -97,10 +97,11 @@ pub fn paste_history_item(id: &str, before_send: impl FnOnce()) -> Result<(), St
             paste_text_to_last_target(&item.text, before_send)
         }
         ClipboardHistoryKind::Image => {
+            let mut image_path = item.image_path.trim().to_owned();
             let image_png_base64 = if !item.image_png_base64.trim().is_empty() {
                 item.image_png_base64
-            } else if !item.image_path.trim().is_empty() {
-                let bytes = fs::read(&item.image_path).map_err(to_message)?;
+            } else if !image_path.is_empty() {
+                let bytes = fs::read(&image_path).map_err(to_message)?;
                 BASE64.encode(bytes)
             } else {
                 String::new()
@@ -109,8 +110,13 @@ pub fn paste_history_item(id: &str, before_send: impl FnOnce()) -> Result<(), St
             if image_png_base64.trim().is_empty() {
                 return Err("图片剪贴记录缺少图片数据".to_owned());
             }
+            if image_path.is_empty() || !PathBuf::from(&image_path).is_file() {
+                if let Ok(stored) = persist_image_files(&item.id, &image_png_base64) {
+                    image_path = stored.image_path.display().to_string();
+                }
+            }
             suppress_clipboard_monitor_for(Duration::from_secs(4));
-            paste_image_to_last_target(&image_png_base64, before_send)
+            paste_image_to_last_target(&image_png_base64, Some(image_path.as_str()), before_send)
         }
     }
 }
@@ -552,6 +558,7 @@ fn paste_text_to_last_target(_text: &str, _before_send: impl FnOnce()) -> Result
 #[cfg(not(windows))]
 fn paste_image_to_last_target(
     _image_png_base64: &str,
+    _image_path: Option<&str>,
     _before_send: impl FnOnce(),
 ) -> Result<(), String> {
     Err("当前平台暂不支持图片快速粘贴".to_owned())
@@ -580,15 +587,17 @@ fn paste_text_to_last_target(text: &str, before_send: impl FnOnce()) -> Result<(
 #[cfg(windows)]
 fn paste_image_to_last_target(
     image_png_base64: &str,
+    image_path: Option<&str>,
     before_send: impl FnOnce(),
 ) -> Result<(), String> {
-    windows_clipboard::paste_image_png_base64(image_png_base64, before_send)
+    windows_clipboard::paste_image_png_base64(image_png_base64, image_path, before_send)
 }
 
 #[cfg(windows)]
 mod windows_clipboard {
     use std::{
         io::Cursor,
+        path::Path,
         ptr::null_mut,
         thread,
         time::{Duration, Instant},
@@ -601,9 +610,12 @@ mod windows_clipboard {
         System::{
             DataExchange::{
                 CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber,
-                IsClipboardFormatAvailable, OpenClipboard, SetClipboardData,
+                IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW,
+                SetClipboardData,
             },
-            Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE},
+            Memory::{
+                GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE, GMEM_ZEROINIT,
+            },
             Threading::{AttachThreadInput, GetCurrentThreadId},
         },
         UI::{
@@ -611,6 +623,7 @@ mod windows_clipboard {
                 SendInput, SetActiveWindow, SetFocus, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
                 KEYEVENTF_KEYUP, VK_CONTROL, VK_V,
             },
+            Shell::{CFSTR_PREFERREDDROPEFFECT, DROPFILES},
             WindowsAndMessaging::{
                 AllowSetForegroundWindow, BringWindowToTop, GetForegroundWindow,
                 GetWindowThreadProcessId, IsIconic, IsWindow, SetForegroundWindow, ShowWindow,
@@ -623,7 +636,9 @@ mod windows_clipboard {
 
     const BI_RGB: u32 = 0;
     const CF_DIB: u32 = 8;
+    const CF_HDROP: u32 = 15;
     const CF_UNICODETEXT: u32 = 13;
+    const DROPEFFECT_COPY: u32 = 1;
     const FOCUS_WAIT_TIMEOUT: Duration = Duration::from_millis(900);
     const FOCUS_WAIT_STEP: Duration = Duration::from_millis(25);
     const TEXT_PASTE_READY_DELAY: Duration = Duration::from_millis(180);
@@ -670,11 +685,12 @@ mod windows_clipboard {
 
     pub fn paste_image_png_base64(
         image_png_base64: &str,
+        image_path: Option<&str>,
         before_send: impl FnOnce(),
     ) -> Result<(), String> {
         let dib = png_base64_to_dib(image_png_base64)?;
         let ready_delay = image_ready_delay(dib.len());
-        set_dib(&dib)?;
+        set_image_clipboard(&dib, image_path)?;
         before_send();
         if let Some(hwnd) = focus_last_target() {
             wait_for_foreground(hwnd, FOCUS_WAIT_TIMEOUT);
@@ -767,42 +783,162 @@ mod windows_clipboard {
         Ok(())
     }
 
-    fn set_dib(dib: &[u8]) -> Result<(), String> {
+    fn set_image_clipboard(dib: &[u8], image_path: Option<&str>) -> Result<(), String> {
         if dib.is_empty() {
             return Err("图片剪贴记录为空".to_owned());
         }
 
+        let mut dib_handle = Some(global_alloc_bytes(dib, "无法分配图片剪贴板内存")?);
+        let mut file_handle = clipboard_file_path(image_path)
+            .map(|path| hdrop_from_file_path(&path))
+            .transpose()?;
+        let mut drop_effect_handle = if file_handle.is_some() {
+            Some(global_alloc_u32(
+                DROPEFFECT_COPY,
+                "无法分配图片复制语义剪贴板内存",
+            )?)
+        } else {
+            None
+        };
+        let needs_file_clipboard = file_handle.is_some();
+
         unsafe {
-            let handle = GlobalAlloc(GMEM_MOVEABLE, dib.len());
-            if handle.is_null() {
-                return Err("无法分配图片剪贴板内存".to_owned());
-            }
-
-            let ptr = GlobalLock(handle) as *mut u8;
-            if ptr.is_null() {
-                GlobalFree(handle);
-                return Err("无法写入图片剪贴板内存".to_owned());
-            }
-
-            std::ptr::copy_nonoverlapping(dib.as_ptr(), ptr, dib.len());
-            GlobalUnlock(handle);
-
             if OpenClipboard(null_mut()) == 0 {
-                GlobalFree(handle);
+                free_global_handle(&mut dib_handle);
+                free_global_handle(&mut file_handle);
+                free_global_handle(&mut drop_effect_handle);
                 return Err("无法打开系统剪贴板".to_owned());
             }
 
             EmptyClipboard();
-            let set_result = SetClipboardData(CF_DIB, handle);
+            let dib = dib_handle
+                .take()
+                .ok_or_else(|| "图片剪贴板数据为空".to_owned())?;
+            let set_dib_result = SetClipboardData(CF_DIB, dib);
+            if set_dib_result.is_null() {
+                CloseClipboard();
+                GlobalFree(dib);
+                free_global_handle(&mut file_handle);
+                free_global_handle(&mut drop_effect_handle);
+                return Err("无法设置图片剪贴板".to_owned());
+            }
+
+            let mut file_clipboard_set = !needs_file_clipboard;
+            if let Some(handle) = file_handle.take() {
+                let set_file_result = SetClipboardData(CF_HDROP, handle);
+                if set_file_result.is_null() {
+                    GlobalFree(handle);
+                } else {
+                    file_clipboard_set = true;
+                }
+            }
+
+            if let Some(handle) = drop_effect_handle.take() {
+                let format = RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT);
+                if format == 0 || SetClipboardData(format, handle).is_null() {
+                    GlobalFree(handle);
+                }
+            }
+
             CloseClipboard();
 
-            if set_result.is_null() {
-                GlobalFree(handle);
-                return Err("无法设置图片剪贴板".to_owned());
+            if !file_clipboard_set {
+                return Err("无法设置图片文件剪贴板".to_owned());
             }
         }
 
         Ok(())
+    }
+
+    fn clipboard_file_path(image_path: Option<&str>) -> Option<String> {
+        let path = image_path?.trim();
+        if path.is_empty() || !Path::new(path).is_file() {
+            return None;
+        }
+        Some(path.to_owned())
+    }
+
+    fn hdrop_from_file_path(path: &str) -> Result<windows_sys::Win32::Foundation::HANDLE, String> {
+        let wide_path = path
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let header = DROPFILES {
+            pFiles: std::mem::size_of::<DROPFILES>() as u32,
+            pt: windows_sys::Win32::Foundation::POINT { x: 0, y: 0 },
+            fNC: 0,
+            fWide: 1,
+        };
+        let header_size = std::mem::size_of::<DROPFILES>();
+        let paths_size = wide_path.len() * std::mem::size_of::<u16>();
+        let total_size = header_size
+            .checked_add(paths_size)
+            .ok_or_else(|| "图片文件路径过长".to_owned())?;
+        let handle = unsafe { GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, total_size) };
+        if handle.is_null() {
+            return Err("无法分配图片文件剪贴板内存".to_owned());
+        }
+
+        unsafe {
+            let ptr = GlobalLock(handle) as *mut u8;
+            if ptr.is_null() {
+                GlobalFree(handle);
+                return Err("无法写入图片文件剪贴板内存".to_owned());
+            }
+
+            std::ptr::copy_nonoverlapping(
+                (&header as *const DROPFILES).cast::<u8>(),
+                ptr,
+                header_size,
+            );
+            std::ptr::copy_nonoverlapping(
+                wide_path.as_ptr().cast::<u8>(),
+                ptr.add(header_size),
+                paths_size,
+            );
+            GlobalUnlock(handle);
+        }
+
+        Ok(handle)
+    }
+
+    fn global_alloc_bytes(
+        bytes: &[u8],
+        allocation_error: &str,
+    ) -> Result<windows_sys::Win32::Foundation::HANDLE, String> {
+        let handle = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes.len()) };
+        if handle.is_null() {
+            return Err(allocation_error.to_owned());
+        }
+
+        unsafe {
+            let ptr = GlobalLock(handle) as *mut u8;
+            if ptr.is_null() {
+                GlobalFree(handle);
+                return Err("无法写入剪贴板内存".to_owned());
+            }
+
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
+            GlobalUnlock(handle);
+        }
+
+        Ok(handle)
+    }
+
+    fn global_alloc_u32(
+        value: u32,
+        allocation_error: &str,
+    ) -> Result<windows_sys::Win32::Foundation::HANDLE, String> {
+        global_alloc_bytes(&value.to_le_bytes(), allocation_error)
+    }
+
+    unsafe fn free_global_handle(handle: &mut Option<windows_sys::Win32::Foundation::HANDLE>) {
+        if let Some(handle) = handle.take() {
+            unsafe {
+                GlobalFree(handle);
+            }
+        }
     }
 
     fn dib_to_png_base64(dib: &[u8]) -> Option<String> {

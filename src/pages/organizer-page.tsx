@@ -8,7 +8,15 @@ import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { ScrollArea } from "@/components/ui/scroll-area"
-import { didDragEndOutsideWindow, hasDustDeskPathDrag, hasPathLikeDrag, readDustDeskPathDrag, writeDustDeskPathDrag } from "@/lib/dustdesk-dnd"
+import {
+  desktopDropPositionFromDragEnd,
+  didDragEndOutsideWindow,
+  hasDustDeskPathDrag,
+  hasPathLikeDrag,
+  readDustDeskPathDrag,
+  type DesktopDropPosition,
+  writeDustDeskPathDrag,
+} from "@/lib/dustdesk-dnd"
 import { safeCurrentWebviewDragDropEvent, safeListen } from "@/lib/tauri-window"
 import { cn } from "@/lib/utils"
 import { useDustDeskStore } from "@/stores/dustdesk-store"
@@ -110,14 +118,13 @@ export function OrganizerPage() {
   useEffect(() => {
     let unlisten: (() => void) | undefined
     void safeCurrentWebviewDragDropEvent((event) => {
-        const payload = event.payload
-        if (payload.type !== "drop") return
-        if (dropZoneFromPoint(payload.position.x, payload.position.y) !== organizerCategoryDropZone) return
-        void addPathsToSelectedCategory(payload.paths)
-      })
-      .then((value) => {
-        unlisten = value
-      })
+      const payload = event.payload
+      if (payload.type !== "drop") return
+      if (dropZoneFromPoint(payload.position.x, payload.position.y) !== organizerCategoryDropZone) return
+      void addPathsToSelectedCategory(payload.paths)
+    }).then((value) => {
+      unlisten = value
+    })
     return () => unlisten?.()
   }, [addItemsToCategory, selectedCategory])
 
@@ -171,12 +178,7 @@ export function OrganizerPage() {
 
   return (
     <div className="grid h-full min-h-0 gap-4 xl:grid-cols-[290px_minmax(0,1fr)_390px]">
-      <Card
-        className="min-h-0"
-        data-path-drop-zone={organizerCategoryDropZone}
-        onDragOver={handleCategoryDragOver}
-        onDrop={handleCategoryDrop}
-      >
+      <Card className="min-h-0" data-path-drop-zone={organizerCategoryDropZone} onDragOver={handleCategoryDragOver} onDrop={handleCategoryDrop}>
         <CardHeader>
           <div>
             <CardTitle>分类</CardTitle>
@@ -208,7 +210,7 @@ export function OrganizerPage() {
                   className="h-auto justify-start gap-3 p-3 text-left"
                   onClick={() => selectCategory(index)}
                 >
-                    <span className="min-w-0 flex-1">
+                  <span className="min-w-0 flex-1">
                     <span className="block truncate font-medium">{item.name}</span>
                     <span className={cn("block text-xs", selectedCategory === index ? "text-primary-foreground/70" : "text-muted-foreground")}>
                       {item.item_paths.length} 个项目
@@ -257,11 +259,7 @@ export function OrganizerPage() {
               {isRestoringDesktop ? "还原中" : "一键还原桌面"}
             </Button>
           </div>
-          {notice ? (
-            <div className="rounded-lg border bg-muted/45 px-3 py-2 text-xs text-muted-foreground">
-              {notice}
-            </div>
-          ) : null}
+          {notice ? <div className="rounded-lg border bg-muted/45 px-3 py-2 text-xs text-muted-foreground">{notice}</div> : null}
           <div className="relative">
             <MagnifyingGlass className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" weight="duotone" />
             <Input value={query} onChange={(event) => setQuery(event.target.value)} className="pl-8" placeholder="搜索桌面文件、快捷方式、扩展名" />
@@ -337,9 +335,29 @@ function DesktopTile({ item }: { item: DesktopItem }) {
       onOpen={() => void openPath(item.path)}
       actions={[
         { label: "打开", icon: "open", onSelect: () => openPath(item.path) },
-        { label: "在资源管理器中显示", icon: "folder", onSelect: () => showPathInFolder(item.path) },
-        ...(isInCurrentCategory ? [] : [{ label: `收纳到${category ? `「${category.name}」` : "当前分类"}`, icon: "restore" as const, onSelect: () => addItemToCategory(selectedCategory, item.path) }]),
-        ...(canLaunch && !isLauncherAdded ? [{ label: "加入快捷启动", icon: "open" as const, onSelect: () => addLauncher(item.path, item.name) }] : []),
+        {
+          label: "在资源管理器中显示",
+          icon: "folder",
+          onSelect: () => showPathInFolder(item.path),
+        },
+        ...(isInCurrentCategory
+          ? []
+          : [
+              {
+                label: `收纳到${category ? `「${category.name}」` : "当前分类"}`,
+                icon: "restore" as const,
+                onSelect: () => addItemToCategory(selectedCategory, item.path),
+              },
+            ]),
+        ...(canLaunch && !isLauncherAdded
+          ? [
+              {
+                label: "加入快捷启动",
+                icon: "open" as const,
+                onSelect: () => addLauncher(item.path, item.name),
+              },
+            ]
+          : []),
       ]}
     >
       <CardContent className="flex h-full flex-col items-center justify-between gap-2 p-3 text-center">
@@ -388,12 +406,22 @@ function CategoryItemTile({ item, categoryIndex }: { item: DesktopItem; category
       title={item.path}
       dragPath={item.path}
       dragEffectAllowed="copyMove"
-      onDragEndOutside={() => restoreItemToDesktop(categoryIndex, item.path)}
+      onDragEndOutside={(position) => restoreItemToDesktop(categoryIndex, item.path, position)}
       onOpen={() => void openPath(item.path)}
       actions={[
         { label: "打开", icon: "open", onSelect: () => openPath(item.path) },
-        { label: "在资源管理器中显示", icon: "folder", onSelect: () => showPathInFolder(item.path) },
-        { label: "移回桌面", icon: "restore", onSelect: async () => { await restoreItemToDesktop(categoryIndex, item.path) } },
+        {
+          label: "在资源管理器中显示",
+          icon: "folder",
+          onSelect: () => showPathInFolder(item.path),
+        },
+        {
+          label: "移回桌面",
+          icon: "restore",
+          onSelect: async () => {
+            await restoreItemToDesktop(categoryIndex, item.path)
+          },
+        },
       ]}
     >
       <CardContent className="flex h-full flex-col items-center justify-between gap-2 p-3 text-center">
@@ -402,17 +430,25 @@ function CategoryItemTile({ item, categoryIndex }: { item: DesktopItem; category
           <span className="w-full truncate text-sm font-medium">{item.name}</span>
         </div>
         <div className="grid w-full grid-cols-2 gap-1.5">
-          <Button size="xs" variant="secondary" onClick={(event) => {
-            event.stopPropagation()
-            void openPath(item.path)
-          }}>
+          <Button
+            size="xs"
+            variant="secondary"
+            onClick={(event) => {
+              event.stopPropagation()
+              void openPath(item.path)
+            }}
+          >
             <FolderOpen className="size-3" weight="duotone" />
             打开
           </Button>
-          <Button size="xs" variant="outline" onClick={(event) => {
-            event.stopPropagation()
-            void restoreItemToDesktop(categoryIndex, item.path)
-          }}>
+          <Button
+            size="xs"
+            variant="outline"
+            onClick={(event) => {
+              event.stopPropagation()
+              void restoreItemToDesktop(categoryIndex, item.path)
+            }}
+          >
             <X className="size-3" weight="bold" />
             移回
           </Button>
@@ -435,7 +471,7 @@ function DesktopItemShell({
   actions: ItemContextMenuAction[]
   dragPath?: string
   dragEffectAllowed?: DataTransfer["effectAllowed"]
-  onDragEndOutside?: () => unknown
+  onDragEndOutside?: (position: DesktopDropPosition) => unknown
   onOpen: () => void
   children: ReactNode
 }) {
@@ -456,7 +492,7 @@ function DesktopItemShell({
       }}
       onDragEnd={(event: ReactDragEvent<HTMLDivElement>) => {
         if (!dragPath || !onDragEndOutside || !didDragEndOutsideWindow(event)) return
-        void Promise.resolve(onDragEndOutside()).catch(() => undefined)
+        void Promise.resolve(onDragEndOutside(desktopDropPositionFromDragEnd(event))).catch(() => undefined)
       }}
       onDoubleClick={(event) => {
         if (isInteractiveTarget(event.target)) return

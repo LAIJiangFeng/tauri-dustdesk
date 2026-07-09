@@ -10,6 +10,8 @@ import type {
   ClipboardHistoryItem,
   DeskCategory,
   DesktopFrameVisibility,
+  DesktopLayout,
+  DesktopWindowLayout,
   LaunchItem,
   SearchItem,
   SearchItemKind,
@@ -21,6 +23,12 @@ const defaultSettings: AppSettings = {
   search_enabled: true,
   search_shortcut: "Ctrl+Space",
   search_paths: [],
+  launch_on_startup: false,
+}
+
+const emptyDesktopLayout: DesktopLayout = {
+  split_category_indices: [],
+  windows: {},
 }
 
 const emptySnapshot: AppSnapshot = {
@@ -28,6 +36,7 @@ const emptySnapshot: AppSnapshot = {
   organizer_root: "",
   launchers_root: "",
   settings: defaultSettings,
+  desktop_layout: emptyDesktopLayout,
   categories: [],
   desktop_items: [],
   launchers: [],
@@ -63,11 +72,22 @@ const iconCache = new Map<string, string | null>()
 let desktopSnapshotLoadPromise: Promise<void> | null = null
 let desktopSnapshotLoadedAt = 0
 
+function waitForNextPaint() {
+  if (typeof globalThis.requestAnimationFrame !== "function") {
+    return Promise.resolve()
+  }
+
+  return new Promise<void>((resolve) => {
+    globalThis.requestAnimationFrame(() => resolve())
+  })
+}
+
 const demoSnapshot: AppSnapshot = {
   data_dir: "<安装目录>\\Data",
   organizer_root: "<安装目录>\\DesktopOrganizer",
   launchers_root: "<安装目录>\\Launchers",
   settings: defaultSettings,
+  desktop_layout: emptyDesktopLayout,
   categories: [
     { name: "开发", is_collapsed: false, item_paths: [], item_details: [] },
     { name: "工具", is_collapsed: false, item_paths: [], item_details: [] },
@@ -119,12 +139,27 @@ async function call<T>(command: string, args?: InvokeArgs): Promise<T> {
         search_paths: asArray(args?.paths).map((item) => asString(item)).filter(Boolean),
       }) as T
     }
+    if (command === "update_launch_on_startup") {
+      return normalizeSettings({ ...defaultSettings, launch_on_startup: asBoolean(args?.enabled) }) as T
+    }
     if (command === "classify_desktop_items") {
       return {
         moved: demoSnapshot.desktop_items.length,
         skipped: 0,
         category_counts: [{ name: "演示分类", count: demoSnapshot.desktop_items.length }],
       } as T
+    }
+    if (command === "restore_all_to_desktop") {
+      return demoSnapshot.categories.reduce((sum, category) => sum + category.item_paths.length, 0) as T
+    }
+    if (command === "start_classify_desktop_items_task" || command === "start_restore_all_to_desktop_task") {
+      return undefined as T
+    }
+    if (command === "save_desktop_window_layout") {
+      return undefined as T
+    }
+    if (command === "save_desktop_split_indices") {
+      return normalizeSplitIndices(args?.indices) as T
     }
     if (
       command === "desktop_frame_visibility" ||
@@ -174,6 +209,33 @@ function normalizeSplitIndices(value: unknown): number[] {
   return [...new Set(asArray(value).map(Number).filter((index) => Number.isInteger(index) && index >= 0))].sort((left, right) => left - right)
 }
 
+function normalizeDesktopWindowLayout(value: unknown): DesktopWindowLayout | null {
+  const raw = asRecord(value)
+  const x = Math.round(Number(raw.x ?? raw.X))
+  const y = Math.round(Number(raw.y ?? raw.Y))
+  const width = Math.round(Number(raw.width ?? raw.Width))
+  const height = Math.round(Number(raw.height ?? raw.Height))
+  if (![x, y, width, height].every(Number.isFinite) || width < 120 || height < 100) {
+    return null
+  }
+  return { x, y, width, height }
+}
+
+function normalizeDesktopLayout(value: unknown): DesktopLayout {
+  const raw = asRecord(value)
+  const rawWindows = asRecord(raw.windows ?? raw.Windows)
+  const windows = Object.fromEntries(
+    Object.entries(rawWindows)
+      .map(([label, layout]) => [label, normalizeDesktopWindowLayout(layout)] as const)
+      .filter((entry): entry is [string, DesktopWindowLayout] => Boolean(entry[1])),
+  )
+
+  return {
+    split_category_indices: normalizeSplitIndices(raw.split_category_indices ?? raw.SplitCategoryIndices),
+    windows,
+  }
+}
+
 function normalizeDesktopFrameVisibility(value: unknown): DesktopFrameVisibility {
   const raw = asRecord(value)
   const organizer = asBoolean(raw.organizer ?? raw.Organizer)
@@ -192,6 +254,7 @@ function normalizeSnapshot(value: unknown): AppSnapshot {
     organizer_root: asString(raw.organizer_root ?? raw.OrganizerRoot),
     launchers_root: asString(raw.launchers_root ?? raw.LaunchersRoot),
     settings: normalizeSettings(raw.settings ?? raw.Settings),
+    desktop_layout: normalizeDesktopLayout(raw.desktop_layout ?? raw.DesktopLayout),
     categories: asArray(raw.categories ?? raw.DesktopCategories).map(normalizeCategory),
     desktop_items: asArray(raw.desktop_items ?? raw.DesktopItems).map((item) => {
       const rawItem = asRecord(item)
@@ -217,6 +280,7 @@ function normalizeSettings(value: unknown): AppSettings {
     search_enabled: asBoolean(raw.search_enabled ?? raw.SearchEnabled, defaultSettings.search_enabled),
     search_shortcut: asString(raw.search_shortcut ?? raw.SearchShortcut, defaultSettings.search_shortcut),
     search_paths: asArray(raw.search_paths ?? raw.SearchPaths).map((item) => asString(item)).filter(Boolean),
+    launch_on_startup: asBoolean(raw.launch_on_startup ?? raw.LaunchOnStartup, defaultSettings.launch_on_startup),
   }
 }
 
@@ -522,12 +586,17 @@ interface DustDeskState {
   addItemsToCategoryLight: (index: number, paths: string[]) => Promise<number>
   removeItemFromCategory: (index: number, path: string) => Promise<void>
   restoreItemToDesktop: (index: number, path: string) => Promise<string>
+  restoreAllToDesktop: () => Promise<number>
+  restoreAllToDesktopLight: () => Promise<number>
+  startRestoreAllToDesktopTask: () => Promise<void>
   addLauncher: (path: string, name: string) => Promise<void>
   addLaunchers: (paths: string[]) => Promise<number>
   addLauncherLight: (path: string, name: string) => Promise<void>
   addLaunchersLight: (paths: string[]) => Promise<number>
   removeLauncher: (path: string) => Promise<void>
   classifyDesktopItems: () => Promise<ClassifyResult>
+  classifyDesktopItemsLight: () => Promise<ClassifyResult>
+  startClassifyDesktopItemsTask: () => Promise<void>
   createDesktopEntries: () => Promise<string[]>
   showDesktopWidget: () => Promise<void>
   refreshDesktopFrameVisibility: () => Promise<void>
@@ -538,6 +607,8 @@ interface DustDeskState {
   splitDesktopCategory: (index: number) => Promise<void>
   mergeDesktopCategory: (index: number) => Promise<void>
   mergeDesktopWidgets: () => Promise<void>
+  saveDesktopWindowLayout: (label: string) => Promise<void>
+  saveDesktopSplitIndices: (indices: number[]) => Promise<number[]>
   hideCurrentWindow: () => Promise<void>
   openSpecial: (target: "organizer" | "launchers" | "data" | "desktop") => Promise<void>
   updateRuntimeDirectory: (target: "organizer" | "launchers" | "data", path: string) => Promise<AppSnapshot>
@@ -553,6 +624,7 @@ interface DustDeskState {
   openSearchItem: (item: SearchItem) => Promise<void>
   hideSearchOverlay: () => Promise<void>
   updateSearchSettings: (enabled: boolean, shortcut: string, paths: string[]) => Promise<AppSettings>
+  updateLaunchOnStartup: (enabled: boolean) => Promise<AppSettings>
 }
 
 export const useDustDeskStore = create<DustDeskState>()(
@@ -713,6 +785,32 @@ export const useDustDeskStore = create<DustDeskState>()(
       await get().load()
       return restored
     },
+    restoreAllToDesktop: async () => {
+      const restored = Number(await call<number>("restore_all_to_desktop")) || 0
+      await get().load()
+      return restored
+    },
+    restoreAllToDesktopLight: async () => {
+      set((state) => {
+        state.loading = true
+        state.error = null
+      })
+      await waitForNextPaint()
+      try {
+        const restored = Number(await call<number>("restore_all_to_desktop")) || 0
+        await get().loadDesktopSnapshot({ force: true })
+        return restored
+      } catch (error) {
+        set((state) => {
+          state.error = error instanceof Error ? error.message : String(error)
+          state.loading = false
+        })
+        throw error
+      }
+    },
+    startRestoreAllToDesktopTask: async () => {
+      await call("start_restore_all_to_desktop_task")
+    },
     addLauncher: async (path, name) => {
       await call("add_launcher", { path, name })
       await get().load()
@@ -741,6 +839,27 @@ export const useDustDeskStore = create<DustDeskState>()(
       const result = await call<ClassifyResult>("classify_desktop_items")
       await get().load()
       return normalizeClassifyResult(result)
+    },
+    classifyDesktopItemsLight: async () => {
+      set((state) => {
+        state.loading = true
+        state.error = null
+      })
+      await waitForNextPaint()
+      try {
+        const result = await call<ClassifyResult>("classify_desktop_items")
+        await get().loadDesktopSnapshot({ force: true })
+        return normalizeClassifyResult(result)
+      } catch (error) {
+        set((state) => {
+          state.error = error instanceof Error ? error.message : String(error)
+          state.loading = false
+        })
+        throw error
+      }
+    },
+    startClassifyDesktopItemsTask: async () => {
+      await call("start_classify_desktop_items_task")
     },
     createDesktopEntries: async () => {
       return call<string[]>("create_desktop_entries")
@@ -789,6 +908,13 @@ export const useDustDeskStore = create<DustDeskState>()(
     mergeDesktopWidgets: async () => {
       await call("merge_desktop_widgets")
       await get().refreshDesktopFrameVisibility()
+    },
+    saveDesktopWindowLayout: async (label) => {
+      await call("save_desktop_window_layout", { label })
+    },
+    saveDesktopSplitIndices: async (indices) => {
+      const saved = await call<unknown>("save_desktop_split_indices", { indices })
+      return normalizeSplitIndices(saved)
     },
     hideCurrentWindow: async () => {
       await call("hide_current_window")
@@ -850,6 +976,13 @@ export const useDustDeskStore = create<DustDeskState>()(
     },
     updateSearchSettings: async (enabled, shortcut, paths) => {
       const settings = await call<AppSettings>("update_search_settings", { enabled, shortcut, paths })
+      set((state) => {
+        state.snapshot.settings = normalizeSettings(settings)
+      })
+      return normalizeSettings(settings)
+    },
+    updateLaunchOnStartup: async (enabled) => {
+      const settings = await call<AppSettings>("update_launch_on_startup", { enabled })
       set((state) => {
         state.snapshot.settings = normalizeSettings(settings)
       })

@@ -1,13 +1,12 @@
 import { useEffect, useRef, useState } from "react"
 import type { KeyboardEvent as ReactKeyboardEvent } from "react"
-import { Desktop, FolderOpen, GearSix, HardDrives, Keyboard, MagnifyingGlass, Plus, X } from "@phosphor-icons/react"
+import { Desktop, FolderOpen, GearSix, HardDrives, Keyboard, MagnifyingGlass, PlayCircle, Plus, X } from "@phosphor-icons/react"
 import { open } from "@tauri-apps/plugin-dialog"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { ScrollArea } from "@/components/ui/scroll-area"
-import { truncate } from "@/lib/utils"
 import { useDustDeskStore } from "@/stores/dustdesk-store"
 
 const MODIFIER_CODES = new Set(["ControlLeft", "ControlRight", "ShiftLeft", "ShiftRight", "AltLeft", "AltRight", "MetaLeft", "MetaRight"])
@@ -39,6 +38,7 @@ export function SettingsPage() {
   const updateRuntimeDirectory = useDustDeskStore((state) => state.updateRuntimeDirectory)
   const updateClipboardShortcut = useDustDeskStore((state) => state.updateClipboardShortcut)
   const updateSearchSettings = useDustDeskStore((state) => state.updateSearchSettings)
+  const updateLaunchOnStartup = useDustDeskStore((state) => state.updateLaunchOnStartup)
   const shortcutInputRef = useRef<HTMLInputElement | null>(null)
   const searchShortcutInputRef = useRef<HTMLInputElement | null>(null)
   const [shortcutDraft, setShortcutDraft] = useState(snapshot.settings.clipboard_shortcut)
@@ -57,6 +57,9 @@ export function SettingsPage() {
   const [directorySuccess, setDirectorySuccess] = useState("")
   const [searchError, setSearchError] = useState("")
   const [searchSuccess, setSearchSuccess] = useState("")
+  const [isSavingStartup, setIsSavingStartup] = useState(false)
+  const [startupError, setStartupError] = useState("")
+  const [startupSuccess, setStartupSuccess] = useState("")
   const effectiveSearchPaths = searchPathsDraft.length > 0 ? searchPathsDraft : [snapshot.organizer_root].filter(Boolean)
   const rows = [
     { name: "数据目录", value: snapshot.data_dir, target: "data" as const, icon: HardDrives },
@@ -242,6 +245,21 @@ export function SettingsPage() {
       setDirectoryError(reason instanceof Error ? reason.message : String(reason))
     } finally {
       setSavingDirectoryTarget("")
+    }
+  }
+
+  const toggleLaunchOnStartup = async () => {
+    const enabled = !snapshot.settings.launch_on_startup
+    setIsSavingStartup(true)
+    setStartupError("")
+    setStartupSuccess("")
+    try {
+      const settings = await updateLaunchOnStartup(enabled)
+      setStartupSuccess(settings.launch_on_startup ? "已设置为开机自动启动" : "已关闭开机自动启动")
+    } catch (reason) {
+      setStartupError(reason instanceof Error ? reason.message : String(reason))
+    } finally {
+      setIsSavingStartup(false)
     }
   }
 
@@ -458,22 +476,64 @@ export function SettingsPage() {
             </Card>
           </div>
 
-          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+          <div className="mb-3 grid gap-3 xl:grid-cols-[minmax(0,1.05fr)_minmax(0,1.95fr)]">
+            <Card>
+              <CardContent className="flex min-h-44 flex-col gap-4 p-5">
+                <div className="flex size-11 items-center justify-center rounded-lg bg-muted text-muted-foreground">
+                  <PlayCircle className="size-5" weight="duotone" />
+                </div>
+                <div>
+                  <h3 className="font-heading text-base font-medium">开机自启</h3>
+                  <p className="mt-2 text-sm leading-6 text-muted-foreground">
+                    登录 Windows 后自动启动 DeskNest，并继续显示桌面收纳卡片。
+                  </p>
+                </div>
+                <Badge className="mt-auto w-fit" variant={snapshot.settings.launch_on_startup ? "default" : "outline"}>
+                  {snapshot.settings.launch_on_startup ? "已启用" : "已关闭"}
+                </Badge>
+              </CardContent>
+            </Card>
+
+            <Card>
+              <CardContent className="flex min-h-44 flex-col gap-4 p-5">
+                <div className="grid gap-2">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <h3 className="font-heading text-base font-medium">启动项设置</h3>
+                    <Badge variant="outline">当前用户</Badge>
+                  </div>
+                  <p className="text-sm leading-6 text-muted-foreground">
+                    使用 Windows 当前用户的 Startup 启动目录，不需要管理员权限。
+                  </p>
+                  {startupSuccess ? <p className="text-xs leading-5 text-emerald-600 dark:text-emerald-400">{startupSuccess}</p> : null}
+                  {startupError ? <p className="text-xs leading-5 text-destructive">{startupError}</p> : null}
+                </div>
+                <div className="mt-auto flex flex-wrap gap-2">
+                  <Button type="button" disabled={isSavingStartup} onClick={() => void toggleLaunchOnStartup()}>
+                    {isSavingStartup ? "保存中" : snapshot.settings.launch_on_startup ? "关闭开机自启" : "开启开机自启"}
+                  </Button>
+                </div>
+              </CardContent>
+            </Card>
+          </div>
+
+          <div className="grid gap-3 xl:grid-cols-4">
             {rows.map((row) => {
               const Icon = row.icon
               const directoryTarget: RuntimeDirectoryTarget | null = row.target === "desktop" ? null : row.target
               const isSavingDirectory = Boolean(directoryTarget && savingDirectoryTarget === directoryTarget)
               return (
-                <Card key={row.name}>
-                  <CardContent className="flex min-h-56 flex-col gap-4 p-5">
-                    <div className="flex size-11 items-center justify-center rounded-lg bg-muted text-muted-foreground">
-                      <Icon className="size-5" weight="duotone" />
-                    </div>
-                    <div>
-                      <h3 className="font-heading text-base font-medium">{row.name}</h3>
-                      <p className="mt-2 text-sm leading-6 text-muted-foreground" title={row.value}>
-                        {truncate(row.value || "等待读取", 98)}
-                      </p>
+                <Card key={row.name} className="min-w-0">
+                  <CardContent className="flex min-h-44 min-w-0 flex-col gap-4 p-5">
+                    <div className="flex items-start gap-3">
+                      <div className="flex size-11 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground">
+                        <Icon className="size-5" weight="duotone" />
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <h3 className="font-heading text-base font-medium">{row.name}</h3>
+                        <p className="mt-2 min-w-0 truncate font-mono text-[13px] leading-6 text-muted-foreground" title={row.value}>
+                          {row.value || "等待读取"}
+                        </p>
+                      </div>
                     </div>
                     <div className="mt-auto grid gap-2">
                       <Button variant="secondary" size="sm" onClick={() => void openSpecial(row.target)}>

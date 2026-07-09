@@ -39,6 +39,28 @@ export interface DesktopFrameVisibility {
   any: boolean
 }
 
+export interface DesktopWindowLayout {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+export interface DesktopLayout {
+  split_category_indices: number[]
+  windows: Record<string, DesktopWindowLayout>
+}
+
+export interface DesktopOperationEvent {
+  kind: "classify" | "restore"
+  status: "started" | "finished" | "failed"
+  message: string
+  moved: number
+  skipped: number
+  restored: number
+  category_counts: CategoryClassifyCount[]
+}
+
 export interface CategoryClassifyCount {
   name: string
   count: number
@@ -84,6 +106,7 @@ export interface AppSettings {
   search_enabled: boolean
   search_shortcut: string
   search_paths: string[]
+  launch_on_startup: boolean
 }
 
 export interface AppSnapshot {
@@ -91,6 +114,7 @@ export interface AppSnapshot {
   organizer_root: string
   launchers_root: string
   settings: AppSettings
+  desktop_layout: DesktopLayout
   categories: DeskCategory[]
   desktop_items: DesktopItem[]
   launchers: LaunchItem[]

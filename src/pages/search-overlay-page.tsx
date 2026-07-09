@@ -23,6 +23,7 @@ const emptyOverlay: SearchOverlayData = {
     search_enabled: true,
     search_shortcut: "Ctrl+Space",
     search_paths: [],
+    launch_on_startup: false,
   },
   paths: [],
   recent: [],

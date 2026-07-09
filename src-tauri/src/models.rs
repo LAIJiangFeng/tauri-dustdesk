@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 
 use chrono::Local;
 use serde::{Deserialize, Serialize};
@@ -9,6 +9,7 @@ pub struct AppSnapshot {
     pub organizer_root: String,
     pub launchers_root: String,
     pub settings: AppSettings,
+    pub desktop_layout: DesktopLayout,
     pub categories: Vec<DeskCategory>,
     pub desktop_items: Vec<DesktopItem>,
     pub launchers: Vec<LaunchItem>,
@@ -22,6 +23,9 @@ pub struct AppConfig {
 
     #[serde(rename = "Settings", alias = "settings", default)]
     pub settings: AppSettings,
+
+    #[serde(rename = "DesktopLayout", alias = "desktop_layout", default)]
+    pub desktop_layout: DesktopLayout,
 }
 
 impl Default for AppConfig {
@@ -29,8 +33,31 @@ impl Default for AppConfig {
         Self {
             desktop_categories: default_categories(),
             settings: AppSettings::default(),
+            desktop_layout: DesktopLayout::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DesktopLayout {
+    #[serde(
+        rename = "SplitCategoryIndices",
+        alias = "split_category_indices",
+        default
+    )]
+    pub split_category_indices: Vec<usize>,
+
+    #[serde(rename = "Windows", alias = "windows", default)]
+    pub windows: BTreeMap<String, DesktopWindowLayout>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct DesktopWindowLayout {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +85,9 @@ pub struct AppSettings {
 
     #[serde(rename = "SearchPaths", alias = "search_paths", default)]
     pub search_paths: Vec<String>,
+
+    #[serde(rename = "LaunchOnStartup", alias = "launch_on_startup", default)]
+    pub launch_on_startup: bool,
 }
 
 impl Default for AppSettings {
@@ -67,6 +97,7 @@ impl Default for AppSettings {
             search_enabled: default_search_enabled(),
             search_shortcut: default_search_shortcut(),
             search_paths: Vec::new(),
+            launch_on_startup: false,
         }
     }
 }

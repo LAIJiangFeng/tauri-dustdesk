@@ -589,13 +589,13 @@ mod windows_clipboard {
         },
         UI::{
             Input::KeyboardAndMouse::{
-                SendInput, SetActiveWindow, SetFocus, INPUT, INPUT_0, INPUT_KEYBOARD,
-                KEYBDINPUT, KEYEVENTF_KEYUP, VK_CONTROL, VK_V,
+                SendInput, SetActiveWindow, SetFocus, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
+                KEYEVENTF_KEYUP, VK_CONTROL, VK_V,
             },
             WindowsAndMessaging::{
                 AllowSetForegroundWindow, BringWindowToTop, GetForegroundWindow,
-                GetWindowThreadProcessId, IsWindow, SetForegroundWindow, ShowWindow, ASFW_ANY,
-                SW_RESTORE,
+                GetWindowThreadProcessId, IsIconic, IsWindow, SetForegroundWindow, ShowWindow,
+                ASFW_ANY, SW_RESTORE, SW_SHOW,
             },
         },
     };
@@ -1023,7 +1023,11 @@ mod windows_clipboard {
 
     unsafe fn activate_window(hwnd: HWND) {
         AllowSetForegroundWindow(ASFW_ANY);
-        ShowWindow(hwnd, SW_RESTORE);
+        if IsIconic(hwnd) != 0 {
+            ShowWindow(hwnd, SW_RESTORE);
+        } else {
+            ShowWindow(hwnd, SW_SHOW);
+        }
 
         let current_thread = GetCurrentThreadId();
         let foreground = GetForegroundWindow();

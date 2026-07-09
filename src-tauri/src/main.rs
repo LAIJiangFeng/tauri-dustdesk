@@ -19,16 +19,18 @@ use std::{
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use models::{
     AppConfig, AppSettings, AppSnapshot, CategoryClassifyCount, ClassifyResult,
-    ClipboardHistoryItem, DeskCategory, DesktopItem, LaunchItem, PathIconResult, SearchHistoryData,
-    SearchHistoryItem, SearchItem, SearchItemKind, SearchOverlayData,
+    ClipboardHistoryItem, DeskCategory, DesktopItem, DesktopWindowLayout, LaunchItem,
+    PathIconResult, SearchHistoryData, SearchHistoryItem, SearchItem, SearchItemKind,
+    SearchOverlayData,
 };
 use serde::Serialize;
 use store::AppStore;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    utils::config::Color, Emitter, Manager, PhysicalPosition, PhysicalSize, Position, Size,
-    WebviewUrl, WebviewWindow, WebviewWindowBuilder,
+    utils::config::Color,
+    Emitter, Manager, PhysicalPosition, PhysicalSize, Position, Size, WebviewUrl, WebviewWindow,
+    WebviewWindowBuilder,
 };
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
@@ -38,16 +40,29 @@ const SEARCH_HISTORY_LIMIT: usize = 500;
 const CLIPBOARD_PREVIEW_IMAGE_MAX_BYTES: u64 = 800_000;
 const TRAY_MENU_SHOW_MAIN: &str = "show-main-window";
 const TRAY_MENU_QUIT: &str = "quit-app";
+const DESKTOP_OPERATION_EVENT: &str = "dustdesk://desktop-operation";
 
 static CONFIG_MUTATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static LAUNCHER_MUTATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static REAL_EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+static DESKTOP_OPERATION_RUNNING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy, Serialize)]
 struct DesktopFrameVisibility {
     organizer: bool,
     launcher: bool,
     any: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DesktopOperationPayload {
+    kind: &'static str,
+    status: &'static str,
+    message: String,
+    moved: usize,
+    skipped: usize,
+    restored: usize,
+    category_counts: Vec<CategoryClassifyCount>,
 }
 
 #[tauri::command]
@@ -75,11 +90,14 @@ fn load_snapshot_impl() -> Result<AppSnapshot, String> {
         let _ = store.save_clipboard(&clipboard);
     }
 
+    let desktop_layout = config.desktop_layout.clone();
+
     Ok(AppSnapshot {
         data_dir: store.data_dir().display().to_string(),
         organizer_root: store.organizer_root().display().to_string(),
         launchers_root: store.launchers_root().display().to_string(),
         settings: config.settings,
+        desktop_layout,
         categories: categories_with_item_details(config.desktop_categories, false),
         desktop_items: desktop_items(false),
         launchers: launchers_with_optional_icons(launchers.items, false),
@@ -108,11 +126,14 @@ fn load_desktop_snapshot_impl() -> Result<AppSnapshot, String> {
         Ok(launchers)
     })?;
 
+    let desktop_layout = config.desktop_layout.clone();
+
     Ok(AppSnapshot {
         data_dir: store.data_dir().display().to_string(),
         organizer_root: store.organizer_root().display().to_string(),
         launchers_root: store.launchers_root().display().to_string(),
         settings: config.settings,
+        desktop_layout,
         categories: categories_with_item_details(config.desktop_categories, false),
         desktop_items: Vec::new(),
         launchers: launchers_with_optional_icons(launchers.items, false),
@@ -222,6 +243,7 @@ fn add_items_to_category_impl(index: usize, paths: Vec<String>) -> Result<usize,
     with_config_mutation(|| {
         let store = AppStore::open().map_err(to_message)?;
         store.ensure_runtime_dirs().map_err(to_message)?;
+        repair_existing_app_desktop_entries(&store)?;
         let mut config = store.load_config();
         repair_category_item_paths(&store, &mut config)?;
         config
@@ -283,18 +305,49 @@ fn restore_item_to_desktop(
 ) -> Result<String, String> {
     let restored_path = with_config_mutation(|| {
         let path = normalize_path_input(&path)?;
+        let store = AppStore::open().map_err(to_message)?;
+        let mut config = store.load_config();
         let desktop = user_desktop().ok_or_else(|| "没有找到桌面路径".to_owned())?;
         fs::create_dir_all(&desktop).map_err(to_message)?;
         let restored_path = restore_path_to_desktop(Path::new(&path), &desktop)?;
-
-        let store = AppStore::open().map_err(to_message)?;
-        let mut config = store.load_config();
         remove_category_path_from_config(&mut config, index, &path)?;
         store.save_config(&config).map_err(to_message)?;
         Ok(restored_path)
     })?;
     emit_desktop_cards_changed(&app);
     Ok(restored_path.display().to_string())
+}
+
+#[tauri::command]
+async fn restore_all_to_desktop(app: tauri::AppHandle) -> Result<usize, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let restored = restore_all_organized_items_to_desktop_and_clear_markers()?;
+        emit_desktop_cards_changed(&app);
+        Ok(restored)
+    })
+    .await
+    .map_err(to_message)?
+}
+
+#[tauri::command]
+async fn start_restore_all_to_desktop_task(app: tauri::AppHandle) -> Result<(), String> {
+    start_desktop_background_operation(app.clone(), "restore", move || {
+        let restored = restore_all_organized_items_to_desktop_and_clear_markers()?;
+        emit_desktop_cards_changed(&app);
+        Ok(DesktopOperationPayload {
+            kind: "restore",
+            status: "finished",
+            message: if restored > 0 {
+                format!("已还原 {restored} 项到桌面")
+            } else {
+                "没有需要还原到桌面的收纳项目".to_owned()
+            },
+            moved: 0,
+            skipped: 0,
+            restored,
+            category_counts: Vec::new(),
+        })
+    })
 }
 
 #[tauri::command]
@@ -404,6 +457,33 @@ async fn classify_desktop_items(app: tauri::AppHandle) -> Result<ClassifyResult,
         .map_err(to_message)?
 }
 
+#[tauri::command]
+async fn start_classify_desktop_items_task(app: tauri::AppHandle) -> Result<(), String> {
+    start_desktop_background_operation(app.clone(), "classify", move || {
+        let result = classify_desktop_items_impl(&app)?;
+        let detail = result
+            .category_counts
+            .iter()
+            .map(|item| format!("{} {}", item.name, item.count))
+            .collect::<Vec<_>>()
+            .join("、");
+        Ok(DesktopOperationPayload {
+            kind: "classify",
+            status: "finished",
+            message: format!(
+                "已智能收纳 {} 项{}{}",
+                result.moved,
+                if detail.is_empty() { "" } else { "：" },
+                detail
+            ),
+            moved: result.moved,
+            skipped: result.skipped,
+            restored: 0,
+            category_counts: result.category_counts,
+        })
+    })
+}
+
 fn classify_desktop_items_impl(app: &tauri::AppHandle) -> Result<ClassifyResult, String> {
     let result = with_config_mutation(|| {
         let store = AppStore::open().map_err(to_message)?;
@@ -414,11 +494,10 @@ fn classify_desktop_items_impl(app: &tauri::AppHandle) -> Result<ClassifyResult,
             return Err("没有可用分类，请先创建分类".to_owned());
         }
 
-        let items = desktop_items(false);
         let mut category_counts = vec![0usize; config.desktop_categories.len()];
         let mut moved = 0usize;
         let mut skipped = 0usize;
-
+        let items = desktop_items(false);
         for item in items {
             if should_skip_desktop_classify_item(&item) {
                 skipped += 1;
@@ -430,7 +509,8 @@ fn classify_desktop_items_impl(app: &tauri::AppHandle) -> Result<ClassifyResult,
                 continue;
             }
 
-            let Some(category_index) = classify_desktop_item(&item, &config.desktop_categories) else {
+            let Some(category_index) = classify_desktop_item(&item, &config.desktop_categories)
+            else {
                 skipped += 1;
                 continue;
             };
@@ -483,19 +563,53 @@ fn create_desktop_entries() -> Result<Vec<String>, String> {
     let desktop = user_desktop().ok_or_else(|| "没有找到桌面路径".to_owned())?;
     fs::create_dir_all(&desktop).map_err(to_message)?;
 
-    let entries = [
-        ("DustDesk 收纳箱", store.organizer_root()),
-        ("DustDesk 快捷启动", store.launchers_root()),
-    ];
+    let entries = app_desktop_entries(&store);
     let mut created = Vec::with_capacity(entries.len());
 
     for (name, target) in entries {
         let shortcut = desktop.join(format!("{name}.lnk"));
-        create_windows_shortcut(&shortcut, &target, name)?;
+        create_windows_shortcut(&shortcut, target.as_path(), name)?;
         created.push(shortcut.display().to_string());
     }
 
     Ok(created)
+}
+
+fn app_desktop_entries(store: &AppStore) -> Vec<(&'static str, PathBuf)> {
+    vec![
+        ("DustDesk 收纳箱", store.organizer_root()),
+        ("DustDesk 快捷启动", store.launchers_root()),
+    ]
+}
+
+fn repair_existing_app_desktop_entries(store: &AppStore) -> Result<(), String> {
+    let Some(desktop) = user_desktop() else {
+        return Ok(());
+    };
+    fs::create_dir_all(&desktop).map_err(to_message)?;
+
+    for (name, target) in app_desktop_entries(store) {
+        for alias in app_desktop_entry_aliases(name) {
+            let shortcut = desktop.join(format!("{alias}.lnk"));
+            if shortcut.exists() {
+                create_windows_shortcut(&shortcut, target.as_path(), name)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn app_desktop_entry_aliases(name: &str) -> &'static [&'static str] {
+    match name {
+        "DustDesk 收纳箱" => &["DustDesk 收纳箱", "DustDusk 收纳箱", "DeskNest 收纳箱"],
+        "DustDesk 快捷启动" => &[
+            "DustDesk 快捷启动",
+            "DustDusk 快捷启动",
+            "DeskNest 快捷启动",
+        ],
+        _ => &[],
+    }
 }
 
 #[tauri::command]
@@ -539,8 +653,10 @@ fn update_runtime_directory_impl(target: String, path: String) -> Result<AppSnap
     let old_data_dir = old_store.data_dir();
     let old_organizer_root = old_store.organizer_root();
     let old_launchers_root = old_store.launchers_root();
+    let requested_path = PathBuf::from(path);
+    validate_runtime_directory_target(&target, &requested_path, &old_store)?;
     let new_store =
-        AppStore::set_runtime_directory(&target, Path::new(path)).map_err(to_message)?;
+        AppStore::set_runtime_directory(&target, &requested_path).map_err(to_message)?;
     new_store.ensure_runtime_dirs().map_err(to_message)?;
     let new_data_dir = new_store.data_dir();
     let new_organizer_root = new_store.organizer_root();
@@ -548,9 +664,9 @@ fn update_runtime_directory_impl(target: String, path: String) -> Result<AppSnap
 
     match target.as_str() {
         "data" => {
-            copy_directory_contents(&old_data_dir, &new_data_dir)?;
-            copy_directory_contents(&old_organizer_root, &new_organizer_root)?;
-            copy_directory_contents(&old_launchers_root, &new_launchers_root)?;
+            move_directory_contents(&old_data_dir, &new_data_dir)?;
+            move_directory_contents(&old_organizer_root, &new_organizer_root)?;
+            move_directory_contents(&old_launchers_root, &new_launchers_root)?;
             rewrite_runtime_path_prefixes(
                 &new_store,
                 &[
@@ -561,17 +677,19 @@ fn update_runtime_directory_impl(target: String, path: String) -> Result<AppSnap
             )?;
         }
         "organizer" => {
-            copy_directory_contents(&old_organizer_root, &new_organizer_root)?;
+            move_directory_contents(&old_organizer_root, &new_organizer_root)?;
             rewrite_runtime_path_prefixes(
                 &new_store,
                 &[(&old_organizer_root, &new_organizer_root)],
             )?;
         }
         "launchers" => {
-            copy_directory_contents(&old_launchers_root, &new_launchers_root)?;
+            move_directory_contents(&old_launchers_root, &new_launchers_root)?;
         }
         _ => {}
     }
+
+    repair_existing_app_desktop_entries(&new_store)?;
 
     load_snapshot_impl()
 }
@@ -598,30 +716,24 @@ fn start_all_launchers() -> Result<usize, String> {
 
 #[tauri::command]
 fn show_desktop_widget(app: tauri::AppHandle) -> Result<(), String> {
-    show_merged_desktop_widget(&app)?;
-    show_desktop_launcher(&app)
+    show_persisted_desktop_layout(&app)
 }
 
 #[tauri::command]
-async fn desktop_frame_visibility(
-    app: tauri::AppHandle,
-) -> Result<DesktopFrameVisibility, String> {
+async fn desktop_frame_visibility(app: tauri::AppHandle) -> Result<DesktopFrameVisibility, String> {
     tauri::async_runtime::spawn_blocking(move || Ok(desktop_frame_visibility_impl(&app)))
         .await
         .map_err(to_message)?
 }
 
 #[tauri::command]
-async fn toggle_desktop_frames(
-    app: tauri::AppHandle,
-) -> Result<DesktopFrameVisibility, String> {
+async fn toggle_desktop_frames(app: tauri::AppHandle) -> Result<DesktopFrameVisibility, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let visibility = desktop_frame_visibility_impl(&app);
         if visibility.any {
             hide_desktop_card_windows(&app);
         } else {
-            show_merged_desktop_widget(&app)?;
-            show_desktop_launcher(&app)?;
+            show_persisted_desktop_layout(&app)?;
         }
         Ok(desktop_frame_visibility_impl(&app))
     })
@@ -663,12 +775,86 @@ async fn toggle_desktop_launcher_frame(
     .map_err(to_message)?
 }
 
+#[tauri::command]
+async fn save_desktop_window_layout(app: tauri::AppHandle, label: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if !is_desktop_card_window_label(&label) {
+            return Ok(());
+        }
+        let Some(window) = app.get_webview_window(&label) else {
+            return Ok(());
+        };
+        let position = window.outer_position().map_err(to_message)?;
+        let size = window.inner_size().map_err(to_message)?;
+        if size.width < 120 || size.height < 100 {
+            return Ok(());
+        }
+
+        with_config_mutation(|| {
+            let store = AppStore::open().map_err(to_message)?;
+            let mut config = store.load_config();
+            config.desktop_layout.windows.insert(
+                label,
+                DesktopWindowLayout {
+                    x: position.x,
+                    y: position.y,
+                    width: size.width,
+                    height: size.height,
+                },
+            );
+            store.save_config(&config).map_err(to_message)
+        })
+    })
+    .await
+    .map_err(to_message)?
+}
+
+#[tauri::command]
+async fn save_desktop_split_indices(indices: Vec<usize>) -> Result<Vec<usize>, String> {
+    tauri::async_runtime::spawn_blocking(move || save_desktop_split_indices_impl(indices))
+        .await
+        .map_err(to_message)?
+}
+
 fn show_merged_desktop_widget(app: &tauri::AppHandle) -> Result<(), String> {
     let window = app
         .get_webview_window("desktop-widget")
         .ok_or_else(|| "桌面框窗口不存在".to_owned())?;
     place_desktop_widget(&window).map_err(to_message)?;
     show_desktop_background_window(&window)
+}
+
+fn show_persisted_desktop_layout(app: &tauri::AppHandle) -> Result<(), String> {
+    let store = AppStore::open().map_err(to_message)?;
+    store.ensure_runtime_dirs().map_err(to_message)?;
+    let config = store.load_config();
+    let categories = config.desktop_categories;
+    let split_indices = normalize_desktop_split_indices(
+        config.desktop_layout.split_category_indices,
+        categories.len(),
+    );
+
+    if split_indices.is_empty() {
+        show_merged_desktop_widget(app)?;
+    } else {
+        if split_indices.len() < categories.len() {
+            show_merged_desktop_widget(app)?;
+        } else if let Some(window) = app.get_webview_window("desktop-widget") {
+            let _ = window.hide();
+        }
+
+        for index in split_indices.iter().copied() {
+            let Some(category) = categories.get(index) else {
+                continue;
+            };
+            let label = desktop_category_label(index);
+            let title = format!("DustDesk {}", category.name);
+            let url = desktop_card_url("category", Some(index));
+            show_or_create_desktop_card(app, &label, &title, &url, index)?;
+        }
+    }
+
+    show_desktop_launcher(app)
 }
 
 #[tauri::command]
@@ -688,10 +874,20 @@ async fn split_desktop_category(app: tauri::AppHandle, index: usize) -> Result<(
 fn split_desktop_category_impl(app: &tauri::AppHandle, index: usize) -> Result<(), String> {
     let store = AppStore::open().map_err(to_message)?;
     store.ensure_runtime_dirs().map_err(to_message)?;
-    let categories = store.load_config().desktop_categories;
-    let category = categories
-        .get(index)
-        .ok_or_else(|| "分类不存在".to_owned())?;
+    let category = with_config_mutation(|| {
+        let mut config = store.load_config();
+        let category = config
+            .desktop_categories
+            .get(index)
+            .cloned()
+            .ok_or_else(|| "分类不存在".to_owned())?;
+        let mut split_indices = config.desktop_layout.split_category_indices.clone();
+        split_indices.push(index);
+        config.desktop_layout.split_category_indices =
+            normalize_desktop_split_indices(split_indices, config.desktop_categories.len());
+        store.save_config(&config).map_err(to_message)?;
+        Ok(category)
+    })?;
 
     let label = desktop_category_label(index);
     let title = format!("DustDesk {}", category.name);
@@ -702,10 +898,17 @@ fn split_desktop_category_impl(app: &tauri::AppHandle, index: usize) -> Result<(
 }
 
 #[tauri::command]
-fn merge_desktop_category(app: tauri::AppHandle, index: usize) -> Result<(), String> {
-    hide_desktop_category_windows(&app, index);
-    show_merged_desktop_widget(&app)?;
-    show_desktop_launcher(&app)?;
+async fn merge_desktop_category(app: tauri::AppHandle, index: usize) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || merge_desktop_category_impl(&app, index))
+        .await
+        .map_err(to_message)?
+}
+
+fn merge_desktop_category_impl(app: &tauri::AppHandle, index: usize) -> Result<(), String> {
+    remove_desktop_split_index(index)?;
+    hide_desktop_category_windows(app, index);
+    show_merged_desktop_widget(app)?;
+    show_desktop_launcher(app)?;
     let _ = app.emit("dustdesk://desktop-cards-changed", ());
     Ok(())
 }
@@ -713,9 +916,13 @@ fn merge_desktop_category(app: tauri::AppHandle, index: usize) -> Result<(), Str
 fn show_split_desktop_widgets(app: &tauri::AppHandle) -> Result<Vec<usize>, String> {
     let store = AppStore::open().map_err(to_message)?;
     store.ensure_runtime_dirs().map_err(to_message)?;
-    let categories = store.load_config().desktop_categories;
-
-    let split_indices = (0..categories.len()).collect::<Vec<_>>();
+    let (categories, split_indices) = with_config_mutation(|| {
+        let mut config = store.load_config();
+        let split_indices = (0..config.desktop_categories.len()).collect::<Vec<_>>();
+        config.desktop_layout.split_category_indices = split_indices.clone();
+        store.save_config(&config).map_err(to_message)?;
+        Ok((config.desktop_categories, split_indices))
+    })?;
 
     if split_indices.is_empty() {
         show_desktop_launcher(app)?;
@@ -753,16 +960,64 @@ fn show_split_desktop_widgets(app: &tauri::AppHandle) -> Result<Vec<usize>, Stri
     Ok(split_indices)
 }
 
+fn save_desktop_split_indices_impl(indices: Vec<usize>) -> Result<Vec<usize>, String> {
+    with_config_mutation(|| {
+        let store = AppStore::open().map_err(to_message)?;
+        let mut config = store.load_config();
+        let split_indices =
+            normalize_desktop_split_indices(indices, config.desktop_categories.len());
+        config.desktop_layout.split_category_indices = split_indices.clone();
+        store.save_config(&config).map_err(to_message)?;
+        Ok(split_indices)
+    })
+}
+
+fn remove_desktop_split_index(index: usize) -> Result<Vec<usize>, String> {
+    with_config_mutation(|| {
+        let store = AppStore::open().map_err(to_message)?;
+        let mut config = store.load_config();
+        let split_indices = config
+            .desktop_layout
+            .split_category_indices
+            .iter()
+            .copied()
+            .filter(|item| *item != index)
+            .collect::<Vec<_>>();
+        let split_indices =
+            normalize_desktop_split_indices(split_indices, config.desktop_categories.len());
+        config.desktop_layout.split_category_indices = split_indices.clone();
+        store.save_config(&config).map_err(to_message)?;
+        Ok(split_indices)
+    })
+}
+
+fn normalize_desktop_split_indices(indices: Vec<usize>, category_count: usize) -> Vec<usize> {
+    let mut unique = indices
+        .into_iter()
+        .filter(|index| *index < category_count)
+        .collect::<Vec<_>>();
+    unique.sort_unstable();
+    unique.dedup();
+    unique
+}
+
 #[tauri::command]
 async fn merge_desktop_widgets(app: tauri::AppHandle) -> Result<(), String> {
-    for window in app.webview_windows().values() {
-        let label = window.label();
-        if label.starts_with("desktop-category-") || label == "desktop-launcher" {
-            let _ = window.hide();
+    tauri::async_runtime::spawn_blocking(move || {
+        save_desktop_split_indices_impl(Vec::new())?;
+        for window in app.webview_windows().values() {
+            let label = window.label();
+            if label.starts_with("desktop-category-") || label == "desktop-launcher" {
+                let _ = window.hide();
+            }
         }
-    }
-    show_merged_desktop_widget(&app)?;
-    show_desktop_launcher(&app)
+        show_merged_desktop_widget(&app)?;
+        show_desktop_launcher(&app)?;
+        let _ = app.emit("dustdesk://desktop-cards-changed", ());
+        Ok(())
+    })
+    .await
+    .map_err(to_message)?
 }
 
 #[tauri::command]
@@ -898,8 +1153,8 @@ async fn paste_clipboard_item(app: tauri::AppHandle, id: String) -> Result<(), S
     tauri::async_runtime::spawn_blocking(move || {
         clipboard_bridge::paste_history_item(&id, || hide_clipboard_overlay_impl(&app))
     })
-        .await
-        .map_err(to_message)?
+    .await
+    .map_err(to_message)?
 }
 
 #[tauri::command]
@@ -990,6 +1245,23 @@ fn update_search_settings(
     })
 }
 
+#[tauri::command]
+async fn update_launch_on_startup(enabled: bool) -> Result<AppSettings, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        with_config_mutation(|| {
+            let store = AppStore::open().map_err(to_message)?;
+            store.ensure_runtime_dirs().map_err(to_message)?;
+            let mut config = store.load_config();
+            set_launch_on_startup_shortcut(enabled)?;
+            config.settings.launch_on_startup = enabled;
+            store.save_config(&config).map_err(to_message)?;
+            Ok(config.settings)
+        })
+    })
+    .await
+    .map_err(to_message)?
+}
+
 fn with_config_mutation<T>(operation: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     let _guard = CONFIG_MUTATION_LOCK
         .get_or_init(|| Mutex::new(()))
@@ -1033,6 +1305,16 @@ fn remove_category_path_from_config(
 }
 
 fn restore_all_organized_items_to_desktop() -> Result<usize, String> {
+    restore_all_organized_items_to_desktop_impl(true)
+}
+
+fn restore_all_organized_items_to_desktop_and_clear_markers() -> Result<usize, String> {
+    restore_all_organized_items_to_desktop_impl(false)
+}
+
+fn restore_all_organized_items_to_desktop_impl(
+    keep_desktop_markers: bool,
+) -> Result<usize, String> {
     with_config_mutation(|| {
         let store = AppStore::open().map_err(to_message)?;
         store.ensure_runtime_dirs().map_err(to_message)?;
@@ -1059,10 +1341,12 @@ fn restore_all_organized_items_to_desktop() -> Result<usize, String> {
                         let restored_path = restore_path_to_desktop(&source, &desktop)?;
                         handled_paths.push(normalized);
                         handled_paths.push(normalize_path_for_compare(&restored_path));
-                        push_unique_category_path(
-                            &mut retained_paths,
-                            restored_path.display().to_string(),
-                        );
+                        if keep_desktop_markers {
+                            push_unique_category_path(
+                                &mut retained_paths,
+                                restored_path.display().to_string(),
+                            );
+                        }
                         restored += 1;
                     }
                 } else {
@@ -1085,20 +1369,27 @@ fn restore_all_organized_items_to_desktop() -> Result<usize, String> {
             let restored_path = restore_path_to_desktop(&path, &desktop)?;
             handled_paths.push(normalized);
             handled_paths.push(normalize_path_for_compare(&restored_path));
-            if let Some(index) =
-                category_index_for_organizer_path(&path, &organizer_root, &config.desktop_categories)
-            {
-                if let Some(category) = config.desktop_categories.get_mut(index) {
-                    push_unique_category_path(
-                        &mut category.item_paths,
-                        restored_path.display().to_string(),
-                    );
+            if keep_desktop_markers {
+                if let Some(index) = category_index_for_organizer_path(
+                    &path,
+                    &organizer_root,
+                    &config.desktop_categories,
+                ) {
+                    if let Some(category) = config.desktop_categories.get_mut(index) {
+                        push_unique_category_path(
+                            &mut category.item_paths,
+                            restored_path.display().to_string(),
+                        );
+                    }
                 }
             }
             restored += 1;
         }
 
         cleanup_empty_organizer_dirs(&organizer_root);
+        if !keep_desktop_markers {
+            config.desktop_layout.split_category_indices.clear();
+        }
         store.save_config(&config).map_err(to_message)?;
         Ok(restored)
     })
@@ -1114,10 +1405,7 @@ fn archive_marked_desktop_items_on_startup() -> Result<(), String> {
 }
 
 fn push_unique_category_path(paths: &mut Vec<String>, path: String) {
-    if paths
-        .iter()
-        .any(|existing| same_path_text(existing, &path))
-    {
+    if paths.iter().any(|existing| same_path_text(existing, &path)) {
         return;
     }
     paths.push(path);
@@ -1385,6 +1673,9 @@ fn desktop_items(include_icons: bool) -> Vec<DesktopItem> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
+            if is_desktop_ini_path(&path) {
+                continue;
+            }
             let key = path.to_string_lossy().to_lowercase();
             unique
                 .entry(key)
@@ -1432,7 +1723,26 @@ fn normalize_path_input(path: &str) -> Result<String, String> {
     Ok(trimmed.to_owned())
 }
 
-fn copy_directory_contents(source: &Path, target: &Path) -> Result<(), String> {
+fn validate_runtime_directory_target(
+    target: &str,
+    requested_path: &Path,
+    old_store: &AppStore,
+) -> Result<(), String> {
+    let source = match target {
+        "data" => old_store.data_dir(),
+        "organizer" => old_store.organizer_root(),
+        "launchers" => old_store.launchers_root(),
+        _ => return Ok(()),
+    };
+
+    if is_target_inside_source(&source, requested_path) {
+        return Err("新目录不能设置在原目录内部，请选择原目录外的位置后再迁移".to_owned());
+    }
+
+    Ok(())
+}
+
+fn move_directory_contents(source: &Path, target: &Path) -> Result<(), String> {
     if !source.exists() {
         return Ok(());
     }
@@ -1440,12 +1750,13 @@ fn copy_directory_contents(source: &Path, target: &Path) -> Result<(), String> {
         return Err(format!("源路径不是目录：{}", source.display()));
     }
 
-    fs::create_dir_all(target).map_err(to_message)?;
-    let source_key = normalize_path_for_compare(source);
-    let target_key = normalize_path_for_compare(target);
-    if source_key == target_key || target_key.starts_with(&format!("{source_key}\\")) {
+    if same_path_for_move(source, target) {
         return Ok(());
     }
+    if is_target_inside_source(source, target) {
+        return Err("新目录不能设置在原目录内部，请选择原目录外的位置后再迁移".to_owned());
+    }
+    fs::create_dir_all(target).map_err(to_message)?;
 
     for entry in fs::read_dir(source).map_err(to_message)?.flatten() {
         let source_path = entry.path();
@@ -1453,14 +1764,47 @@ fn copy_directory_contents(source: &Path, target: &Path) -> Result<(), String> {
             continue;
         };
         let target_path = target.join(file_name);
-        if source_path.is_dir() {
-            copy_directory_contents(&source_path, &target_path)?;
-        } else if !target_path.exists() {
-            fs::copy(&source_path, &target_path).map_err(to_message)?;
+
+        if target_path.exists() {
+            if source_path.is_dir() && target_path.is_dir() {
+                move_directory_contents(&source_path, &target_path)?;
+                let _ = fs::remove_dir(&source_path);
+            }
+            continue;
+        }
+
+        match fs::rename(&source_path, &target_path) {
+            Ok(()) => {}
+            Err(_) if source_path.is_dir() => {
+                move_directory_contents(&source_path, &target_path)?;
+                let _ = fs::remove_dir(&source_path);
+            }
+            Err(error) => {
+                fs::copy(&source_path, &target_path).map_err(to_message)?;
+                fs::remove_file(&source_path).map_err(|remove_error| {
+                    format!(
+                        "已复制到新目录，但删除原文件失败：{}；原始移动错误：{}",
+                        remove_error, error
+                    )
+                })?;
+            }
         }
     }
 
+    let _ = fs::remove_dir(source);
     Ok(())
+}
+
+fn same_path_for_move(left: &Path, right: &Path) -> bool {
+    normalize_path_for_compare(left) == normalize_path_for_compare(right)
+}
+
+fn is_target_inside_source(source: &Path, target: &Path) -> bool {
+    let source_key = normalize_path_for_compare(source);
+    let target_key = normalize_path_for_compare(target);
+    !source_key.is_empty()
+        && source_key != target_key
+        && target_key.starts_with(&format!("{source_key}\\"))
 }
 
 fn rewrite_runtime_path_prefixes(
@@ -1521,6 +1865,12 @@ fn same_path_text(left: &str, right: &str) -> bool {
     left.trim().eq_ignore_ascii_case(right.trim())
 }
 
+fn is_desktop_ini_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("desktop.ini"))
+}
+
 fn should_skip_desktop_classify_item(item: &DesktopItem) -> bool {
     let name = item.name.trim();
     let lower_name = name.to_lowercase();
@@ -1530,9 +1880,31 @@ fn should_skip_desktop_classify_item(item: &DesktopItem) -> bool {
         return true;
     }
 
+    if is_app_desktop_entry(&lower_name, &extension) {
+        return true;
+    }
+
+    false
+}
+
+fn is_app_desktop_entry(lower_name: &str, extension: &str) -> bool {
+    if !matches!(extension, "lnk" | "dir") {
+        return false;
+    }
+
+    let compact_name = lower_name
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+
     matches!(
-        name,
-        "DustDesk 收纳箱" | "DustDesk 快捷启动" | "DustDesk 桌面收纳"
+        compact_name.as_str(),
+        "dustdesk收纳箱"
+            | "dustdesk快捷启动"
+            | "dustdusk收纳箱"
+            | "dustdusk快捷启动"
+            | "desknest收纳箱"
+            | "desknest快捷启动"
     )
 }
 
@@ -1686,9 +2058,7 @@ fn classify_desktop_item(item: &DesktopItem, categories: &[DeskCategory]) -> Opt
     }
 
     if item.is_dir {
-        return find_category_index(categories, &["本机", "文件", "文档"])
-            .or_else(|| find_category_index(categories, &["工具"]))
-            .or(Some(0));
+        return find_category_index(categories, &["文档", "资料", "文件"]).or(Some(0));
     }
 
     find_category_index(categories, &["工具", "本机"]).or(Some(0))
@@ -1784,6 +2154,10 @@ fn repair_category_item_paths(store: &AppStore, config: &mut AppConfig) -> Resul
 
         for item_path in old_paths {
             let source = PathBuf::from(&item_path);
+            if is_desktop_ini_path(&source) {
+                changed = true;
+                continue;
+            }
             if !source.exists() {
                 changed = true;
                 continue;
@@ -1821,11 +2195,7 @@ fn repair_category_item_paths(store: &AppStore, config: &mut AppConfig) -> Resul
 
         for entry in entries.flatten() {
             let path = entry.path();
-            if path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.eq_ignore_ascii_case("desktop.ini"))
-            {
+            if is_desktop_ini_path(&path) {
                 continue;
             }
 
@@ -2402,11 +2772,36 @@ fn open_with_shell(path: &str) -> Result<(), String> {
         .map_err(to_message)
 }
 
+fn set_launch_on_startup_shortcut(enabled: bool) -> Result<(), String> {
+    let shortcut = startup_shortcut_path()?;
+    if enabled {
+        let exe = env::current_exe().map_err(to_message)?;
+        create_windows_shortcut(&shortcut, &exe, "DeskNest 开机自启")?;
+    } else if shortcut.exists() {
+        fs::remove_file(&shortcut).map_err(to_message)?;
+    }
+    Ok(())
+}
+
+fn startup_shortcut_path() -> Result<PathBuf, String> {
+    let app_data = env::var_os("APPDATA").ok_or_else(|| "没有找到 APPDATA 目录".to_owned())?;
+    Ok(PathBuf::from(app_data)
+        .join("Microsoft")
+        .join("Windows")
+        .join("Start Menu")
+        .join("Programs")
+        .join("Startup")
+        .join("DeskNest.lnk"))
+}
+
 fn create_windows_shortcut(
     shortcut: &Path,
     target: &Path,
     description: &str,
 ) -> Result<(), String> {
+    if let Some(parent) = shortcut.parent() {
+        fs::create_dir_all(parent).map_err(to_message)?;
+    }
     let working_dir = target.parent().unwrap_or(target).display().to_string();
     let shortcut = ps_quote(&shortcut.display().to_string());
     let target = ps_quote(&target.display().to_string());
@@ -2586,6 +2981,16 @@ fn configured_settings() -> AppSettings {
         .unwrap_or_default()
 }
 
+fn sync_launch_on_startup_setting() {
+    let Ok(store) = AppStore::open() else {
+        return;
+    };
+    let config = store.load_config();
+    if let Err(error) = set_launch_on_startup_shortcut(config.settings.launch_on_startup) {
+        eprintln!("failed to sync launch on startup shortcut: {error}");
+    }
+}
+
 fn shortcut_matches(shortcut: &Shortcut, configured: &str) -> bool {
     configured
         .parse::<Shortcut>()
@@ -2625,6 +3030,56 @@ fn hide_clipboard_overlay_impl(app: &tauri::AppHandle) {
 
 fn emit_desktop_cards_changed(app: &tauri::AppHandle) {
     let _ = app.emit("dustdesk://desktop-cards-changed", ());
+}
+
+fn start_desktop_background_operation(
+    app: tauri::AppHandle,
+    kind: &'static str,
+    operation: impl FnOnce() -> Result<DesktopOperationPayload, String> + Send + 'static,
+) -> Result<(), String> {
+    if DESKTOP_OPERATION_RUNNING.swap(true, Ordering::SeqCst) {
+        return Err("已有桌面整理任务正在执行，请稍后再试".to_owned());
+    }
+
+    emit_desktop_operation(
+        &app,
+        DesktopOperationPayload {
+            kind,
+            status: "started",
+            message: match kind {
+                "classify" => "正在智能收纳桌面...".to_owned(),
+                "restore" => "正在还原桌面...".to_owned(),
+                _ => "正在处理桌面项目...".to_owned(),
+            },
+            moved: 0,
+            skipped: 0,
+            restored: 0,
+            category_counts: Vec::new(),
+        },
+    );
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let payload = match operation() {
+            Ok(payload) => payload,
+            Err(error) => DesktopOperationPayload {
+                kind,
+                status: "failed",
+                message: error,
+                moved: 0,
+                skipped: 0,
+                restored: 0,
+                category_counts: Vec::new(),
+            },
+        };
+        emit_desktop_operation(&app, payload);
+        DESKTOP_OPERATION_RUNNING.store(false, Ordering::SeqCst);
+    });
+
+    Ok(())
+}
+
+fn emit_desktop_operation(app: &tauri::AppHandle, payload: DesktopOperationPayload) {
+    let _ = app.emit(DESKTOP_OPERATION_EVENT, payload);
 }
 
 fn place_clipboard_overlay(window: &WebviewWindow) -> tauri::Result<()> {
@@ -2668,6 +3123,16 @@ fn place_search_overlay(window: &WebviewWindow) -> tauri::Result<()> {
 fn place_desktop_widget(window: &WebviewWindow) -> tauri::Result<()> {
     const MIN_WIDTH: u32 = 520;
     const MIN_HEIGHT: u32 = 320;
+
+    if let Some(layout) = saved_desktop_window_layout("desktop-widget") {
+        let width = layout.width.max(MIN_WIDTH);
+        let height = layout.height.max(MIN_HEIGHT);
+        window.set_size(Size::Physical(PhysicalSize::new(width, height)))?;
+        window.set_position(Position::Physical(PhysicalPosition::new(
+            layout.x, layout.y,
+        )))?;
+        return Ok(());
+    }
 
     let Some(monitor) = window.current_monitor()?.or(window.primary_monitor()?) else {
         return Ok(());
@@ -2715,7 +3180,9 @@ fn show_or_create_desktop_card(
     index: usize,
 ) -> Result<(), String> {
     if let Some(window) = app.get_webview_window(label) {
-        restore_desktop_card_size_if_collapsed(&window, label)?;
+        if !apply_saved_desktop_window_layout(&window, label)? {
+            restore_desktop_card_size_if_collapsed(&window, label)?;
+        }
         return show_desktop_background_window(&window);
     }
 
@@ -2789,7 +3256,6 @@ fn create_desktop_card(
     let row = index / columns;
     let x = work_area.position.x as f64 + 28.0 + (width + gap) * column as f64;
     let y = work_area.position.y as f64 + 72.0 + (height + gap) * row as f64;
-
     WebviewWindowBuilder::new(app, label, WebviewUrl::App(url.into()))
         .title(title)
         .inner_size(width, height)
@@ -2804,10 +3270,15 @@ fn create_desktop_card(
         .always_on_top(false)
         .always_on_bottom(true)
         .focused(false)
-        .visible(true)
+        .visible(false)
         .build()
         .map_err(to_message)
-        .and_then(|window| show_desktop_background_window(&window))
+        .and_then(|window| {
+            if !apply_saved_desktop_window_layout(&window, label)? {
+                restore_desktop_card_size_if_collapsed(&window, label)?;
+            }
+            show_desktop_background_window(&window)
+        })
 }
 
 fn desktop_card_url(kind: &str, index: Option<usize>) -> String {
@@ -2906,6 +3377,40 @@ fn desktop_frame_visibility_impl(app: &tauri::AppHandle) -> DesktopFrameVisibili
     }
 }
 
+fn saved_desktop_window_layout(label: &str) -> Option<DesktopWindowLayout> {
+    if !is_desktop_card_window_label(label) {
+        return None;
+    }
+
+    let store = AppStore::open().ok()?;
+    let config = store.load_config();
+    let layout = config.desktop_layout.windows.get(label)?.clone();
+    is_valid_desktop_window_layout(&layout).then_some(layout)
+}
+
+fn apply_saved_desktop_window_layout(window: &WebviewWindow, label: &str) -> Result<bool, String> {
+    let Some(layout) = saved_desktop_window_layout(label) else {
+        return Ok(false);
+    };
+
+    window
+        .set_size(Size::Physical(PhysicalSize::new(
+            layout.width,
+            layout.height,
+        )))
+        .map_err(to_message)?;
+    window
+        .set_position(Position::Physical(PhysicalPosition::new(
+            layout.x, layout.y,
+        )))
+        .map_err(to_message)?;
+    Ok(true)
+}
+
+fn is_valid_desktop_window_layout(layout: &DesktopWindowLayout) -> bool {
+    layout.width >= 120 && layout.height >= 100
+}
+
 fn cleanup_desktop_card_windows_impl(app: &tauri::AppHandle) {
     for window in app.webview_windows().values() {
         if is_desktop_card_window_label(window.label()) {
@@ -2952,10 +3457,10 @@ fn request_real_app_exit(app: tauri::AppHandle) {
     }
 
     tauri::async_runtime::spawn_blocking(move || {
+        cleanup_desktop_card_windows_impl(&app);
         if let Err(error) = restore_all_organized_items_to_desktop() {
             eprintln!("failed to restore organized desktop items on exit: {error}");
         }
-        cleanup_desktop_card_windows_impl(&app);
         app.exit(0);
     });
 }
@@ -3038,6 +3543,7 @@ fn main() {
         .setup(|app| {
             let app_handle = app.handle().clone();
             setup_system_tray(&app_handle)?;
+            sync_launch_on_startup_setting();
             clipboard_bridge::spawn_text_history_monitor();
             let settings = configured_settings();
             let clipboard_shortcut = settings.clipboard_shortcut_value();
@@ -3054,19 +3560,19 @@ fn main() {
                 }
             }
 
-            if let Err(error) = archive_marked_desktop_items_on_startup() {
-                eprintln!("failed to archive marked desktop items on startup: {error}");
-            }
-
             if let Some(window) = app.get_webview_window("desktop-widget") {
                 let _ = place_desktop_widget(&window);
             }
             let handle = app.handle().clone();
-            if let Err(error) =
-                show_merged_desktop_widget(&handle).and_then(|_| show_desktop_launcher(&handle))
-            {
+            if let Err(error) = show_persisted_desktop_layout(&handle) {
                 eprintln!("failed to show desktop cards: {error}");
             }
+            tauri::async_runtime::spawn_blocking(move || {
+                if let Err(error) = archive_marked_desktop_items_on_startup() {
+                    eprintln!("failed to archive marked desktop items on startup: {error}");
+                }
+                emit_desktop_cards_changed(&handle);
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -3081,11 +3587,14 @@ fn main() {
             add_items_to_category,
             remove_item_from_category,
             restore_item_to_desktop,
+            restore_all_to_desktop,
+            start_restore_all_to_desktop_task,
             add_launcher,
             add_launchers,
             remove_launcher,
             show_path_in_folder,
             classify_desktop_items,
+            start_classify_desktop_items_task,
             create_desktop_entries,
             open_special,
             update_runtime_directory,
@@ -3096,6 +3605,8 @@ fn main() {
             toggle_desktop_frames,
             toggle_desktop_organizer_frame,
             toggle_desktop_launcher_frame,
+            save_desktop_window_layout,
+            save_desktop_split_indices,
             split_desktop_widgets,
             split_desktop_category,
             merge_desktop_category,
@@ -3112,7 +3623,8 @@ fn main() {
             paste_clipboard_item,
             hide_clipboard_overlay,
             update_clipboard_shortcut,
-            update_search_settings
+            update_search_settings,
+            update_launch_on_startup
         ])
         .run(tauri::generate_context!())
         .expect("failed to run DustDesk Tauri app");

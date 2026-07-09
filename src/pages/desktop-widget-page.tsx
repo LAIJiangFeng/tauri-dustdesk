@@ -15,6 +15,7 @@ import {
   Briefcase,
   Code,
   Columns,
+  Desktop,
   Eye,
   EyeSlash,
   FileText,
@@ -36,30 +37,25 @@ import { FileIcon } from "@/components/dustdesk/file-icon"
 import { ItemContextMenu, type ItemContextMenuAction } from "@/components/dustdesk/item-context-menu"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { usePersistCurrentWindowLayout } from "@/hooks/use-persist-current-window-layout"
 import { useTheme } from "@/hooks/use-theme"
 import { allowPathLikeDrag, didDragEndOutsideWindow, writeDustDeskPathDrag } from "@/lib/dustdesk-dnd"
 import {
-  getCurrentWindowInnerSize,
-  listenCurrentWindowResize,
   repaintCurrentWindow,
   safeCurrentWebviewDragDropEvent,
   safeListen,
-  setCurrentWindowSize,
   startCurrentWindowDragging,
   startCurrentWindowResizeDragging,
 } from "@/lib/tauri-window"
 import { cn, displayPathName, extensionFromPath } from "@/lib/utils"
 import { useDustDeskStore } from "@/stores/dustdesk-store"
-import type { DesktopItem } from "@/types"
+import type { DesktopItem, DesktopOperationEvent } from "@/types"
 
 const activeCategoryKey = "dustdesk-desktop-widget-active-category"
 const settingsStorageKey = "dustdesk-desktop-widget-settings"
 const layoutsStorageKey = "dustdesk-desktop-widget-layouts"
 const legacyCollapsedStorageKey = "dustdesk-desktop-widget-collapsed"
-const windowSizeStorageKey = "dustdesk-desktop-widget-window-size"
 const splitCategoriesStorageKey = "dustdesk-desktop-widget-split-categories"
-const defaultWindowSize = { width: 720, height: 460 }
-const minWindowSize = { width: 520, height: 320 }
 
 type DropTarget = { type: "category"; index: number } | { type: "launcher" }
 
@@ -100,6 +96,7 @@ const launcherVisual = {
 
 export function DesktopWidgetPage() {
   useTheme()
+  usePersistCurrentWindowLayout("desktop-widget")
   const snapshot = useDustDeskStore((state) => state.snapshot)
   const loadDesktopSnapshot = useDustDeskStore((state) => state.loadDesktopSnapshot)
   const createCategory = useDustDeskStore((state) => state.createCategory)
@@ -111,21 +108,31 @@ export function DesktopWidgetPage() {
   const addLaunchersLight = useDustDeskStore((state) => state.addLaunchersLight)
   const removeLauncher = useDustDeskStore((state) => state.removeLauncher)
   const restoreItemToDesktop = useDustDeskStore((state) => state.restoreItemToDesktop)
+  const startRestoreAllToDesktopTask = useDustDeskStore((state) => state.startRestoreAllToDesktopTask)
   const showPathInFolder = useDustDeskStore((state) => state.showPathInFolder)
-  const classifyDesktopItems = useDustDeskStore((state) => state.classifyDesktopItems)
+  const startClassifyDesktopItemsTask = useDustDeskStore((state) => state.startClassifyDesktopItemsTask)
   const startAllLaunchers = useDustDeskStore((state) => state.startAllLaunchers)
   const splitDesktopWidgets = useDustDeskStore((state) => state.splitDesktopWidgets)
   const splitDesktopCategory = useDustDeskStore((state) => state.splitDesktopCategory)
+  const mergeDesktopWidgets = useDustDeskStore((state) => state.mergeDesktopWidgets)
+  const saveDesktopSplitIndices = useDustDeskStore((state) => state.saveDesktopSplitIndices)
   const hideCurrentWindow = useDustDeskStore((state) => state.hideCurrentWindow)
   const [activeCategoryId, setActiveCategoryId] = useState(() => globalThis.localStorage.getItem(activeCategoryKey) || "category:0")
-  const [splitCategoryIndices, setSplitCategoryIndices] = useState<number[]>(readSplitCategoryIndices)
+  const [splitCategoryIndices, setSplitCategoryIndices] = useState<number[]>([])
   const [settings, setSettings] = useState<WidgetSettings>(readSettings)
   const [layouts, setLayouts] = useState<Record<string, CardLayout>>(readLayouts)
   const [openSettingsId, setOpenSettingsId] = useState("")
   const [hoverZone, setHoverZone] = useState("")
   const [notice, setNotice] = useState("")
+  const [isClassifyingDesktop, setIsClassifyingDesktop] = useState(false)
+  const [isRestoringDesktop, setIsRestoringDesktop] = useState(false)
+  const [isMergingCategories, setIsMergingCategories] = useState(false)
+  const desktopOperationLabel = isClassifyingDesktop ? "正在智能收纳桌面..." : isRestoringDesktop ? "正在还原桌面..." : isMergingCategories ? "正在合并分类..." : ""
+  const hasSnapshot = Boolean(snapshot.data_dir)
   const dragRef = useRef<{ id: string; x: number; y: number; rect: CardLayout } | null>(null)
   const resizeRef = useRef<{ id: string; x: number; y: number; rect: CardLayout } | null>(null)
+  const pendingClassifyActionRef = useRef<"split-all" | null>(null)
+  const previousSplitCategoryIndicesRef = useRef<number[]>([])
 
   useEffect(() => {
     if (!notice) return
@@ -154,13 +161,8 @@ export function DesktopWidgetPage() {
     document.documentElement.classList.add("desktop-widget-root")
     const repaintTimers = [window.setTimeout(() => void repaintCurrentWindow(), 50), window.setTimeout(() => void repaintCurrentWindow(), 240)]
     const hadLegacyCollapsedState = Boolean(globalThis.localStorage.getItem(legacyCollapsedStorageKey))
-    const savedWindowSize = readWindowSize()
     if (hadLegacyCollapsedState) {
       globalThis.localStorage.removeItem(legacyCollapsedStorageKey)
-    }
-    const size = savedWindowSize ?? (hadLegacyCollapsedState ? defaultWindowSize : null)
-    if (size) {
-      void setCurrentWindowSize(size.width, size.height, minWindowSize.width, minWindowSize.height)
     }
     return () => {
       document.documentElement.classList.remove("desktop-widget-root")
@@ -170,41 +172,29 @@ export function DesktopWidgetPage() {
 
   useEffect(() => {
     let unlisten: (() => void) | undefined
-    let saveTimer: number | undefined
-    const initialSaveTimer = window.setTimeout(() => {
-      void getCurrentWindowInnerSize().then((size) => {
-        if (size) writeWindowSize(size)
-      })
-    }, 360)
-
-    void listenCurrentWindowResize((size) => {
-      if (saveTimer) {
-        window.clearTimeout(saveTimer)
-      }
-      saveTimer = window.setTimeout(() => writeWindowSize(size), 160)
-    }).then((value) => {
-      unlisten = value
-    })
-
-    return () => {
-      window.clearTimeout(initialSaveTimer)
-      if (saveTimer) {
-        window.clearTimeout(saveTimer)
-      }
-      unlisten?.()
-    }
-  }, [])
-
-  useEffect(() => {
-    let unlisten: (() => void) | undefined
     void safeListen("dustdesk://desktop-cards-changed", () => {
-      setSplitCategoryIndices(readSplitCategoryIndices())
-      void loadDesktopSnapshot()
+      void loadDesktopSnapshot({ force: true })
     }).then((value) => {
       unlisten = value
     })
     return () => unlisten?.()
   }, [loadDesktopSnapshot])
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined
+    void safeListen<DesktopOperationEvent>("dustdesk://desktop-operation", (event) => {
+      const payload = event.payload
+      if (payload.status === "started") return
+      if (payload.kind === "classify") {
+        void finishClassifyOperation(payload)
+      } else if (payload.kind === "restore") {
+        void finishRestoreOperation(payload)
+      }
+    }).then((value) => {
+      unlisten = value
+    })
+    return () => unlisten?.()
+  }, [loadDesktopSnapshot, saveDesktopSplitIndices, splitDesktopWidgets])
 
   useEffect(() => {
     const valid = splitCategoryIndices.filter((index) => index >= 0 && index < snapshot.categories.length)
@@ -214,13 +204,19 @@ export function DesktopWidgetPage() {
   }, [snapshot.categories.length, splitCategoryIndices])
 
   useEffect(() => {
+    if (!hasSnapshot) return
+    const persisted = normalizeSplitCategoryIndices(snapshot.desktop_layout.split_category_indices, snapshot.categories.length)
+    setSplitCategoryIndices((current) => {
+      if (sameNumberList(current, persisted)) return current
+      writeSplitCategoryIndices(persisted)
+      return persisted
+    })
+  }, [hasSnapshot, snapshot.categories.length, snapshot.desktop_layout.split_category_indices])
+
+  useEffect(() => {
     if (activeCategory || groupedCategories.length === 0) return
     setActiveCategoryId(groupedCategories[0].id)
   }, [activeCategory, groupedCategories])
-
-  useEffect(() => {
-    writeSplitCategoryIndices(splitCategoryIndices)
-  }, [splitCategoryIndices])
 
   useEffect(() => {
     globalThis.localStorage.setItem(activeCategoryKey, activeCategory?.id ?? "category:0")
@@ -321,7 +317,10 @@ export function DesktopWidgetPage() {
   }, [])
 
   async function handleDroppedPaths(target: DropTarget, paths: string[]) {
-    if (paths.length === 0) return
+    if (paths.length === 0) {
+      setNotice("这个桌面图标不是普通文件路径，Windows 不允许直接移动到收纳箱")
+      return
+    }
     try {
       if (target.type === "launcher") {
         const added = await addLaunchersLight(paths)
@@ -351,27 +350,36 @@ export function DesktopWidgetPage() {
   }
 
   async function handleClassifyDesktopItems() {
+    if (isClassifyingDesktop) return
+    pendingClassifyActionRef.current = null
+    setIsClassifyingDesktop(true)
+    setNotice("正在智能收纳桌面...")
     try {
-      const result = await classifyDesktopItems()
-      setNotice(classifyResultNotice(result))
+      setOpenSettingsId("")
+      await startClassifyDesktopItemsTask()
     } catch (error) {
+      pendingClassifyActionRef.current = null
       setNotice(error instanceof Error ? error.message : String(error))
+      setIsClassifyingDesktop(false)
     }
   }
 
   async function handleOrganizeAndSplitAll() {
+    if (isClassifyingDesktop) return
     const previous = splitCategoryIndices
+    pendingClassifyActionRef.current = "split-all"
+    previousSplitCategoryIndicesRef.current = previous
+    setIsClassifyingDesktop(true)
+    setNotice("正在智能收纳并拆分...")
     try {
-      const result = await classifyDesktopItems()
-      const next = await splitDesktopWidgets()
       setOpenSettingsId("")
-      writeSplitCategoryIndices(next)
-      setSplitCategoryIndices(next)
-      setNotice(next.length > 0 ? `${classifyResultNotice(result)}，已拆出 ${next.length} 个分类` : `${classifyResultNotice(result)}，没有可拆出的分类内容`)
+      await startClassifyDesktopItemsTask()
     } catch (error) {
+      pendingClassifyActionRef.current = null
       writeSplitCategoryIndices(previous)
       setSplitCategoryIndices(previous)
       setNotice(error instanceof Error ? error.message : String(error))
+      setIsClassifyingDesktop(false)
     }
   }
 
@@ -388,6 +396,26 @@ export function DesktopWidgetPage() {
       writeSplitCategoryIndices(previous)
       setSplitCategoryIndices(previous)
       setNotice(error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  async function handleMergeAllCategories() {
+    if (isMergingCategories) return
+
+    setIsMergingCategories(true)
+    setNotice("正在合并分类...")
+    try {
+      setOpenSettingsId("")
+      await mergeDesktopWidgets()
+      await loadDesktopSnapshot({ force: true })
+      writeSplitCategoryIndices([])
+      setSplitCategoryIndices([])
+      setActiveCategoryId("category:0")
+      setNotice(splitCategoryIndices.length > 0 ? `已合并 ${splitCategoryIndices.length} 个分类` : "分类已处于合并状态")
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : String(error))
+    } finally {
+      setIsMergingCategories(false)
     }
   }
 
@@ -459,6 +487,69 @@ export function DesktopWidgetPage() {
     }
   }
 
+  async function handleRestoreAllToDesktop() {
+    if (isRestoringDesktop) return
+    if (!window.confirm("确认把所有收纳箱项目移回桌面吗？这会清空对应的收纳记录。")) return
+
+    setIsRestoringDesktop(true)
+    setNotice("正在还原桌面...")
+    try {
+      setOpenSettingsId("")
+      await startRestoreAllToDesktopTask()
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : String(error))
+      setIsRestoringDesktop(false)
+    }
+  }
+
+  async function finishClassifyOperation(payload: DesktopOperationEvent) {
+    if (payload.status === "failed") {
+      pendingClassifyActionRef.current = null
+      setNotice(payload.message || "智能收纳失败")
+      setIsClassifyingDesktop(false)
+      return
+    }
+
+    await loadDesktopSnapshot({ force: true })
+    const result = classifyResultFromOperation(payload)
+    if (pendingClassifyActionRef.current === "split-all") {
+      pendingClassifyActionRef.current = null
+      try {
+        const next = await splitDesktopWidgets()
+        writeSplitCategoryIndices(next)
+        setSplitCategoryIndices(next)
+        setNotice(next.length > 0 ? `${classifyResultNotice(result)}，已拆出 ${next.length} 个分类` : `${classifyResultNotice(result)}，没有可拆出的分类内容`)
+      } catch (error) {
+        const previous = previousSplitCategoryIndicesRef.current
+        writeSplitCategoryIndices(previous)
+        setSplitCategoryIndices(previous)
+        setNotice(error instanceof Error ? error.message : String(error))
+      } finally {
+        setIsClassifyingDesktop(false)
+      }
+      return
+    }
+
+    setNotice(classifyResultNotice(result))
+    setIsClassifyingDesktop(false)
+  }
+
+  async function finishRestoreOperation(payload: DesktopOperationEvent) {
+    if (payload.status === "failed") {
+      setNotice(payload.message || "还原桌面失败")
+      setIsRestoringDesktop(false)
+      return
+    }
+
+    await loadDesktopSnapshot({ force: true })
+    writeSplitCategoryIndices([])
+    await saveDesktopSplitIndices([])
+    setSplitCategoryIndices([])
+    setActiveCategoryId("category:0")
+    setNotice(payload.message || (payload.restored > 0 ? `已还原 ${payload.restored} 项到桌面` : "没有需要还原到桌面的收纳项目"))
+    setIsRestoringDesktop(false)
+  }
+
   function updateSettings(next: Partial<WidgetSettings>) {
     setSettings((value) => ({ ...value, ...next }))
   }
@@ -492,8 +583,13 @@ export function DesktopWidgetPage() {
     updateSettings,
     onSplitCategory: () => (activeCategory ? handleSplitCategory(activeCategory.index) : Promise.resolve()),
     onSplitAllCategories: handleSplitAllCategories,
+    onMergeAllCategories: handleMergeAllCategories,
     onClassifyDesktop: handleClassifyDesktopItems,
     onOrganizeAndSplitAll: handleOrganizeAndSplitAll,
+    onRestoreAllToDesktop: handleRestoreAllToDesktop,
+    isClassifyingDesktop,
+    isRestoringDesktop,
+    isMergingCategories,
     onRefresh: handleRefresh,
     onHide: hideCurrentWindow,
   }
@@ -510,7 +606,7 @@ export function DesktopWidgetPage() {
         data-drop-zone={activeCategory?.id ?? "category:0"}
         style={frameStyle}
         className={cn(
-          "flex h-full w-full min-w-0 flex-col overflow-hidden rounded-2xl border border-white/15 backdrop-blur-2xl transition-colors",
+          "relative flex h-full w-full min-w-0 flex-col overflow-hidden rounded-2xl border border-white/15 backdrop-blur-2xl transition-colors",
           activeCategory && (hoverZone === "organizer" || hoverZone === activeCategory.id) && "border-emerald-200/80",
         )}
       >
@@ -543,8 +639,9 @@ export function DesktopWidgetPage() {
             onRestoreDragOut={handleRestoreDragOut}
           />
         ) : (
-          <EmptyDropHint title="分类都已拆出" detail="在单独分类卡片的设置里点合并，就会回到这个分类组。" />
+          <EmptyDropHint title="分类都已拆出" detail="在设置里点一键合并分类，就会回到这个分类组。" />
         )}
+        {desktopOperationLabel ? <WidgetOperationOverlay label={desktopOperationLabel} /> : null}
       </section>
       {notice ? <div className="pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full bg-slate-950/70 px-3 py-1 text-xs text-white/80 ring-1 ring-white/10">{notice}</div> : null}
       <button
@@ -556,6 +653,17 @@ export function DesktopWidgetPage() {
           void startCurrentWindowResizeDragging("SouthEast")
         }}
       />
+    </div>
+  )
+}
+
+function WidgetOperationOverlay({ label }: { label: string }) {
+  return (
+    <div className="no-drag absolute inset-0 z-40 grid place-items-center bg-slate-950/60 backdrop-blur-md">
+      <div className="flex items-center gap-2 rounded-xl border border-white/15 bg-slate-950/90 px-3 py-2 text-xs font-semibold text-white shadow-2xl shadow-black/30">
+        <ArrowsClockwise className="size-4 animate-spin text-emerald-300" weight="duotone" />
+        <span>{label}</span>
+      </div>
     </div>
   )
 }
@@ -623,8 +731,13 @@ interface SettingsMenuProps {
   updateSettings: (settings: Partial<WidgetSettings>) => void
   onSplitCategory: () => Promise<void>
   onSplitAllCategories: () => Promise<void>
+  onMergeAllCategories: () => Promise<void>
   onClassifyDesktop: () => Promise<void>
   onOrganizeAndSplitAll: () => Promise<void>
+  onRestoreAllToDesktop: () => Promise<void>
+  isClassifyingDesktop: boolean
+  isRestoringDesktop: boolean
+  isMergingCategories: boolean
   onRefresh: () => Promise<void>
   onHide: () => Promise<void>
 }
@@ -750,20 +863,27 @@ function SettingsMenu({
   updateSettings,
   onSplitCategory,
   onSplitAllCategories,
+  onMergeAllCategories,
   onClassifyDesktop,
   onOrganizeAndSplitAll,
+  onRestoreAllToDesktop,
+  isClassifyingDesktop,
+  isRestoringDesktop,
+  isMergingCategories,
   onRefresh,
   onHide,
 }: SettingsMenuProps) {
   return (
     <div className="desktop-widget-scroll absolute right-0 top-8 z-50 max-h-[min(64vh,260px)] w-48 overflow-y-auto rounded-xl border border-white/15 bg-slate-950/85 p-1 text-white shadow-2xl shadow-black/30 backdrop-blur-2xl">
+      <MenuButton icon={Columns} label={isMergingCategories ? "合并中" : "一键合并分类"} disabled={isMergingCategories} onClick={() => void onMergeAllCategories()} />
       <MenuButton icon={Columns} label="拆出当前分类" onClick={() => void onSplitCategory()} />
       <MenuButton icon={Columns} label="拆分全部分类" onClick={() => void onSplitAllCategories()} />
-      <MenuButton icon={Columns} label="智能收纳并拆分全部" onClick={() => void onOrganizeAndSplitAll()} />
+      <MenuButton icon={Columns} label={isClassifyingDesktop ? "智能收纳中" : "智能收纳并拆分全部"} disabled={isClassifyingDesktop} onClick={() => void onOrganizeAndSplitAll()} />
       <MenuButton icon={Plus} label="新增分类" onClick={() => void createCategory()} />
       <MenuButton icon={PencilSimple} label="重命名当前分类" onClick={() => void renameCategory()} />
       <MenuButton icon={Trash} label="删除当前分类" onClick={() => void deleteCategory()} />
-      <MenuButton icon={Archive} label="智能收纳桌面" onClick={() => void onClassifyDesktop()} />
+      <MenuButton icon={Archive} label={isClassifyingDesktop ? "智能收纳中" : "智能收纳桌面"} disabled={isClassifyingDesktop} onClick={() => void onClassifyDesktop()} />
+      <MenuButton icon={Desktop} label={isRestoringDesktop ? "还原中" : "一键还原桌面"} disabled={isRestoringDesktop} onClick={() => void onRestoreAllToDesktop()} />
       <MenuButton icon={ArrowsClockwise} label="刷新" onClick={() => void onRefresh()} />
       <div className="my-1 h-px bg-white/10" />
       <RangeRow label="卡片透明度" min={0.25} max={0.85} step={0.05} value={settings.opacity} onChange={(opacity) => updateSettings({ opacity })} />
@@ -779,9 +899,9 @@ function SettingsMenu({
   )
 }
 
-function MenuButton({ icon: Icon, label, onClick }: { icon: Icon; label: string; onClick: () => void }) {
+function MenuButton({ icon: Icon, label, disabled, onClick }: { icon: Icon; label: string; disabled?: boolean; onClick: () => void }) {
   return (
-    <button type="button" className="flex w-full items-center gap-1.5 rounded-lg px-2 py-1 text-left text-[11px] font-semibold text-white/80 transition hover:bg-white/10 hover:text-white" onClick={onClick}>
+    <button type="button" disabled={disabled} className="flex w-full items-center gap-1.5 rounded-lg px-2 py-1 text-left text-[11px] font-semibold text-white/80 transition hover:bg-white/10 hover:text-white disabled:cursor-wait disabled:opacity-55" onClick={onClick}>
       <Icon className="size-3.5" weight="duotone" />
       <span>{label}</span>
     </button>
@@ -1098,6 +1218,14 @@ function classifyResultNotice(result: { moved: number; skipped: number; category
   return `已智能收纳 ${result.moved} 项${detail ? `：${detail}` : ""}${result.skipped ? `，跳过 ${result.skipped} 项` : ""}`
 }
 
+function classifyResultFromOperation(payload: DesktopOperationEvent) {
+  return {
+    moved: payload.moved,
+    skipped: payload.skipped,
+    category_counts: payload.category_counts ?? [],
+  }
+}
+
 function countNotice(action: string, count: number, total: number, empty: string) {
   if (count <= 0) return empty
   const skipped = Math.max(0, total - count)
@@ -1126,35 +1254,6 @@ function readLayouts(): Record<string, CardLayout> {
   }
 }
 
-function readWindowSize(): { width: number; height: number } | null {
-  try {
-    const parsed = JSON.parse(globalThis.localStorage.getItem(windowSizeStorageKey) || "null") as Partial<typeof defaultWindowSize> | null
-    if (!parsed) return null
-    const width = Math.round(Number(parsed.width))
-    const height = Math.round(Number(parsed.height))
-    if (width < minWindowSize.width || height < minWindowSize.height) return null
-    return { width, height }
-  } catch {
-    return null
-  }
-}
-
-function writeWindowSize(size: { width: number; height: number }) {
-  const width = Math.round(Number(size.width))
-  const height = Math.round(Number(size.height))
-  if (width < minWindowSize.width || height < minWindowSize.height) return
-  globalThis.localStorage.setItem(windowSizeStorageKey, JSON.stringify({ width, height }))
-}
-
-function readSplitCategoryIndices(): number[] {
-  try {
-    const parsed = JSON.parse(globalThis.localStorage.getItem(splitCategoriesStorageKey) || "[]")
-    return normalizeSplitCategoryIndices(parsed, Number.MAX_SAFE_INTEGER)
-  } catch {
-    return []
-  }
-}
-
 function writeSplitCategoryIndices(indices: number[]) {
   globalThis.localStorage.setItem(splitCategoriesStorageKey, JSON.stringify(normalizeSplitCategoryIndices(indices, Number.MAX_SAFE_INTEGER)))
 }
@@ -1162,6 +1261,10 @@ function writeSplitCategoryIndices(indices: number[]) {
 function normalizeSplitCategoryIndices(value: unknown, maxLength: number) {
   if (!Array.isArray(value)) return []
   return [...new Set(value.map(Number).filter((index) => Number.isInteger(index) && index >= 0 && index < maxLength))].sort((left, right) => left - right)
+}
+
+function sameNumberList(left: number[], right: number[]) {
+  return left.length === right.length && left.every((value, index) => value === right[index])
 }
 
 function clamp(value: number, min: number, max: number) {

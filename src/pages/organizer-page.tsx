@@ -1,5 +1,5 @@
 import { useDeferredValue, useEffect, useState, type DragEvent as ReactDragEvent, type ReactNode } from "react"
-import { Archive, CaretRight, CheckCircle, Desktop, FolderOpen, MagnifyingGlass, PencilSimple, Plus, RocketLaunch, Trash, X } from "@phosphor-icons/react"
+import { Archive, ArrowsClockwise, CaretRight, CheckCircle, Columns, Desktop, FolderOpen, MagnifyingGlass, PencilSimple, Plus, RocketLaunch, Trash, X } from "@phosphor-icons/react"
 import { EmptyState } from "@/components/dustdesk/empty-state"
 import { FileIcon } from "@/components/dustdesk/file-icon"
 import { ItemContextMenu, type ItemContextMenuAction } from "@/components/dustdesk/item-context-menu"
@@ -9,12 +9,13 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { didDragEndOutsideWindow, hasDustDeskPathDrag, hasPathLikeDrag, readDustDeskPathDrag, writeDustDeskPathDrag } from "@/lib/dustdesk-dnd"
-import { safeCurrentWebviewDragDropEvent } from "@/lib/tauri-window"
+import { safeCurrentWebviewDragDropEvent, safeListen } from "@/lib/tauri-window"
 import { cn } from "@/lib/utils"
 import { useDustDeskStore } from "@/stores/dustdesk-store"
-import type { DesktopItem } from "@/types"
+import type { DesktopItem, DesktopOperationEvent } from "@/types"
 
 const organizerCategoryDropZone = "organizer-category"
+const splitCategoriesStorageKey = "dustdesk-desktop-widget-split-categories"
 
 export function OrganizerPage() {
   const snapshot = useDustDeskStore((state) => state.snapshot)
@@ -24,30 +25,87 @@ export function OrganizerPage() {
   const renameCategory = useDustDeskStore((state) => state.renameCategory)
   const deleteCategory = useDustDeskStore((state) => state.deleteCategory)
   const openSpecial = useDustDeskStore((state) => state.openSpecial)
-  const classifyDesktopItems = useDustDeskStore((state) => state.classifyDesktopItems)
+  const loadDesktopSnapshot = useDustDeskStore((state) => state.loadDesktopSnapshot)
+  const startClassifyDesktopItemsTask = useDustDeskStore((state) => state.startClassifyDesktopItemsTask)
+  const startRestoreAllToDesktopTask = useDustDeskStore((state) => state.startRestoreAllToDesktopTask)
   const addItemsToCategory = useDustDeskStore((state) => state.addItemsToCategory)
   const desktopFrames = useDustDeskStore((state) => state.desktopFrames)
   const refreshDesktopFrameVisibility = useDustDeskStore((state) => state.refreshDesktopFrameVisibility)
   const toggleDesktopOrganizerFrame = useDustDeskStore((state) => state.toggleDesktopOrganizerFrame)
+  const mergeDesktopWidgets = useDustDeskStore((state) => state.mergeDesktopWidgets)
   const [query, setQuery] = useState("")
   const [notice, setNotice] = useState<string | null>(null)
+  const [isClassifyingDesktop, setIsClassifyingDesktop] = useState(false)
+  const [isRestoringDesktop, setIsRestoringDesktop] = useState(false)
+  const [isMergingCategories, setIsMergingCategories] = useState(false)
   const deferredQuery = useDeferredValue(query.trim().toLowerCase())
+  const desktopOperationLabel = isClassifyingDesktop ? "正在智能收纳桌面..." : isRestoringDesktop ? "正在还原桌面..." : isMergingCategories ? "正在合并分类..." : ""
   const category = snapshot.categories[selectedCategory]
   const desktopItems = deferredQuery
     ? snapshot.desktop_items.filter((item) => `${item.name} ${item.path} ${item.extension}`.toLowerCase().includes(deferredQuery))
     : snapshot.desktop_items
   const handleClassifyDesktopItems = async () => {
+    if (isClassifyingDesktop) return
+    setIsClassifyingDesktop(true)
+    setNotice("正在智能收纳桌面...")
     try {
-      const result = await classifyDesktopItems()
-      setNotice(classifyResultNotice(result))
+      await startClassifyDesktopItemsTask()
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error))
+      setIsClassifyingDesktop(false)
+    }
+  }
+
+  const handleRestoreAllToDesktop = async () => {
+    if (isRestoringDesktop) return
+    if (!window.confirm("确认把所有收纳箱项目移回桌面吗？这会清空对应的收纳记录。")) return
+
+    setIsRestoringDesktop(true)
+    setNotice("正在还原桌面...")
+    try {
+      await startRestoreAllToDesktopTask()
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : String(error))
+      setIsRestoringDesktop(false)
+    }
+  }
+
+  const handleMergeAllCategories = async () => {
+    if (isMergingCategories) return
+
+    setIsMergingCategories(true)
+    setNotice("正在合并分类...")
+    try {
+      await mergeDesktopWidgets()
+      await loadDesktopSnapshot({ force: true })
+      writeSplitCategoryIndices([])
+      setNotice("已合并全部分类到收纳桌面框")
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : String(error))
+    } finally {
+      setIsMergingCategories(false)
     }
   }
 
   useEffect(() => {
     void refreshDesktopFrameVisibility()
   }, [refreshDesktopFrameVisibility])
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined
+    void safeListen<DesktopOperationEvent>("dustdesk://desktop-operation", (event) => {
+      const payload = event.payload
+      if (payload.status === "started") return
+      if (payload.kind === "classify") {
+        void finishClassifyOperation(payload)
+      } else if (payload.kind === "restore") {
+        void finishRestoreOperation(payload)
+      }
+    }).then((value) => {
+      unlisten = value
+    })
+    return () => unlisten?.()
+  }, [loadDesktopSnapshot])
 
   useEffect(() => {
     let unlisten: (() => void) | undefined
@@ -71,6 +129,30 @@ export function OrganizerPage() {
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error))
     }
+  }
+
+  async function finishClassifyOperation(payload: DesktopOperationEvent) {
+    if (payload.status === "failed") {
+      setNotice(payload.message || "智能收纳失败")
+      setIsClassifyingDesktop(false)
+      return
+    }
+
+    await loadDesktopSnapshot({ force: true })
+    setNotice(classifyResultNotice(classifyResultFromOperation(payload)))
+    setIsClassifyingDesktop(false)
+  }
+
+  async function finishRestoreOperation(payload: DesktopOperationEvent) {
+    if (payload.status === "failed") {
+      setNotice(payload.message || "还原桌面失败")
+      setIsRestoringDesktop(false)
+      return
+    }
+
+    await loadDesktopSnapshot({ force: true })
+    setNotice(payload.message || (payload.restored > 0 ? `已还原 ${payload.restored} 项到桌面` : "没有需要还原到桌面的收纳项目"))
+    setIsRestoringDesktop(false)
   }
 
   function handleCategoryDragOver(event: ReactDragEvent<HTMLElement>) {
@@ -140,7 +222,7 @@ export function OrganizerPage() {
         </CardContent>
       </Card>
 
-      <Card className="min-h-0">
+      <Card className="relative min-h-0 overflow-hidden">
         <CardHeader>
           <div>
             <CardTitle>桌面项目</CardTitle>
@@ -154,7 +236,7 @@ export function OrganizerPage() {
           </div>
         </CardHeader>
         <CardContent className="flex min-h-0 flex-col gap-4">
-          <div className="grid grid-cols-3 gap-2">
+          <div className="grid grid-cols-2 gap-2 2xl:grid-cols-5">
             <Button variant="secondary" size="sm" onClick={() => void openSpecial("organizer")}>
               打开收纳箱
             </Button>
@@ -162,9 +244,17 @@ export function OrganizerPage() {
               <Desktop className="size-3.5" weight="duotone" />
               {desktopFrames.organizer ? "隐藏收纳桌面框" : "显示收纳桌面框"}
             </Button>
-            <Button size="sm" onClick={() => void handleClassifyDesktopItems()}>
+            <Button variant="secondary" size="sm" disabled={isMergingCategories} onClick={() => void handleMergeAllCategories()}>
+              <Columns className="size-3.5" weight="duotone" />
+              {isMergingCategories ? "合并中" : "一键合并分类"}
+            </Button>
+            <Button size="sm" disabled={isClassifyingDesktop} onClick={() => void handleClassifyDesktopItems()}>
               <Archive className="size-3.5" weight="duotone" />
-              智能收纳桌面
+              {isClassifyingDesktop ? "收纳中" : "智能收纳桌面"}
+            </Button>
+            <Button variant="outline" size="sm" disabled={isRestoringDesktop} onClick={() => void handleRestoreAllToDesktop()}>
+              <Desktop className="size-3.5" weight="duotone" />
+              {isRestoringDesktop ? "还原中" : "一键还原桌面"}
             </Button>
           </div>
           {notice ? (
@@ -189,6 +279,7 @@ export function OrganizerPage() {
             )}
           </ScrollArea>
         </CardContent>
+        {desktopOperationLabel ? <DesktopOperationOverlay label={desktopOperationLabel} /> : null}
       </Card>
 
       <Card className="min-h-0">
@@ -212,6 +303,17 @@ export function OrganizerPage() {
           </ScrollArea>
         </CardContent>
       </Card>
+    </div>
+  )
+}
+
+function DesktopOperationOverlay({ label }: { label: string }) {
+  return (
+    <div className="absolute inset-0 z-20 grid place-items-center bg-background/70 backdrop-blur-sm">
+      <div className="flex items-center gap-3 rounded-xl border bg-card/95 px-4 py-3 text-sm font-medium shadow-lg">
+        <ArrowsClockwise className="size-5 animate-spin text-primary" weight="duotone" />
+        <span>{label}</span>
+      </div>
     </div>
   )
 }
@@ -396,6 +498,18 @@ function classifyResultNotice(result: { moved: number; skipped: number; category
     .map((item) => `${item.name} ${item.count}`)
     .join("、")
   return `已智能收纳 ${result.moved} 项${detail ? `：${detail}` : ""}${result.skipped ? `，跳过 ${result.skipped} 项` : ""}`
+}
+
+function classifyResultFromOperation(payload: DesktopOperationEvent) {
+  return {
+    moved: payload.moved,
+    skipped: payload.skipped,
+    category_counts: payload.category_counts ?? [],
+  }
+}
+
+function writeSplitCategoryIndices(indices: number[]) {
+  globalThis.localStorage.setItem(splitCategoriesStorageKey, JSON.stringify([...new Set(indices)].sort((left, right) => left - right)))
 }
 
 function countNotice(action: string, count: number, total: number, empty: string) {

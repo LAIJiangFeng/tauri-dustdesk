@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type CSSProperties, type DragEvent as ReactDragEvent, type ReactNode } from "react"
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent as ReactDragEvent, type ReactNode } from "react"
 import { useParams } from "react-router"
 import {
   Archive,
@@ -6,6 +6,7 @@ import {
   Briefcase,
   Code,
   Columns,
+  Desktop,
   Eye,
   EyeSlash,
   FileText,
@@ -27,12 +28,13 @@ import { FileIcon } from "@/components/dustdesk/file-icon"
 import { ItemContextMenu, type ItemContextMenuAction } from "@/components/dustdesk/item-context-menu"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { usePersistCurrentWindowLayout } from "@/hooks/use-persist-current-window-layout"
 import { useTheme } from "@/hooks/use-theme"
 import { allowPathLikeDrag, didDragEndOutsideWindow, hasDustDeskPathDrag, readDustDeskPathDrag, writeDustDeskPathDrag } from "@/lib/dustdesk-dnd"
 import { repaintCurrentWindow, safeCurrentWebviewDragDropEvent, safeListen, startCurrentWindowDragging, startCurrentWindowResizeDragging } from "@/lib/tauri-window"
 import { displayPathName, extensionFromPath } from "@/lib/utils"
 import { useDustDeskStore } from "@/stores/dustdesk-store"
-import type { DesktopItem } from "@/types"
+import type { DesktopItem, DesktopOperationEvent } from "@/types"
 
 const settingsStorageKey = "dustdesk-desktop-widget-settings"
 const splitCategoriesStorageKey = "dustdesk-desktop-widget-split-categories"
@@ -67,18 +69,28 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
   const addLaunchersLight = useDustDeskStore((state) => state.addLaunchersLight)
   const removeLauncher = useDustDeskStore((state) => state.removeLauncher)
   const restoreItemToDesktop = useDustDeskStore((state) => state.restoreItemToDesktop)
+  const startRestoreAllToDesktopTask = useDustDeskStore((state) => state.startRestoreAllToDesktopTask)
   const showPathInFolder = useDustDeskStore((state) => state.showPathInFolder)
-  const classifyDesktopItems = useDustDeskStore((state) => state.classifyDesktopItems)
+  const startClassifyDesktopItemsTask = useDustDeskStore((state) => state.startClassifyDesktopItemsTask)
   const openPath = useDustDeskStore((state) => state.openPath)
   const startAllLaunchers = useDustDeskStore((state) => state.startAllLaunchers)
   const splitDesktopWidgets = useDustDeskStore((state) => state.splitDesktopWidgets)
   const mergeDesktopCategory = useDustDeskStore((state) => state.mergeDesktopCategory)
+  const mergeDesktopWidgets = useDustDeskStore((state) => state.mergeDesktopWidgets)
+  const saveDesktopSplitIndices = useDustDeskStore((state) => state.saveDesktopSplitIndices)
   const hideCurrentWindow = useDustDeskStore((state) => state.hideCurrentWindow)
   const [settings, setSettings] = useState<WidgetSettings>(readSettings)
   const [menuOpen, setMenuOpen] = useState(false)
   const [notice, setNotice] = useState("")
+  const [isClassifyingDesktop, setIsClassifyingDesktop] = useState(false)
+  const [isRestoringDesktop, setIsRestoringDesktop] = useState(false)
+  const [isMergingCategories, setIsMergingCategories] = useState(false)
+  const desktopOperationLabel = isClassifyingDesktop ? "正在智能收纳桌面..." : isRestoringDesktop ? "正在还原桌面..." : isMergingCategories ? "正在合并分类..." : ""
+  const pendingClassifyActionRef = useRef<"split-all" | null>(null)
+  const previousSplitCategoryIndicesRef = useRef<number[]>([])
   const kind = (routeKind ?? params.kind) === "launcher" ? "launcher" : "category"
   const index = Number(routeIndex ?? params.index ?? 0)
+  const windowLabel = kind === "launcher" ? "desktop-launcher" : `desktop-category-${index}`
   const category = Number.isFinite(index) ? snapshot.categories[index] : undefined
   const visual = useMemo(() => {
     if (kind === "launcher") {
@@ -86,6 +98,7 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
     }
     return categoryVisual(category?.name ?? "分类", index)
   }, [category?.name, index, kind])
+  usePersistCurrentWindowLayout(windowLabel)
 
   useEffect(() => {
     if (!notice) return
@@ -105,7 +118,7 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
   useEffect(() => {
     let unlisten: (() => void) | undefined
     void safeListen("dustdesk://desktop-cards-changed", () => {
-      void loadDesktopSnapshot()
+      void loadDesktopSnapshot({ force: true })
     }).then((value) => {
       unlisten = value
     })
@@ -113,8 +126,29 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
   }, [loadDesktopSnapshot])
 
   useEffect(() => {
+    let unlisten: (() => void) | undefined
+    void safeListen<DesktopOperationEvent>("dustdesk://desktop-operation", (event) => {
+      const payload = event.payload
+      if (payload.status === "started") return
+      if (payload.kind === "classify") {
+        void finishClassifyOperation(payload)
+      } else if (payload.kind === "restore") {
+        void finishRestoreOperation(payload)
+      }
+    }).then((value) => {
+      unlisten = value
+    })
+    return () => unlisten?.()
+  }, [loadDesktopSnapshot, saveDesktopSplitIndices, splitDesktopWidgets])
+
+  useEffect(() => {
     globalThis.localStorage.setItem(settingsStorageKey, JSON.stringify(settings))
   }, [settings])
+
+  useEffect(() => {
+    if (!snapshot.data_dir) return
+    writeSplitCategoryIndices(snapshot.desktop_layout.split_category_indices)
+  }, [snapshot.data_dir, snapshot.desktop_layout.split_category_indices])
 
   useEffect(() => {
     const onDragOver = (event: DragEvent) => {
@@ -146,7 +180,10 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
   }, [kind, index, category?.name])
 
   async function handleDropped(paths: string[]) {
-    if (paths.length === 0) return
+    if (paths.length === 0) {
+      setNotice("这个桌面图标不是普通文件路径，Windows 不允许直接移动到收纳箱")
+      return
+    }
     try {
       if (kind === "launcher") {
         const added = await addLaunchersLight(paths)
@@ -188,24 +225,35 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
   }
 
   async function handleClassifyDesktopItems() {
+    if (isClassifyingDesktop) return
+    pendingClassifyActionRef.current = null
+    setIsClassifyingDesktop(true)
+    setNotice("正在智能收纳桌面...")
     try {
-      const result = await classifyDesktopItems()
-      setNotice(classifyResultNotice(result))
+      setMenuOpen(false)
+      await startClassifyDesktopItemsTask()
     } catch (error) {
+      pendingClassifyActionRef.current = null
       setNotice(error instanceof Error ? error.message : String(error))
+      setIsClassifyingDesktop(false)
     }
   }
 
   async function handleOrganizeAndSplitAll() {
+    if (isClassifyingDesktop) return
     const previous = readSplitCategoryIndices()
+    pendingClassifyActionRef.current = "split-all"
+    previousSplitCategoryIndicesRef.current = previous
+    setIsClassifyingDesktop(true)
+    setNotice("正在智能收纳并拆分...")
     try {
-      const result = await classifyDesktopItems()
-      const next = await splitDesktopWidgets()
-      writeSplitCategoryIndices(next)
-      setNotice(next.length > 0 ? `${classifyResultNotice(result)}，已拆出 ${next.length} 个分类` : `${classifyResultNotice(result)}，没有可拆出的分类内容`)
+      setMenuOpen(false)
+      await startClassifyDesktopItemsTask()
     } catch (error) {
+      pendingClassifyActionRef.current = null
       writeSplitCategoryIndices(previous)
       setNotice(error instanceof Error ? error.message : String(error))
+      setIsClassifyingDesktop(false)
     }
   }
 
@@ -277,13 +325,91 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
   async function handleMergeCategory() {
     if (kind !== "category") return
     const next = readSplitCategoryIndices().filter((item) => item !== index)
-    writeSplitCategoryIndices(next)
     try {
       setMenuOpen(false)
       await mergeDesktopCategory(index)
+      writeSplitCategoryIndices(next)
+      setNotice("已合并当前分类")
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error))
     }
+  }
+
+  async function handleMergeAllCategories() {
+    if (isMergingCategories) return
+
+    const previous = readSplitCategoryIndices()
+    setIsMergingCategories(true)
+    setNotice("正在合并分类...")
+    try {
+      setMenuOpen(false)
+      await mergeDesktopWidgets()
+      await loadDesktopSnapshot({ force: true })
+      writeSplitCategoryIndices([])
+      setNotice(previous.length > 0 ? `已合并 ${previous.length} 个分类` : "分类已处于合并状态")
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : String(error))
+    } finally {
+      setIsMergingCategories(false)
+    }
+  }
+
+  async function handleRestoreAllToDesktop() {
+    if (isRestoringDesktop) return
+    if (!window.confirm("确认把所有收纳箱项目移回桌面吗？这会清空对应的收纳记录。")) return
+
+    setIsRestoringDesktop(true)
+    setNotice("正在还原桌面...")
+    try {
+      setMenuOpen(false)
+      await startRestoreAllToDesktopTask()
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : String(error))
+      setIsRestoringDesktop(false)
+    }
+  }
+
+  async function finishClassifyOperation(payload: DesktopOperationEvent) {
+    if (payload.status === "failed") {
+      pendingClassifyActionRef.current = null
+      setNotice(payload.message || "智能收纳失败")
+      setIsClassifyingDesktop(false)
+      return
+    }
+
+    await loadDesktopSnapshot({ force: true })
+    const result = classifyResultFromOperation(payload)
+    if (pendingClassifyActionRef.current === "split-all") {
+      pendingClassifyActionRef.current = null
+      try {
+        const next = await splitDesktopWidgets()
+        writeSplitCategoryIndices(next)
+        setNotice(next.length > 0 ? `${classifyResultNotice(result)}，已拆出 ${next.length} 个分类` : `${classifyResultNotice(result)}，没有可拆出的分类内容`)
+      } catch (error) {
+        writeSplitCategoryIndices(previousSplitCategoryIndicesRef.current)
+        setNotice(error instanceof Error ? error.message : String(error))
+      } finally {
+        setIsClassifyingDesktop(false)
+      }
+      return
+    }
+
+    setNotice(classifyResultNotice(result))
+    setIsClassifyingDesktop(false)
+  }
+
+  async function finishRestoreOperation(payload: DesktopOperationEvent) {
+    if (payload.status === "failed") {
+      setNotice(payload.message || "还原桌面失败")
+      setIsRestoringDesktop(false)
+      return
+    }
+
+    await loadDesktopSnapshot({ force: true })
+    writeSplitCategoryIndices([])
+    await saveDesktopSplitIndices([])
+    setNotice(payload.message || (payload.restored > 0 ? `已还原 ${payload.restored} 项到桌面` : "没有需要还原到桌面的收纳项目"))
+    setIsRestoringDesktop(false)
   }
 
   function updateSettings(next: Partial<WidgetSettings>) {
@@ -300,7 +426,7 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
   return (
     <div className="desktop-widget-page h-screen w-screen bg-transparent p-2 text-white">
       <section
-        className="flex h-full w-full min-w-0 flex-col overflow-hidden rounded-2xl border border-white/15 backdrop-blur-2xl"
+        className="relative flex h-full w-full min-w-0 flex-col overflow-hidden rounded-2xl border border-white/15 backdrop-blur-2xl"
         style={frameStyle}
         onDragOver={handleLauncherDragOver}
         onDrop={handleLauncherDrop}
@@ -343,7 +469,12 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
                 onSplitAllCategories={handleSplitAllCategories}
                 onClassifyDesktop={handleClassifyDesktopItems}
                 onOrganizeAndSplitAll={handleOrganizeAndSplitAll}
+                onRestoreAllToDesktop={handleRestoreAllToDesktop}
+                isClassifyingDesktop={isClassifyingDesktop}
+                isRestoringDesktop={isRestoringDesktop}
+                isMergingCategories={isMergingCategories}
                 onMerge={handleMergeCategory}
+                onMergeAllCategories={handleMergeAllCategories}
                 onHide={hideCurrentWindow}
               />
             ) : null}
@@ -363,6 +494,7 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
             onRestoreDragOut={handleRestoreDragOut}
           />
         )}
+        {desktopOperationLabel ? <WidgetOperationOverlay label={desktopOperationLabel} /> : null}
       </section>
       {notice ? <div className="pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full bg-slate-950/70 px-3 py-1 text-xs text-white/80 ring-1 ring-white/10">{notice}</div> : null}
       <button
@@ -378,6 +510,17 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
   )
 }
 
+function WidgetOperationOverlay({ label }: { label: string }) {
+  return (
+    <div className="no-drag absolute inset-0 z-40 grid place-items-center bg-slate-950/60 backdrop-blur-md">
+      <div className="flex items-center gap-2 rounded-xl border border-white/15 bg-slate-950/90 px-3 py-2 text-xs font-semibold text-white shadow-2xl shadow-black/30">
+        <ArrowsClockwise className="size-4 animate-spin text-emerald-300" weight="duotone" />
+        <span>{label}</span>
+      </div>
+    </div>
+  )
+}
+
 function SettingsMenu({
   kind,
   settings,
@@ -389,7 +532,12 @@ function SettingsMenu({
   onSplitAllCategories,
   onClassifyDesktop,
   onOrganizeAndSplitAll,
+  onRestoreAllToDesktop,
+  isClassifyingDesktop,
+  isRestoringDesktop,
+  isMergingCategories,
   onMerge,
+  onMergeAllCategories,
   onHide,
 }: {
   kind: "category" | "launcher"
@@ -402,7 +550,12 @@ function SettingsMenu({
   onSplitAllCategories: () => Promise<void>
   onClassifyDesktop: () => Promise<void>
   onOrganizeAndSplitAll: () => Promise<void>
+  onRestoreAllToDesktop: () => Promise<void>
+  isClassifyingDesktop: boolean
+  isRestoringDesktop: boolean
+  isMergingCategories: boolean
   onMerge: () => Promise<void>
+  onMergeAllCategories: () => Promise<void>
   onHide: () => Promise<void>
 }) {
   return (
@@ -410,14 +563,17 @@ function SettingsMenu({
       {kind === "category" ? (
         <>
           <MenuButton icon={Columns} label="合并当前分类" onClick={() => void onMerge()} />
+          <MenuButton icon={Columns} label={isMergingCategories ? "合并中" : "一键合并分类"} disabled={isMergingCategories} onClick={() => void onMergeAllCategories()} />
           <MenuButton icon={Plus} label="新增分类" onClick={() => void createCategory()} />
           <MenuButton icon={PencilSimple} label="重命名当前分类" onClick={() => void renameCategory()} />
           <MenuButton icon={Trash} label="删除当前分类" onClick={() => void deleteCategory()} />
           <MenuButton icon={Columns} label="拆分全部分类" onClick={() => void onSplitAllCategories()} />
-          <MenuButton icon={Columns} label="智能收纳并拆分全部" onClick={() => void onOrganizeAndSplitAll()} />
-          <MenuButton icon={Archive} label="智能收纳桌面" onClick={() => void onClassifyDesktop()} />
+          <MenuButton icon={Columns} label={isClassifyingDesktop ? "智能收纳中" : "智能收纳并拆分全部"} disabled={isClassifyingDesktop} onClick={() => void onOrganizeAndSplitAll()} />
+          <MenuButton icon={Archive} label={isClassifyingDesktop ? "智能收纳中" : "智能收纳桌面"} disabled={isClassifyingDesktop} onClick={() => void onClassifyDesktop()} />
+          <MenuButton icon={Desktop} label={isRestoringDesktop ? "还原中" : "一键还原桌面"} disabled={isRestoringDesktop} onClick={() => void onRestoreAllToDesktop()} />
         </>
       ) : null}
+      {kind === "launcher" ? <MenuButton icon={Columns} label={isMergingCategories ? "合并中" : "一键合并分类"} disabled={isMergingCategories} onClick={() => void onMergeAllCategories()} /> : null}
       <MenuButton icon={ArrowsClockwise} label="刷新" onClick={() => void onRefresh()} />
       <div className="my-1 h-px bg-white/10" />
       <RangeRow label="卡片透明度" min={0.25} max={0.85} step={0.05} value={settings.opacity} onChange={(opacity) => updateSettings({ opacity })} />
@@ -433,9 +589,9 @@ function SettingsMenu({
   )
 }
 
-function MenuButton({ icon: Icon, label, onClick }: { icon: Icon; label: string; onClick: () => void }) {
+function MenuButton({ icon: Icon, label, disabled, onClick }: { icon: Icon; label: string; disabled?: boolean; onClick: () => void }) {
   return (
-    <button type="button" className="flex w-full items-center gap-1.5 rounded-lg px-2 py-1 text-left text-[11px] font-semibold text-white/80 transition hover:bg-white/10 hover:text-white" onClick={onClick}>
+    <button type="button" disabled={disabled} className="flex w-full items-center gap-1.5 rounded-lg px-2 py-1 text-left text-[11px] font-semibold text-white/80 transition hover:bg-white/10 hover:text-white disabled:cursor-wait disabled:opacity-55" onClick={onClick}>
       <Icon className="size-3.5" weight="duotone" />
       <span>{label}</span>
     </button>
@@ -650,6 +806,14 @@ function classifyResultNotice(result: { moved: number; skipped: number; category
     .map((item) => `${item.name} ${item.count}`)
     .join("、")
   return `已智能收纳 ${result.moved} 项${detail ? `：${detail}` : ""}${result.skipped ? `，跳过 ${result.skipped} 项` : ""}`
+}
+
+function classifyResultFromOperation(payload: DesktopOperationEvent) {
+  return {
+    moved: payload.moved,
+    skipped: payload.skipped,
+    category_counts: payload.category_counts ?? [],
+  }
 }
 
 function countNotice(action: string, count: number, total: number, empty: string) {

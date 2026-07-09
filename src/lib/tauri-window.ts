@@ -5,6 +5,14 @@ import { getCurrentWebview, type DragDropEvent } from "@tauri-apps/api/webview"
 import { getCurrentWindow } from "@tauri-apps/api/window"
 
 type ResizeDirection = "East" | "North" | "NorthEast" | "NorthWest" | "South" | "SouthEast" | "SouthWest" | "West"
+export const desktopWindowLayoutUserChangeEvent = "dustdesk:desktop-window-layout-user-change"
+
+export interface CurrentWindowLayout {
+  x: number
+  y: number
+  width: number
+  height: number
+}
 
 function hasTauriInternals() {
   return "__TAURI_INTERNALS__" in window
@@ -83,11 +91,21 @@ async function runCurrentWindowAction(action: (currentWindow: NonNullable<Return
 }
 
 export async function startCurrentWindowDragging() {
+  notifyDesktopWindowLayoutUserChange()
   await runCurrentWindowAction((currentWindow) => currentWindow.startDragging())
 }
 
 export async function startCurrentWindowResizeDragging(direction: ResizeDirection) {
+  notifyDesktopWindowLayoutUserChange()
   await runCurrentWindowAction((currentWindow) => currentWindow.startResizeDragging(direction))
+}
+
+function notifyDesktopWindowLayoutUserChange() {
+  try {
+    window.dispatchEvent(new CustomEvent(desktopWindowLayoutUserChangeEvent))
+  } catch {
+    // Window layout persistence is best-effort outside a live Tauri webview.
+  }
 }
 
 export async function getCurrentWindowInnerSize(): Promise<{ width: number; height: number } | null> {
@@ -99,6 +117,36 @@ export async function getCurrentWindowInnerSize(): Promise<{ width: number; heig
     return { width: size.width, height: size.height }
   } catch {
     return null
+  }
+}
+
+export async function getCurrentWindowLayout(): Promise<CurrentWindowLayout | null> {
+  const currentWindow = safeCurrentWindow()
+  if (!currentWindow) return null
+
+  try {
+    const [position, size] = await Promise.all([currentWindow.outerPosition(), currentWindow.innerSize()])
+    return {
+      x: position.x,
+      y: position.y,
+      width: size.width,
+      height: size.height,
+    }
+  } catch {
+    return null
+  }
+}
+
+export async function listenCurrentWindowMove(handler: (position: { x: number; y: number }) => void): Promise<UnlistenFn | undefined> {
+  const currentWindow = safeCurrentWindow()
+  if (!currentWindow) return undefined
+
+  try {
+    return await currentWindow.onMoved((event) => {
+      handler({ x: event.payload.x, y: event.payload.y })
+    })
+  } catch {
+    return undefined
   }
 }
 

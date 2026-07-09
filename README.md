@@ -154,6 +154,10 @@ scripts/             本地开发脚本
 AGENTS.md            AI 项目规则和排障经验
 ```
 
+## 友情链接
+
+- [LINUX DO](https://linux.do/)
+
 ## 说明
 
 - `dist/`、`logs/`、`node_modules/`、`src-tauri/target/` 都是本地生成内容，不应该提交。

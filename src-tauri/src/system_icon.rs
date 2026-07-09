@@ -421,6 +421,7 @@ mod windows_icon {
             for pixel in pixels.chunks_exact(4) {
                 rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
             }
+            restore_legacy_icon_alpha(&mut rgba);
             Some(rgba)
         } else {
             None
@@ -433,6 +434,29 @@ mod windows_icon {
         }
 
         rgba.and_then(|bytes| encode_png(&bytes, width as u32, height as u32))
+    }
+
+    fn restore_legacy_icon_alpha(rgba: &mut [u8]) {
+        let mut visible_pixels = 0usize;
+        let mut colored_pixels = 0usize;
+        for pixel in rgba.chunks_exact(4) {
+            if pixel[3] > 0 {
+                visible_pixels += 1;
+            }
+            if pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0 {
+                colored_pixels += 1;
+            }
+        }
+
+        if visible_pixels > 0 || colored_pixels == 0 {
+            return;
+        }
+
+        for pixel in rgba.chunks_exact_mut(4) {
+            if pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0 {
+                pixel[3] = u8::MAX;
+            }
+        }
     }
 
     fn encode_png(rgba: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {

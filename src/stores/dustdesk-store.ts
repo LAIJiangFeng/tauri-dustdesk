@@ -61,6 +61,7 @@ interface IconResolutionOptions {
 
 interface DesktopSnapshotLoadOptions {
   force?: boolean
+  preserveDesktopItems?: boolean
 }
 
 interface RestoreDesktopArgs extends Record<string, unknown> {
@@ -562,6 +563,16 @@ function applyResolvedIcons(snapshot: AppSnapshot, icons: PathIconResult[]) {
   }
 }
 
+function snapshotPathKey(path: string) {
+  return path.trim().toLowerCase()
+}
+
+function removeDesktopItemsFromSnapshot(snapshot: AppSnapshot, paths: string[]) {
+  const keys = new Set(paths.map(snapshotPathKey).filter(Boolean))
+  if (keys.size === 0) return
+  snapshot.desktop_items = snapshot.desktop_items.filter((item) => !keys.has(snapshotPathKey(item.path)))
+}
+
 function normalizeClassifyResult(value: unknown): ClassifyResult {
   const raw = asRecord(value)
   return {
@@ -762,7 +773,13 @@ export const useDustDeskStore = create<DustDeskState>()(
           state.error = null
         })
         try {
-          const snapshot = await call<AppSnapshot>("load_desktop_snapshot")
+          let snapshot = await call<AppSnapshot>("load_desktop_snapshot")
+          if (options.preserveDesktopItems && snapshot.desktop_items.length === 0) {
+            snapshot = {
+              ...snapshot,
+              desktop_items: get().snapshot.desktop_items,
+            }
+          }
           set((state) => {
             state.snapshot = snapshot
             state.selectedCategory = Math.min(state.selectedCategory, Math.max(0, snapshot.categories.length - 1))
@@ -862,7 +879,10 @@ export const useDustDeskStore = create<DustDeskState>()(
     addItemsToCategoryLight: async (index, paths) => {
       if (paths.length === 0) return 0
       const added = Number(await call<number>("add_items_to_category", { index, paths })) || 0
-      await get().loadDesktopSnapshot({ force: true })
+      set((state) => {
+        removeDesktopItemsFromSnapshot(state.snapshot, paths)
+      })
+      await get().loadDesktopSnapshot({ force: true, preserveDesktopItems: true })
       return added
     },
     removeItemFromCategory: async (index, path) => {
@@ -924,12 +944,12 @@ export const useDustDeskStore = create<DustDeskState>()(
     },
     addLauncherLight: async (path, name) => {
       await call("add_launcher", { path, name })
-      await get().loadDesktopSnapshot({ force: true })
+      await get().loadDesktopSnapshot({ force: true, preserveDesktopItems: true })
     },
     addLaunchersLight: async (paths) => {
       if (paths.length === 0) return 0
       const added = Number(await call<number>("add_launchers", { paths })) || 0
-      await get().loadDesktopSnapshot({ force: true })
+      await get().loadDesktopSnapshot({ force: true, preserveDesktopItems: true })
       return added
     },
     removeLauncher: async (path) => {

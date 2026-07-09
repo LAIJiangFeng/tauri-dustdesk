@@ -147,9 +147,10 @@ export function DesktopWidgetPage() {
 
   useEffect(() => {
     if (!notice) return
+    if (desktopOperationLabel) return
     const timer = window.setTimeout(() => setNotice(""), 2400)
     return () => window.clearTimeout(timer)
-  }, [notice])
+  }, [desktopOperationLabel, notice])
 
   const categories = useMemo<CategoryTab[]>(() => {
     return snapshot.categories.map((category, index) => ({
@@ -193,6 +194,10 @@ export function DesktopWidgetPage() {
     void safeListen<DesktopOperationEvent>("dustdesk://desktop-operation", (event) => {
       const payload = event.payload
       if (payload.status === "started") return
+      if (payload.status === "progress") {
+        setNotice(payload.message)
+        return
+      }
       if (payload.kind === "classify") {
         void finishClassifyOperation(payload)
       } else if (payload.kind === "restore") {

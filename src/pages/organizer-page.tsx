@@ -36,7 +36,7 @@ export function OrganizerPage() {
   const loadDesktopSnapshot = useDustDeskStore((state) => state.loadDesktopSnapshot)
   const startClassifyDesktopItemsTask = useDustDeskStore((state) => state.startClassifyDesktopItemsTask)
   const startRestoreAllToDesktopTask = useDustDeskStore((state) => state.startRestoreAllToDesktopTask)
-  const addItemsToCategory = useDustDeskStore((state) => state.addItemsToCategory)
+  const addItemsToCategoryLight = useDustDeskStore((state) => state.addItemsToCategoryLight)
   const desktopFrames = useDustDeskStore((state) => state.desktopFrames)
   const refreshDesktopFrameVisibility = useDustDeskStore((state) => state.refreshDesktopFrameVisibility)
   const toggleDesktopOrganizerFrame = useDustDeskStore((state) => state.toggleDesktopOrganizerFrame)
@@ -104,6 +104,10 @@ export function OrganizerPage() {
     void safeListen<DesktopOperationEvent>("dustdesk://desktop-operation", (event) => {
       const payload = event.payload
       if (payload.status === "started") return
+      if (payload.status === "progress") {
+        setNotice(payload.message)
+        return
+      }
       if (payload.kind === "classify") {
         void finishClassifyOperation(payload)
       } else if (payload.kind === "restore") {
@@ -126,12 +130,12 @@ export function OrganizerPage() {
       unlisten = value
     })
     return () => unlisten?.()
-  }, [addItemsToCategory, selectedCategory])
+  }, [addItemsToCategoryLight, selectedCategory])
 
   async function addPathsToSelectedCategory(paths: string[]) {
     if (paths.length === 0) return
     try {
-      const added = await addItemsToCategory(selectedCategory, paths)
+      const added = await addItemsToCategoryLight(selectedCategory, paths)
       setNotice(countNotice("已收纳", added, paths.length, "没有新增收纳项目"))
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error))
@@ -320,7 +324,7 @@ function DesktopTile({ item }: { item: DesktopItem }) {
   const openPath = useDustDeskStore((state) => state.openPath)
   const selectedCategory = useDustDeskStore((state) => state.selectedCategory)
   const snapshot = useDustDeskStore((state) => state.snapshot)
-  const addItemToCategory = useDustDeskStore((state) => state.addItemToCategory)
+  const addItemsToCategoryLight = useDustDeskStore((state) => state.addItemsToCategoryLight)
   const addLauncher = useDustDeskStore((state) => state.addLauncher)
   const showPathInFolder = useDustDeskStore((state) => state.showPathInFolder)
   const category = snapshot.categories[selectedCategory]
@@ -346,7 +350,9 @@ function DesktopTile({ item }: { item: DesktopItem }) {
               {
                 label: `收纳到${category ? `「${category.name}」` : "当前分类"}`,
                 icon: "restore" as const,
-                onSelect: () => addItemToCategory(selectedCategory, item.path),
+                onSelect: async () => {
+                  await addItemsToCategoryLight(selectedCategory, [item.path])
+                },
               },
             ]),
         ...(canLaunch && !isLauncherAdded
@@ -372,7 +378,7 @@ function DesktopTile({ item }: { item: DesktopItem }) {
             disabled={isInCurrentCategory}
             onClick={(event) => {
               event.stopPropagation()
-              void addItemToCategory(selectedCategory, item.path)
+              void addItemsToCategoryLight(selectedCategory, [item.path])
             }}
           >
             {isInCurrentCategory ? <CheckCircle className="size-3" weight="fill" /> : <Archive className="size-3" weight="duotone" />}

@@ -6,7 +6,7 @@ mod store;
 mod system_icon;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     env, fs,
     path::{Path, PathBuf},
     process::Command,
@@ -45,6 +45,7 @@ const DESKTOP_OPERATION_EVENT: &str = "dustdesk://desktop-operation";
 static CONFIG_MUTATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static LAUNCHER_MUTATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static RUNTIME_DIRECTORY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static ICON_DATA_URL_CACHE: OnceLock<Mutex<BTreeMap<String, Option<String>>>> = OnceLock::new();
 static REAL_EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 static DESKTOP_OPERATION_RUNNING: AtomicBool = AtomicBool::new(false);
 
@@ -63,6 +64,8 @@ struct DesktopOperationPayload {
     moved: usize,
     skipped: usize,
     restored: usize,
+    total: usize,
+    current_path: String,
     category_counts: Vec<CategoryClassifyCount>,
 }
 
@@ -255,7 +258,6 @@ fn add_items_to_category_impl(index: usize, paths: Vec<String>) -> Result<usize,
     with_config_mutation(|| {
         let store = AppStore::open().map_err(to_message)?;
         store.ensure_runtime_dirs().map_err(to_message)?;
-        repair_existing_app_desktop_entries(&store)?;
         let mut config = store.load_config();
         repair_category_item_paths(&store, &mut config)?;
         config
@@ -359,8 +361,24 @@ async fn restore_all_to_desktop(app: tauri::AppHandle) -> Result<usize, String> 
 #[tauri::command]
 async fn start_restore_all_to_desktop_task(app: tauri::AppHandle) -> Result<(), String> {
     start_desktop_background_operation(app.clone(), "restore", move || {
-        let restored = restore_all_organized_items_to_desktop_and_clear_markers()?;
-        emit_desktop_cards_changed(&app);
+        let progress_app = app.clone();
+        let restored =
+            restore_all_organized_items_to_desktop_with_progress(move |current, total, path| {
+                emit_desktop_operation(
+                    &progress_app,
+                    DesktopOperationPayload {
+                        kind: "restore",
+                        status: "progress",
+                        message: restore_progress_message(current, total, path),
+                        moved: 0,
+                        skipped: 0,
+                        restored: current,
+                        total,
+                        current_path: path.display().to_string(),
+                        category_counts: Vec::new(),
+                    },
+                );
+            })?;
         Ok(DesktopOperationPayload {
             kind: "restore",
             status: "finished",
@@ -372,6 +390,8 @@ async fn start_restore_all_to_desktop_task(app: tauri::AppHandle) -> Result<(), 
             moved: 0,
             skipped: 0,
             restored,
+            total: restored,
+            current_path: String::new(),
             category_counts: Vec::new(),
         })
     })
@@ -479,15 +499,17 @@ fn show_path_in_folder(path: String) -> Result<(), String> {
 
 #[tauri::command]
 async fn classify_desktop_items(app: tauri::AppHandle) -> Result<ClassifyResult, String> {
-    tauri::async_runtime::spawn_blocking(move || classify_desktop_items_impl(&app))
+    let result = tauri::async_runtime::spawn_blocking(classify_desktop_items_impl)
         .await
-        .map_err(to_message)?
+        .map_err(to_message)??;
+    emit_desktop_cards_changed(&app);
+    Ok(result)
 }
 
 #[tauri::command]
 async fn start_classify_desktop_items_task(app: tauri::AppHandle) -> Result<(), String> {
     start_desktop_background_operation(app.clone(), "classify", move || {
-        let result = classify_desktop_items_impl(&app)?;
+        let result = classify_desktop_items_impl()?;
         let detail = result
             .category_counts
             .iter()
@@ -506,13 +528,15 @@ async fn start_classify_desktop_items_task(app: tauri::AppHandle) -> Result<(), 
             moved: result.moved,
             skipped: result.skipped,
             restored: 0,
+            total: result.moved + result.skipped,
+            current_path: String::new(),
             category_counts: result.category_counts,
         })
     })
 }
 
-fn classify_desktop_items_impl(app: &tauri::AppHandle) -> Result<ClassifyResult, String> {
-    let result = with_config_mutation(|| {
+fn classify_desktop_items_impl() -> Result<ClassifyResult, String> {
+    with_config_mutation(|| {
         let store = AppStore::open().map_err(to_message)?;
         store.ensure_runtime_dirs().map_err(to_message)?;
         let mut config = store.load_config();
@@ -578,9 +602,7 @@ fn classify_desktop_items_impl(app: &tauri::AppHandle) -> Result<ClassifyResult,
                 })
                 .collect(),
         })
-    })?;
-    emit_desktop_cards_changed(&app);
-    Ok(result)
+    })
 }
 
 #[tauri::command]
@@ -1320,7 +1342,7 @@ async fn update_launch_on_startup(enabled: bool) -> Result<AppSettings, String> 
             let store = AppStore::open().map_err(to_message)?;
             store.ensure_runtime_dirs().map_err(to_message)?;
             let mut config = store.load_config();
-            set_launch_on_startup_shortcut(enabled)?;
+            set_launch_on_startup_entry(enabled)?;
             config.settings.launch_on_startup = enabled;
             store.save_config(&config).map_err(to_message)?;
             Ok(config.settings)
@@ -1372,24 +1394,27 @@ fn remove_category_path_from_config(
     Ok(())
 }
 
-fn restore_all_organized_items_to_desktop() -> Result<usize, String> {
-    restore_all_organized_items_to_desktop_impl(true)
+fn restore_all_organized_items_to_desktop_and_clear_markers() -> Result<usize, String> {
+    restore_all_organized_items_to_desktop_with_progress(|_, _, _| {})
 }
 
-fn restore_all_organized_items_to_desktop_and_clear_markers() -> Result<usize, String> {
-    restore_all_organized_items_to_desktop_impl(false)
+fn restore_all_organized_items_to_desktop_with_progress(
+    on_progress: impl FnMut(usize, usize, &Path),
+) -> Result<usize, String> {
+    restore_all_organized_items_to_desktop_impl(on_progress)
 }
 
 fn restore_all_organized_items_to_desktop_impl(
-    keep_desktop_markers: bool,
+    mut on_progress: impl FnMut(usize, usize, &Path),
 ) -> Result<usize, String> {
-    with_config_mutation(|| {
+    let (restored, desktop, organizer_root) = with_config_mutation(|| {
         let store = AppStore::open().map_err(to_message)?;
         store.ensure_runtime_dirs().map_err(to_message)?;
         let desktop = user_desktop().ok_or_else(|| "没有找到桌面路径".to_owned())?;
         fs::create_dir_all(&desktop).map_err(to_message)?;
         let organizer_root = store.organizer_root();
         let mut config = store.load_config();
+        let total = restore_candidate_count(&config, &organizer_root, &desktop);
         let mut restored = 0usize;
         let mut handled_paths = Vec::<String>::new();
 
@@ -1406,20 +1431,15 @@ fn restore_all_organized_items_to_desktop_impl(
                 if is_path_within(&source, &organizer_root) || is_path_within(&source, &desktop) {
                     let normalized = normalize_path_for_compare(&source);
                     if !handled_paths.iter().any(|path| path == &normalized) {
-                        let restored_path = restore_path_to_desktop(&source, &desktop)?;
+                        let restored_path = restore_path_to_desktop_silent(&source, &desktop)?;
                         handled_paths.push(normalized);
                         handled_paths.push(normalize_path_for_compare(&restored_path));
-                        if keep_desktop_markers {
-                            push_unique_category_path(
-                                &mut retained_paths,
-                                restored_path.display().to_string(),
-                            );
-                        }
                         restored += 1;
+                        on_progress(restored, total, &restored_path);
                     }
                 } else {
                     // External references are not migrated desktop items, so do not move them on exit.
-                    push_unique_category_path(&mut retained_paths, item_path);
+                    retained_paths.push(item_path);
                 }
             }
 
@@ -1434,67 +1454,80 @@ fn restore_all_organized_items_to_desktop_impl(
             if handled_paths.iter().any(|item| item == &normalized) {
                 continue;
             }
-            let restored_path = restore_path_to_desktop(&path, &desktop)?;
+            let restored_path = restore_path_to_desktop_silent(&path, &desktop)?;
             handled_paths.push(normalized);
             handled_paths.push(normalize_path_for_compare(&restored_path));
-            if keep_desktop_markers {
-                if let Some(index) = category_index_for_organizer_path(
-                    &path,
-                    &organizer_root,
-                    &config.desktop_categories,
-                ) {
-                    if let Some(category) = config.desktop_categories.get_mut(index) {
-                        push_unique_category_path(
-                            &mut category.item_paths,
-                            restored_path.display().to_string(),
-                        );
-                    }
-                }
-            }
             restored += 1;
+            on_progress(restored, total, &restored_path);
         }
 
         cleanup_empty_organizer_dirs(&organizer_root);
-        if !keep_desktop_markers {
-            config.desktop_layout.split_category_indices.clear();
-        }
+        config.desktop_layout.split_category_indices.clear();
         store.save_config(&config).map_err(to_message)?;
-        Ok(restored)
-    })
-}
+        Ok((restored, desktop, organizer_root))
+    })?;
 
-fn archive_marked_desktop_items_on_startup() -> Result<(), String> {
-    with_config_mutation(|| {
-        let store = AppStore::open().map_err(to_message)?;
-        store.ensure_runtime_dirs().map_err(to_message)?;
-        let mut config = store.load_config();
-        repair_category_item_paths(&store, &mut config)
-    })
-}
-
-fn push_unique_category_path(paths: &mut Vec<String>, path: String) {
-    if paths.iter().any(|existing| same_path_text(existing, &path)) {
-        return;
+    if restored > 0 {
+        notify_shell_directory_updated(&desktop);
+        notify_shell_directory_updated(&organizer_root);
     }
-    paths.push(path);
+
+    Ok(restored)
 }
 
-fn category_index_for_organizer_path(
-    path: &Path,
-    organizer_root: &Path,
-    categories: &[DeskCategory],
-) -> Option<usize> {
-    let parent = path.parent()?;
-    if !is_path_within(parent, organizer_root) {
-        return None;
+fn restore_candidate_count(config: &AppConfig, organizer_root: &Path, desktop: &Path) -> usize {
+    let mut seen = Vec::<String>::new();
+    for category in &config.desktop_categories {
+        for item_path in &category.item_paths {
+            let source = PathBuf::from(item_path);
+            if !source.exists() {
+                continue;
+            }
+            if !is_path_within(&source, organizer_root) && !is_path_within(&source, desktop) {
+                continue;
+            }
+            let normalized = normalize_path_for_compare(&source);
+            if !seen.iter().any(|path| path == &normalized) {
+                seen.push(normalized);
+            }
+        }
     }
-    let folder_name = parent.file_name()?.to_string_lossy();
-    categories.iter().position(|category| {
-        safe_windows_file_name(&category.name).eq_ignore_ascii_case(folder_name.as_ref())
-    })
+
+    for path in organizer_contents(organizer_root) {
+        if !path.exists() {
+            continue;
+        }
+        let normalized = normalize_path_for_compare(&path);
+        if !seen.iter().any(|item| item == &normalized) {
+            seen.push(normalized);
+        }
+    }
+
+    seen.len()
+}
+
+fn restore_progress_message(current: usize, total: usize, path: &Path) -> String {
+    let name = display_path_name(path);
+    if total > 0 {
+        format!("正在还原 {current}/{total}：{name}")
+    } else {
+        format!("正在还原：{name}")
+    }
 }
 
 fn restore_path_to_desktop(source: &Path, desktop: &Path) -> Result<PathBuf, String> {
+    restore_path_to_desktop_impl(source, desktop, true)
+}
+
+fn restore_path_to_desktop_silent(source: &Path, desktop: &Path) -> Result<PathBuf, String> {
+    restore_path_to_desktop_impl(source, desktop, false)
+}
+
+fn restore_path_to_desktop_impl(
+    source: &Path,
+    desktop: &Path,
+    notify_shell: bool,
+) -> Result<PathBuf, String> {
     let file_name = source
         .file_name()
         .ok_or_else(|| "无法识别项目名称".to_owned())?;
@@ -1510,19 +1543,29 @@ fn restore_path_to_desktop(source: &Path, desktop: &Path) -> Result<PathBuf, Str
             &existing_desktop_item.display().to_string(),
         ) {
             remove_existing_path(source)?;
+            if notify_shell {
+                notify_shell_path_removed(source);
+            }
         }
-        notify_shell_desktop_restore(&existing_desktop_item, desktop);
+        if notify_shell {
+            notify_shell_desktop_restore(&existing_desktop_item, desktop);
+        }
         return Ok(existing_desktop_item);
     }
 
     if is_path_within(source, desktop) {
-        notify_shell_desktop_restore(source, desktop);
+        if notify_shell {
+            notify_shell_desktop_restore(source, desktop);
+        }
         return Ok(source.to_path_buf());
     }
 
     let destination = unique_destination(desktop, source);
     move_path(source, &destination)?;
-    notify_shell_desktop_restore(&destination, desktop);
+    if notify_shell {
+        notify_shell_path_removed(source);
+        notify_shell_desktop_restore(&destination, desktop);
+    }
     Ok(destination)
 }
 
@@ -1914,6 +1957,14 @@ fn notify_shell_path_created(path: &Path) {
 fn notify_shell_path_created(_path: &Path) {}
 
 #[cfg(windows)]
+fn notify_shell_path_deleted(path: &Path) {
+    notify_shell_path(path, windows_sys::Win32::UI::Shell::SHCNE_DELETE);
+}
+
+#[cfg(not(windows))]
+fn notify_shell_path_deleted(_path: &Path) {}
+
+#[cfg(windows)]
 fn notify_shell_directory_updated(path: &Path) {
     notify_shell_path(path, windows_sys::Win32::UI::Shell::SHCNE_UPDATEDIR);
 }
@@ -1940,6 +1991,23 @@ fn notify_shell_path(path: &Path, event: u32) {
             null(),
         );
     }
+}
+
+fn notify_shell_parent_updated(path: &Path) {
+    if let Some(parent) = path.parent() {
+        notify_shell_directory_updated(parent);
+    }
+}
+
+fn notify_shell_path_removed(path: &Path) {
+    notify_shell_path_deleted(path);
+    notify_shell_parent_updated(path);
+}
+
+fn notify_shell_path_moved(source: &Path, destination: &Path) {
+    notify_shell_path_removed(source);
+    notify_shell_path_created(destination);
+    notify_shell_parent_updated(destination);
 }
 
 fn organizer_contents(root: &Path) -> Vec<PathBuf> {
@@ -2005,7 +2073,7 @@ fn launchers_with_optional_icons(
         let path = Path::new(&launcher.path);
         launcher.name = normalized_launch_name(&launcher.name, path);
         if include_icons {
-            launcher.icon_data_url = system_icon::icon_data_url(path);
+            launcher.icon_data_url = cached_icon_data_url(path);
         } else {
             launcher.icon_data_url = None;
         }
@@ -2146,10 +2214,41 @@ fn resolve_path_icons_impl(paths: Vec<String>) -> Result<Vec<PathIconResult>, St
     Ok(unique
         .into_values()
         .map(|path| PathIconResult {
-            icon_data_url: system_icon::icon_data_url(Path::new(&path)),
+            icon_data_url: cached_icon_data_url(Path::new(&path)),
             path,
         })
         .collect())
+}
+
+fn cached_icon_data_url(path: &Path) -> Option<String> {
+    const ICON_CACHE_LIMIT: usize = 1024;
+
+    let key = normalize_path_for_compare(path);
+    if key.is_empty() {
+        return None;
+    }
+
+    if let Ok(cache) = ICON_DATA_URL_CACHE
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+    {
+        if let Some(icon) = cache.get(&key) {
+            return icon.clone();
+        }
+    }
+
+    let icon = system_icon::icon_data_url(path);
+    if let Ok(mut cache) = ICON_DATA_URL_CACHE
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+    {
+        if cache.len() >= ICON_CACHE_LIMIT && !cache.contains_key(&key) {
+            cache.clear();
+        }
+        cache.insert(key, icon.clone());
+    }
+
+    icon
 }
 
 fn desktop_items(include_icons: bool) -> Vec<DesktopItem> {
@@ -2175,7 +2274,7 @@ fn desktop_items(include_icons: bool) -> Vec<DesktopItem> {
 fn desktop_item_for_path(path: &Path, include_icon: bool) -> DesktopItem {
     let mut item = DesktopItem::from_path(path);
     if include_icon {
-        item.icon_data_url = system_icon::icon_data_url(path);
+        item.icon_data_url = cached_icon_data_url(path);
     }
     item
 }
@@ -2693,11 +2792,13 @@ fn archive_item_path(store: &AppStore, category_name: &str, path: &str) -> Resul
     if destination.exists() {
         if !same_path_text(path, &destination.display().to_string()) {
             remove_existing_path(&source)?;
+            notify_shell_path_removed(&source);
         }
         return Ok(destination.display().to_string());
     }
 
     move_path(&source, &destination)?;
+    notify_shell_path_moved(&source, &destination);
     Ok(destination.display().to_string())
 }
 
@@ -2946,8 +3047,8 @@ fn add_matching_paths(
             continue;
         }
 
-        let mut stack = vec![root_path];
-        while let Some(path) = stack.pop() {
+        let mut queue = VecDeque::from([root_path]);
+        while let Some(path) = queue.pop_front() {
             if scanned >= SEARCH_SCAN_LIMIT || unique.len() >= SEARCH_RESULT_LIMIT * 2 {
                 break;
             }
@@ -2969,13 +3070,14 @@ fn add_matching_paths(
                 };
 
                 let name = display_path_name(&entry_path);
-                if is_noise_search_entry(&name) {
+                let is_dir = file_type.is_dir();
+                if is_dir && is_noise_search_dir(&name) {
                     continue;
                 }
 
                 let path_text = entry_path.display().to_string();
                 if matches_search_query(&name, &path_text, query_lower) {
-                    let kind = if file_type.is_dir() {
+                    let kind = if is_dir {
                         SearchItemKind::Directory
                     } else {
                         SearchItemKind::File
@@ -2986,8 +3088,8 @@ fn add_matching_paths(
                         .or_insert_with(|| path_search_item(&entry_path, kind));
                 }
 
-                if file_type.is_dir() {
-                    stack.push(entry_path);
+                if is_dir {
+                    queue.push_back(entry_path);
                 }
             }
         }
@@ -3047,7 +3149,7 @@ fn launcher_search_item(launcher: &LaunchItem, name: String) -> SearchItem {
     let icon_data_url = launcher
         .icon_data_url
         .clone()
-        .or_else(|| system_icon::icon_data_url(Path::new(&path)));
+        .or_else(|| cached_icon_data_url(Path::new(&path)));
     SearchItem {
         id: format!("launcher:{}", path.to_lowercase()),
         name,
@@ -3080,7 +3182,7 @@ fn path_search_item(path: &Path, kind: SearchItemKind) -> SearchItem {
             .parent()
             .map(|parent| parent.display().to_string())
             .unwrap_or_else(|| "本地路径".to_owned()),
-        icon_data_url: system_icon::icon_data_url(path),
+        icon_data_url: cached_icon_data_url(path),
         open_count: 0,
         last_opened_at: String::new(),
     }
@@ -3103,7 +3205,7 @@ fn search_item_from_history(item: &SearchHistoryItem) -> SearchItem {
             SearchItemKind::Directory => "目录".to_owned(),
             SearchItemKind::File => "最近文件".to_owned(),
         },
-        icon_data_url: system_icon::icon_data_url(Path::new(&item.path)),
+        icon_data_url: cached_icon_data_url(Path::new(&item.path)),
         open_count: item.open_count,
         last_opened_at: item.last_opened_at.clone(),
     }
@@ -3150,11 +3252,72 @@ fn is_shortcut_or_app(item: &SearchItem) -> bool {
     )
 }
 
-fn is_noise_search_entry(name: &str) -> bool {
+fn is_noise_search_dir(name: &str) -> bool {
     matches!(
         name,
-        "." | ".." | "node_modules" | ".git" | "target" | "dist"
+        "." | ".."
+            | ".git"
+            | ".hg"
+            | ".svn"
+            | ".cache"
+            | ".next"
+            | ".nuxt"
+            | ".pytest_cache"
+            | ".ruff_cache"
+            | ".venv"
+            | "__pycache__"
+            | "build"
+            | "dist"
+            | "node_modules"
+            | "target"
+            | "venv"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn recursive_search_finds_nested_shortcut_before_noisy_dirs() {
+        let root = unique_test_dir("dustdesk-search");
+        let shortcut_dir = root.join("apps").join("nested");
+        let noisy_dir = root
+            .join("projects")
+            .join("demo")
+            .join(".venv")
+            .join("Scripts");
+        fs::create_dir_all(&shortcut_dir).expect("create shortcut dir");
+        fs::create_dir_all(&noisy_dir).expect("create noisy dir");
+        fs::write(shortcut_dir.join("Cursor.lnk"), b"shortcut").expect("write shortcut");
+        fs::write(noisy_dir.join("cursor.py"), b"print('cursor')").expect("write noisy file");
+
+        let mut unique = BTreeMap::new();
+        add_matching_paths(&[root.display().to_string()], "cursor", &mut unique);
+
+        let items = unique.into_values().collect::<Vec<_>>();
+        assert!(
+            items
+                .iter()
+                .any(|item| item.name == "Cursor" && item.extension.eq_ignore_ascii_case("lnk")),
+            "nested shortcut should be searchable"
+        );
+        assert!(
+            items.iter().all(|item| !item.path.contains(".venv")),
+            "virtual environment files should not pollute search results"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn unique_test_dir(prefix: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        env::temp_dir().join(format!("{prefix}-{}-{nonce}", std::process::id()))
+    }
 }
 
 fn clipboard_preview(mut items: Vec<ClipboardHistoryItem>) -> Vec<ClipboardHistoryItem> {
@@ -3331,15 +3494,96 @@ fn open_with_shell(path: &str) -> Result<(), String> {
         .map_err(to_message)
 }
 
-fn set_launch_on_startup_shortcut(enabled: bool) -> Result<(), String> {
-    let shortcut = startup_shortcut_path()?;
-    if enabled {
+fn set_launch_on_startup_entry(enabled: bool) -> Result<(), String> {
+    remove_legacy_startup_shortcut();
+    set_launch_on_startup_run_entry(enabled)
+}
+
+#[cfg(windows)]
+fn set_launch_on_startup_run_entry(enabled: bool) -> Result<(), String> {
+    const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+    const VALUE_NAME: &str = "DeskNest";
+
+    use std::ptr::null_mut;
+
+    use windows_sys::Win32::{
+        Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS},
+        System::Registry::{
+            RegCloseKey, RegCreateKeyW, RegDeleteValueW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
+            REG_SZ,
+        },
+    };
+
+    let mut key: HKEY = null_mut();
+    let run_key = wide_null(RUN_KEY);
+    let status = unsafe { RegCreateKeyW(HKEY_CURRENT_USER, run_key.as_ptr(), &mut key) };
+    if status != ERROR_SUCCESS {
+        return Err(format!("打开开机自启注册表失败：{status}"));
+    }
+
+    let value_name = wide_null(VALUE_NAME);
+    let result = if enabled {
         let exe = env::current_exe().map_err(to_message)?;
-        create_windows_shortcut(&shortcut, &exe, "DeskNest 开机自启")?;
-    } else if shortcut.exists() {
-        fs::remove_file(&shortcut).map_err(to_message)?;
+        let command = format!("\"{}\" --startup", exe.display());
+        let command = wide_null(&command);
+        unsafe {
+            RegSetValueExW(
+                key,
+                value_name.as_ptr(),
+                0,
+                REG_SZ,
+                command.as_ptr().cast::<u8>(),
+                (command.len() * std::mem::size_of::<u16>()) as u32,
+            )
+        }
+    } else {
+        let status = unsafe { RegDeleteValueW(key, value_name.as_ptr()) };
+        if status == ERROR_FILE_NOT_FOUND {
+            ERROR_SUCCESS
+        } else {
+            status
+        }
+    };
+
+    unsafe {
+        RegCloseKey(key);
+    }
+
+    if result != ERROR_SUCCESS {
+        return Err(format!("更新开机自启注册表失败：{result}"));
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn wide_null(value: &str) -> Vec<u16> {
+    use std::{ffi::OsStr, os::windows::ffi::OsStrExt};
+
+    OsStr::new(value)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn set_launch_on_startup_run_entry(enabled: bool) -> Result<(), String> {
+    if enabled {
+        let exe = env::current_exe().map_err(to_message)?;
+        let shortcut = startup_shortcut_path()?;
+        create_windows_shortcut(&shortcut, &exe, "DeskNest 开机自启")?;
+    } else {
+        remove_legacy_startup_shortcut();
+    }
+    Ok(())
+}
+
+fn remove_legacy_startup_shortcut() {
+    let Ok(shortcut) = startup_shortcut_path() else {
+        return;
+    };
+    if shortcut.exists() {
+        let _ = fs::remove_file(shortcut);
+    }
 }
 
 fn startup_shortcut_path() -> Result<PathBuf, String> {
@@ -3545,10 +3789,33 @@ fn sync_launch_on_startup_setting() {
         return;
     };
     let config = store.load_config();
-    if let Err(error) = set_launch_on_startup_shortcut(config.settings.launch_on_startup) {
-        eprintln!("failed to sync launch on startup shortcut: {error}");
+    if let Err(error) = set_launch_on_startup_entry(config.settings.launch_on_startup) {
+        eprintln!("failed to sync launch on startup entry: {error}");
     }
 }
+
+fn is_startup_launch_invocation() -> bool {
+    env::args().any(|arg| arg == "--startup")
+}
+
+#[cfg(windows)]
+fn raise_startup_process_priority_if_needed(settings: &AppSettings) {
+    if !settings.launch_on_startup || !is_startup_launch_invocation() {
+        return;
+    }
+
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, SetPriorityClass, HIGH_PRIORITY_CLASS,
+    };
+
+    let ok = unsafe { SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS) != 0 };
+    if !ok {
+        eprintln!("failed to raise startup process priority");
+    }
+}
+
+#[cfg(not(windows))]
+fn raise_startup_process_priority_if_needed(_settings: &AppSettings) {}
 
 fn shortcut_matches(shortcut: &Shortcut, configured: &str) -> bool {
     configured
@@ -3613,6 +3880,8 @@ fn start_desktop_background_operation(
             moved: 0,
             skipped: 0,
             restored: 0,
+            total: 0,
+            current_path: String::new(),
             category_counts: Vec::new(),
         },
     );
@@ -3627,6 +3896,8 @@ fn start_desktop_background_operation(
                 moved: 0,
                 skipped: 0,
                 restored: 0,
+                total: 0,
+                current_path: String::new(),
                 category_counts: Vec::new(),
             },
         };
@@ -4017,7 +4288,7 @@ fn request_real_app_exit(app: tauri::AppHandle) {
 
     tauri::async_runtime::spawn_blocking(move || {
         cleanup_desktop_card_windows_impl(&app);
-        if let Err(error) = restore_all_organized_items_to_desktop() {
+        if let Err(error) = restore_all_organized_items_to_desktop_and_clear_markers() {
             eprintln!("failed to restore organized desktop items on exit: {error}");
         }
         app.exit(0);
@@ -4105,6 +4376,7 @@ fn main() {
             sync_launch_on_startup_setting();
             clipboard_bridge::spawn_text_history_monitor();
             let settings = configured_settings();
+            raise_startup_process_priority_if_needed(&settings);
             let clipboard_shortcut = settings.clipboard_shortcut_value();
             if let Err(error) = app.global_shortcut().register(clipboard_shortcut.as_str()) {
                 eprintln!("failed to register {clipboard_shortcut} shortcut: {error}");
@@ -4132,8 +4404,8 @@ fn main() {
                         eprintln!("failed to repair desktop entry shortcuts: {error}");
                     }
                 }
-                if let Err(error) = archive_marked_desktop_items_on_startup() {
-                    eprintln!("failed to archive marked desktop items on startup: {error}");
+                if let Err(error) = restore_all_organized_items_to_desktop_and_clear_markers() {
+                    eprintln!("failed to restore organized desktop items on startup: {error}");
                 }
                 emit_desktop_cards_changed(&handle);
             });

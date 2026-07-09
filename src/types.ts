@@ -53,11 +53,13 @@ export interface DesktopLayout {
 
 export interface DesktopOperationEvent {
   kind: "classify" | "restore"
-  status: "started" | "finished" | "failed"
+  status: "started" | "progress" | "finished" | "failed"
   message: string
   moved: number
   skipped: number
   restored: number
+  total: number
+  current_path: string
   category_counts: CategoryClassifyCount[]
 }
 

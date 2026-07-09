@@ -30,7 +30,15 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { usePersistCurrentWindowLayout } from "@/hooks/use-persist-current-window-layout"
 import { useTheme } from "@/hooks/use-theme"
-import { allowPathLikeDrag, didDragEndOutsideWindow, hasPathLikeDrag, readDustDeskPathDrag, writeDustDeskPathDrag } from "@/lib/dustdesk-dnd"
+import {
+  allowPathLikeDrag,
+  desktopDropPositionFromDragEnd,
+  didDragEndOutsideWindow,
+  hasPathLikeDrag,
+  readDustDeskPathDrag,
+  type DesktopDropPosition,
+  writeDustDeskPathDrag,
+} from "@/lib/dustdesk-dnd"
 import { repaintCurrentWindow, safeCurrentWebviewDragDropEvent, safeListen, startCurrentWindowDragging, startCurrentWindowResizeDragging } from "@/lib/tauri-window"
 import { displayPathName, extensionFromPath } from "@/lib/utils"
 import { useDustDeskStore } from "@/stores/dustdesk-store"
@@ -94,7 +102,11 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
   const category = Number.isFinite(index) ? snapshot.categories[index] : undefined
   const visual = useMemo(() => {
     if (kind === "launcher") {
-      return { icon: RocketLaunch, color: "#fb923c", glow: "rgba(251, 146, 60, 0.28)" }
+      return {
+        icon: RocketLaunch,
+        color: "#fb923c",
+        glow: "rgba(251, 146, 60, 0.28)",
+      }
     }
     return categoryVisual(category?.name ?? "分类", index)
   }, [category?.name, index, kind])
@@ -169,13 +181,12 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
   useEffect(() => {
     let unlisten: (() => void) | undefined
     void safeCurrentWebviewDragDropEvent((event) => {
-        const payload = event.payload
-        if (payload.type !== "drop") return
-        void handleDropped(payload.paths)
-      })
-      .then((value) => {
-        unlisten = value
-      })
+      const payload = event.payload
+      if (payload.type !== "drop") return
+      void handleDropped(payload.paths)
+    }).then((value) => {
+      unlisten = value
+    })
     return () => unlisten?.()
   }, [kind, index, category?.name])
 
@@ -197,9 +208,9 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
     }
   }
 
-  async function handleRestoreDragOut(path: string) {
+  async function handleRestoreDragOut(path: string, position: DesktopDropPosition) {
     try {
-      const restored = await restoreItemToDesktopLight(index, path)
+      const restored = await restoreItemToDesktopLight(index, path, position)
       setNotice(`已移回桌面：${displayPathName(restored)}`)
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error))
@@ -496,7 +507,11 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
         )}
         {desktopOperationLabel ? <WidgetOperationOverlay label={desktopOperationLabel} /> : null}
       </section>
-      {notice ? <div className="pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full bg-slate-950/70 px-3 py-1 text-xs text-white/80 ring-1 ring-white/10">{notice}</div> : null}
+      {notice ? (
+        <div className="pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full bg-slate-950/70 px-3 py-1 text-xs text-white/80 ring-1 ring-white/10">
+          {notice}
+        </div>
+      ) : null}
       <button
         type="button"
         className="no-drag absolute bottom-0 right-0 size-7 cursor-nwse-resize rounded-br-2xl border-b-2 border-r-2 border-white/45"
@@ -568,12 +583,19 @@ function SettingsMenu({
           <MenuButton icon={PencilSimple} label="重命名当前分类" onClick={() => void renameCategory()} />
           <MenuButton icon={Trash} label="删除当前分类" onClick={() => void deleteCategory()} />
           <MenuButton icon={Columns} label="拆分全部分类" onClick={() => void onSplitAllCategories()} />
-          <MenuButton icon={Columns} label={isClassifyingDesktop ? "智能收纳中" : "智能收纳并拆分全部"} disabled={isClassifyingDesktop} onClick={() => void onOrganizeAndSplitAll()} />
+          <MenuButton
+            icon={Columns}
+            label={isClassifyingDesktop ? "智能收纳中" : "智能收纳并拆分全部"}
+            disabled={isClassifyingDesktop}
+            onClick={() => void onOrganizeAndSplitAll()}
+          />
           <MenuButton icon={Archive} label={isClassifyingDesktop ? "智能收纳中" : "智能收纳桌面"} disabled={isClassifyingDesktop} onClick={() => void onClassifyDesktop()} />
           <MenuButton icon={Desktop} label={isRestoringDesktop ? "还原中" : "一键还原桌面"} disabled={isRestoringDesktop} onClick={() => void onRestoreAllToDesktop()} />
         </>
       ) : null}
-      {kind === "launcher" ? <MenuButton icon={Columns} label={isMergingCategories ? "合并中" : "一键合并分类"} disabled={isMergingCategories} onClick={() => void onMergeAllCategories()} /> : null}
+      {kind === "launcher" ? (
+        <MenuButton icon={Columns} label={isMergingCategories ? "合并中" : "一键合并分类"} disabled={isMergingCategories} onClick={() => void onMergeAllCategories()} />
+      ) : null}
       <MenuButton icon={ArrowsClockwise} label="刷新" onClick={() => void onRefresh()} />
       <div className="my-1 h-px bg-white/10" />
       <RangeRow label="卡片透明度" min={0.25} max={0.85} step={0.05} value={settings.opacity} onChange={(opacity) => updateSettings({ opacity })} />
@@ -591,28 +613,19 @@ function SettingsMenu({
 
 function MenuButton({ icon: Icon, label, disabled, onClick }: { icon: Icon; label: string; disabled?: boolean; onClick: () => void }) {
   return (
-    <button type="button" disabled={disabled} className="flex w-full items-center gap-1.5 rounded-lg px-2 py-1 text-left text-[11px] font-semibold text-white/80 transition hover:bg-white/10 hover:text-white disabled:cursor-wait disabled:opacity-55" onClick={onClick}>
+    <button
+      type="button"
+      disabled={disabled}
+      className="flex w-full items-center gap-1.5 rounded-lg px-2 py-1 text-left text-[11px] font-semibold text-white/80 transition hover:bg-white/10 hover:text-white disabled:cursor-wait disabled:opacity-55"
+      onClick={onClick}
+    >
       <Icon className="size-3.5" weight="duotone" />
       <span>{label}</span>
     </button>
   )
 }
 
-function RangeRow({
-  label,
-  min,
-  max,
-  step,
-  value,
-  onChange,
-}: {
-  label: string
-  min: number
-  max: number
-  step: number
-  value: number
-  onChange: (value: number) => void
-}) {
+function RangeRow({ label, min, max, step, value, onChange }: { label: string; min: number; max: number; step: number; value: number; onChange: (value: number) => void }) {
   return (
     <label className="block rounded-lg px-2 py-1 text-[11px] font-semibold text-white/80">
       <span className="mb-1 flex justify-between">
@@ -639,7 +652,7 @@ function CategoryItems({
   onOpen: (path: string) => Promise<void>
   onShowInFolder: (path: string) => Promise<void>
   onRestoreToDesktop: (index: number, path: string) => Promise<string>
-  onRestoreDragOut: (path: string) => Promise<void>
+  onRestoreDragOut: (path: string, position: DesktopDropPosition) => Promise<void>
 }) {
   if (items.length === 0) {
     return <EmptyDropHint title="暂无项目" detail="把桌面文件拖到这里，会自动收纳进这个分类。" />
@@ -660,11 +673,25 @@ function CategoryItems({
             dragEffectAllowed="copyMove"
             settings={settings}
             onOpen={onOpen}
-            onDragEndOutside={() => onRestoreDragOut(item.path)}
+            onDragEndOutside={(position) => onRestoreDragOut(item.path, position)}
             actions={[
-              { label: "打开", icon: "open", onSelect: () => onOpen(item.path) },
-              { label: "在资源管理器中显示", icon: "folder", onSelect: () => onShowInFolder(item.path) },
-              { label: "移回桌面", icon: "restore", onSelect: async () => { await onRestoreToDesktop(categoryIndex, item.path) } },
+              {
+                label: "打开",
+                icon: "open",
+                onSelect: () => onOpen(item.path),
+              },
+              {
+                label: "在资源管理器中显示",
+                icon: "folder",
+                onSelect: () => onShowInFolder(item.path),
+              },
+              {
+                label: "移回桌面",
+                icon: "restore",
+                onSelect: async () => {
+                  await onRestoreToDesktop(categoryIndex, item.path)
+                },
+              },
             ]}
           />
         ))}
@@ -704,9 +731,22 @@ function LauncherItems({
             settings={settings}
             onOpen={onOpen}
             actions={[
-              { label: "启动", icon: "open", onSelect: () => onOpen(item.path) },
-              { label: "在资源管理器中显示", icon: "folder", onSelect: () => onShowInFolder(item.path) },
-              { label: "从快捷启动移除", icon: "remove", tone: "danger", onSelect: () => onRemoveLauncher(item.path) },
+              {
+                label: "启动",
+                icon: "open",
+                onSelect: () => onOpen(item.path),
+              },
+              {
+                label: "在资源管理器中显示",
+                icon: "folder",
+                onSelect: () => onShowInFolder(item.path),
+              },
+              {
+                label: "从快捷启动移除",
+                icon: "remove",
+                tone: "danger",
+                onSelect: () => onRemoveLauncher(item.path),
+              },
             ]}
           />
         ))}
@@ -750,7 +790,7 @@ function WidgetItem({
   dragEffectAllowed?: DataTransfer["effectAllowed"]
   settings: WidgetSettings
   onOpen: (path: string) => Promise<void>
-  onDragEndOutside?: () => unknown
+  onDragEndOutside?: (position: DesktopDropPosition) => unknown
   actions?: ItemContextMenuAction[]
 }) {
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null)
@@ -767,7 +807,7 @@ function WidgetItem({
       }}
       onDragEnd={(event: ReactDragEvent<HTMLButtonElement>) => {
         if (!dragPath || !onDragEndOutside || !didDragEndOutsideWindow(event)) return
-        void Promise.resolve(onDragEndOutside()).catch(() => undefined)
+        void Promise.resolve(onDragEndOutside(desktopDropPositionFromDragEnd(event))).catch(() => undefined)
       }}
       onDoubleClick={() => void onOpen(path)}
       onContextMenu={(event) => {

@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core"
 import { create } from "zustand"
 import { immer } from "zustand/middleware/immer"
+import type { DesktopDropPosition } from "@/lib/dustdesk-dnd"
 import { displayPathName, extensionFromPath } from "@/lib/utils"
 import type {
   AppPage,
@@ -62,6 +63,12 @@ interface DesktopSnapshotLoadOptions {
   force?: boolean
 }
 
+interface RestoreDesktopArgs extends Record<string, unknown> {
+  index: number
+  path: string
+  position?: DesktopDropPosition
+}
+
 const iconBatchSize = 24
 const iconPathLimit = 512
 const desktopSnapshotReloadDedupeMs = 120
@@ -90,6 +97,12 @@ function waitForNextPaint() {
   })
 }
 
+function restoreDesktopArgs(index: number, path: string, position?: DesktopDropPosition): RestoreDesktopArgs {
+  const args: RestoreDesktopArgs = { index, path }
+  if (position) args.position = position
+  return args
+}
+
 const demoSnapshot: AppSnapshot = {
   data_dir: "<安装目录>\\Data",
   organizer_root: "<安装目录>\\DesktopOrganizer",
@@ -104,10 +117,30 @@ const demoSnapshot: AppSnapshot = {
     { name: "游戏", is_collapsed: false, item_paths: [], item_details: [] },
   ],
   desktop_items: [
-    { name: "Apifox", path: "C:\\Users\\Desktop\\Apifox.lnk", extension: "LNK", is_dir: false },
-    { name: "Cursor", path: "C:\\Users\\Desktop\\Cursor.lnk", extension: "LNK", is_dir: false },
-    { name: "Project Assets", path: "C:\\Users\\Desktop\\Project Assets", extension: "DIR", is_dir: true },
-    { name: "design-reference", path: "C:\\Users\\Desktop\\design-reference.png", extension: "PNG", is_dir: false },
+    {
+      name: "Apifox",
+      path: "C:\\Users\\Desktop\\Apifox.lnk",
+      extension: "LNK",
+      is_dir: false,
+    },
+    {
+      name: "Cursor",
+      path: "C:\\Users\\Desktop\\Cursor.lnk",
+      extension: "LNK",
+      is_dir: false,
+    },
+    {
+      name: "Project Assets",
+      path: "C:\\Users\\Desktop\\Project Assets",
+      extension: "DIR",
+      is_dir: true,
+    },
+    {
+      name: "design-reference",
+      path: "C:\\Users\\Desktop\\design-reference.png",
+      extension: "PNG",
+      is_dir: false,
+    },
   ],
   launchers: [
     { name: "Cursor", path: "C:\\Users\\Desktop\\Cursor.lnk" },
@@ -128,7 +161,9 @@ async function call<T>(command: string, args?: InvokeArgs): Promise<T> {
       return normalizeSnapshot(demoSnapshot) as T
     }
     if (command === "resolve_path_icons") {
-      return asArray(args?.paths).map((path) => ({ path: asPathString(path) })) as T
+      return asArray(args?.paths).map((path) => ({
+        path: asPathString(path),
+      })) as T
     }
     if (command === "load_search_overlay") {
       return demoSearchOverlay() as T
@@ -137,18 +172,26 @@ async function call<T>(command: string, args?: InvokeArgs): Promise<T> {
       return demoSearchItems(asString(args?.query)) as T
     }
     if (command === "update_clipboard_shortcut") {
-      return normalizeSettings({ ...defaultSettings, clipboard_shortcut: asString(args?.shortcut, defaultSettings.clipboard_shortcut) }) as T
+      return normalizeSettings({
+        ...defaultSettings,
+        clipboard_shortcut: asString(args?.shortcut, defaultSettings.clipboard_shortcut),
+      }) as T
     }
     if (command === "update_search_settings") {
       return normalizeSettings({
         ...defaultSettings,
         search_enabled: asBoolean(args?.enabled, defaultSettings.search_enabled),
         search_shortcut: asString(args?.shortcut, defaultSettings.search_shortcut),
-        search_paths: asArray(args?.paths).map((item) => asString(item)).filter(Boolean),
+        search_paths: asArray(args?.paths)
+          .map((item) => asString(item))
+          .filter(Boolean),
       }) as T
     }
     if (command === "update_launch_on_startup") {
-      return normalizeSettings({ ...defaultSettings, launch_on_startup: asBoolean(args?.enabled) }) as T
+      return normalizeSettings({
+        ...defaultSettings,
+        launch_on_startup: asBoolean(args?.enabled),
+      }) as T
     }
     if (command === "classify_desktop_items") {
       return {
@@ -232,7 +275,13 @@ function asArray(value: unknown): unknown[] {
 }
 
 function normalizeSplitIndices(value: unknown): number[] {
-  return [...new Set(asArray(value).map(Number).filter((index) => Number.isInteger(index) && index >= 0))].sort((left, right) => left - right)
+  return [
+    ...new Set(
+      asArray(value)
+        .map(Number)
+        .filter((index) => Number.isInteger(index) && index >= 0),
+    ),
+  ].sort((left, right) => left - right)
 }
 
 function normalizeDesktopWindowLayout(value: unknown): DesktopWindowLayout | null {
@@ -305,15 +354,21 @@ function normalizeSettings(value: unknown): AppSettings {
     clipboard_shortcut: asString(raw.clipboard_shortcut ?? raw.ClipboardShortcut, defaultSettings.clipboard_shortcut),
     search_enabled: asBoolean(raw.search_enabled ?? raw.SearchEnabled, defaultSettings.search_enabled),
     search_shortcut: asString(raw.search_shortcut ?? raw.SearchShortcut, defaultSettings.search_shortcut),
-    search_paths: asArray(raw.search_paths ?? raw.SearchPaths).map((item) => asPathString(item)).filter(Boolean),
+    search_paths: asArray(raw.search_paths ?? raw.SearchPaths)
+      .map((item) => asPathString(item))
+      .filter(Boolean),
     launch_on_startup: asBoolean(raw.launch_on_startup ?? raw.LaunchOnStartup, defaultSettings.launch_on_startup),
   }
 }
 
 function normalizeCategory(value: unknown): DeskCategory {
   const raw = asRecord(value)
-  const itemPaths = asArray(raw.item_paths ?? raw.ItemPaths).map((item) => asPathString(item)).filter(Boolean)
-  const itemDetails = asArray(raw.item_details ?? raw.ItemDetails).map(normalizeDesktopItem).filter((item) => item.path)
+  const itemPaths = asArray(raw.item_paths ?? raw.ItemPaths)
+    .map((item) => asPathString(item))
+    .filter(Boolean)
+  const itemDetails = asArray(raw.item_details ?? raw.ItemDetails)
+    .map(normalizeDesktopItem)
+    .filter((item) => item.path)
   return {
     name: asString(raw.name ?? raw.Name, "未命名分类"),
     is_collapsed: asBoolean(raw.is_collapsed ?? raw.IsCollapsed),
@@ -372,7 +427,9 @@ function normalizeSearchOverlay(value: unknown): SearchOverlayData {
   const raw = asRecord(value)
   return {
     settings: normalizeSettings(raw.settings ?? raw.Settings),
-    paths: asArray(raw.paths ?? raw.Paths).map((item) => asPathString(item)).filter(Boolean),
+    paths: asArray(raw.paths ?? raw.Paths)
+      .map((item) => asPathString(item))
+      .filter(Boolean),
     recent: asArray(raw.recent ?? raw.Recent).map(normalizeSearchItem),
     frequent: asArray(raw.frequent ?? raw.Frequent).map(normalizeSearchItem),
   }
@@ -486,11 +543,7 @@ function mergeIconResolutionOptions(left: IconResolutionOptions | null, right: I
 }
 
 function applyResolvedIcons(snapshot: AppSnapshot, icons: PathIconResult[]) {
-  const iconByPath = new Map(
-    icons
-      .filter((item) => item.path && item.icon_data_url)
-      .map((item) => [item.path.toLowerCase(), item.icon_data_url as string]),
-  )
+  const iconByPath = new Map(icons.filter((item) => item.path && item.icon_data_url).map((item) => [item.path.toLowerCase(), item.icon_data_url as string]))
   if (iconByPath.size === 0) return
 
   for (const category of snapshot.categories) {
@@ -616,8 +669,8 @@ interface DustDeskState {
   addItemsToCategory: (index: number, paths: string[]) => Promise<number>
   addItemsToCategoryLight: (index: number, paths: string[]) => Promise<number>
   removeItemFromCategory: (index: number, path: string) => Promise<void>
-  restoreItemToDesktop: (index: number, path: string) => Promise<string>
-  restoreItemToDesktopLight: (index: number, path: string) => Promise<string>
+  restoreItemToDesktop: (index: number, path: string, position?: DesktopDropPosition) => Promise<string>
+  restoreItemToDesktopLight: (index: number, path: string, position?: DesktopDropPosition) => Promise<string>
   restoreAllToDesktop: () => Promise<number>
   restoreAllToDesktopLight: () => Promise<number>
   startRestoreAllToDesktopTask: () => Promise<void>
@@ -747,7 +800,11 @@ export const useDustDeskStore = create<DustDeskState>()(
           for (let index = 0; index < paths.length; index += iconBatchSize) {
             if (run !== iconResolutionToken) break
             const batch = paths.slice(index, index + iconBatchSize)
-            const icons = asArray(await call<PathIconResult[]>("resolve_path_icons", { paths: batch })).map(normalizePathIcon)
+            const icons = asArray(
+              await call<PathIconResult[]>("resolve_path_icons", {
+                paths: batch,
+              }),
+            ).map(normalizePathIcon)
             if (run !== iconResolutionToken) break
             rememberResolvedIcons(icons)
             set((state) => {
@@ -812,13 +869,13 @@ export const useDustDeskStore = create<DustDeskState>()(
       await call("remove_item_from_category", { index, path })
       await get().load()
     },
-    restoreItemToDesktop: async (index, path) => {
-      const restored = await call<string>("restore_item_to_desktop", { index, path })
+    restoreItemToDesktop: async (index, path, position) => {
+      const restored = await call<string>("restore_item_to_desktop", restoreDesktopArgs(index, path, position))
       await get().load()
       return restored
     },
-    restoreItemToDesktopLight: async (index, path) => {
-      const restored = await call<string>("restore_item_to_desktop", { index, path })
+    restoreItemToDesktopLight: async (index, path, position) => {
+      const restored = await call<string>("restore_item_to_desktop", restoreDesktopArgs(index, path, position))
       const key = path.trim().toLowerCase()
       set((state) => {
         const category = state.snapshot.categories[index]
@@ -957,7 +1014,9 @@ export const useDustDeskStore = create<DustDeskState>()(
       await call("save_desktop_window_layout", { label })
     },
     saveDesktopSplitIndices: async (indices) => {
-      const saved = await call<unknown>("save_desktop_split_indices", { indices })
+      const saved = await call<unknown>("save_desktop_split_indices", {
+        indices,
+      })
       return normalizeSplitIndices(saved)
     },
     hideCurrentWindow: async () => {
@@ -967,7 +1026,10 @@ export const useDustDeskStore = create<DustDeskState>()(
       await call("open_special", { target })
     },
     updateRuntimeDirectory: async (target, path) => {
-      const snapshot = await call<AppSnapshot>("update_runtime_directory", { target, path })
+      const snapshot = await call<AppSnapshot>("update_runtime_directory", {
+        target,
+        path,
+      })
       resetRuntimeCaches()
       set((state) => {
         state.snapshot = snapshot
@@ -998,7 +1060,9 @@ export const useDustDeskStore = create<DustDeskState>()(
       await call("hide_clipboard_overlay")
     },
     updateClipboardShortcut: async (shortcut) => {
-      const settings = await call<AppSettings>("update_clipboard_shortcut", { shortcut })
+      const settings = await call<AppSettings>("update_clipboard_shortcut", {
+        shortcut,
+      })
       set((state) => {
         state.snapshot.settings = normalizeSettings(settings)
       })
@@ -1020,14 +1084,20 @@ export const useDustDeskStore = create<DustDeskState>()(
       await call("hide_search_overlay")
     },
     updateSearchSettings: async (enabled, shortcut, paths) => {
-      const settings = await call<AppSettings>("update_search_settings", { enabled, shortcut, paths })
+      const settings = await call<AppSettings>("update_search_settings", {
+        enabled,
+        shortcut,
+        paths,
+      })
       set((state) => {
         state.snapshot.settings = normalizeSettings(settings)
       })
       return normalizeSettings(settings)
     },
     updateLaunchOnStartup: async (enabled) => {
-      const settings = await call<AppSettings>("update_launch_on_startup", { enabled })
+      const settings = await call<AppSettings>("update_launch_on_startup", {
+        enabled,
+      })
       set((state) => {
         state.snapshot.settings = normalizeSettings(settings)
       })

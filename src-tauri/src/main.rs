@@ -602,7 +602,14 @@ fn repair_existing_app_desktop_entries(store: &AppStore) -> Result<(), String> {
 
 fn app_desktop_entry_aliases(name: &str) -> &'static [&'static str] {
     match name {
-        "DustDesk 收纳箱" => &["DustDesk 收纳箱", "DustDusk 收纳箱", "DeskNest 收纳箱"],
+        "DustDesk 收纳箱" => &[
+            "DustDesk 收纳箱",
+            "DustDesk 桌面收纳",
+            "DustDusk 收纳箱",
+            "DustDusk 桌面收纳",
+            "DeskNest 收纳箱",
+            "DeskNest 桌面收纳",
+        ],
         "DustDesk 快捷启动" => &[
             "DustDesk 快捷启动",
             "DustDusk 快捷启动",
@@ -3568,6 +3575,11 @@ fn main() {
                 eprintln!("failed to show desktop cards: {error}");
             }
             tauri::async_runtime::spawn_blocking(move || {
+                if let Ok(store) = AppStore::open() {
+                    if let Err(error) = repair_existing_app_desktop_entries(&store) {
+                        eprintln!("failed to repair desktop entry shortcuts: {error}");
+                    }
+                }
                 if let Err(error) = archive_marked_desktop_items_on_startup() {
                     eprintln!("failed to archive marked desktop items on startup: {error}");
                 }

@@ -20,3 +20,5 @@ createRoot(document.getElementById("root")!).render(
     </AppErrorBoundary>
   </StrictMode>,
 )
+
+document.documentElement.classList.remove("boot-main-route", "boot-desktop-route")

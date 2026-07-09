@@ -60,7 +60,8 @@ export function SettingsPage() {
   const [isSavingStartup, setIsSavingStartup] = useState(false)
   const [startupError, setStartupError] = useState("")
   const [startupSuccess, setStartupSuccess] = useState("")
-  const effectiveSearchPaths = searchPathsDraft.length > 0 ? searchPathsDraft : [snapshot.organizer_root].filter(Boolean)
+  const safeSearchPathsDraft = Array.isArray(searchPathsDraft) ? searchPathsDraft : []
+  const effectiveSearchPaths = safeSearchPathsDraft.length > 0 ? safeSearchPathsDraft : [snapshot.organizer_root].filter(Boolean)
   const rows = [
     { name: "数据目录", value: snapshot.data_dir, target: "data" as const, icon: HardDrives },
     { name: "收纳目录", value: snapshot.organizer_root, target: "organizer" as const, icon: FolderOpen },
@@ -422,13 +423,13 @@ export function SettingsPage() {
                   <div className="grid max-h-36 gap-2 overflow-y-auto pr-1">
                     {effectiveSearchPaths.map((path, index) => (
                       <div key={`${path}-${index}`} className="flex items-center gap-2 rounded-lg border bg-muted/30 px-3 py-2 text-sm">
-                        <Badge variant={searchPathsDraft.length === 0 ? "secondary" : "outline"} className="shrink-0">
-                          {searchPathsDraft.length === 0 ? "默认" : String(index + 1).padStart(2, "0")}
+                        <Badge variant={safeSearchPathsDraft.length === 0 ? "secondary" : "outline"} className="shrink-0">
+                          {safeSearchPathsDraft.length === 0 ? "默认" : String(index + 1).padStart(2, "0")}
                         </Badge>
                         <span className="min-w-0 flex-1 truncate" title={path}>
                           {path}
                         </span>
-                        {searchPathsDraft.length > 0 ? (
+                        {safeSearchPathsDraft.length > 0 ? (
                           <Button type="button" size="icon-xs" variant="ghost" onClick={() => removeSearchPath(index)}>
                             <X className="size-3" weight="bold" />
                           </Button>

@@ -72,6 +72,14 @@ const iconCache = new Map<string, string | null>()
 let desktopSnapshotLoadPromise: Promise<void> | null = null
 let desktopSnapshotLoadedAt = 0
 
+function resetRuntimeCaches() {
+  iconResolutionToken += 1
+  queuedIconResolutionOptions = null
+  iconCache.clear()
+  desktopSnapshotLoadPromise = null
+  desktopSnapshotLoadedAt = 0
+}
+
 function waitForNextPaint() {
   if (typeof globalThis.requestAnimationFrame !== "function") {
     return Promise.resolve()
@@ -116,11 +124,11 @@ function isTauriRuntime() {
 
 async function call<T>(command: string, args?: InvokeArgs): Promise<T> {
   if (!isTauriRuntime()) {
-    if (command === "load_snapshot" || command === "load_desktop_snapshot") {
+    if (command === "load_snapshot" || command === "load_desktop_snapshot" || command === "update_runtime_directory") {
       return normalizeSnapshot(demoSnapshot) as T
     }
     if (command === "resolve_path_icons") {
-      return asArray(args?.paths).map((path) => ({ path: asString(path) })) as T
+      return asArray(args?.paths).map((path) => ({ path: asPathString(path) })) as T
     }
     if (command === "load_search_overlay") {
       return demoSearchOverlay() as T
@@ -153,7 +161,7 @@ async function call<T>(command: string, args?: InvokeArgs): Promise<T> {
       return demoSnapshot.categories.reduce((sum, category) => sum + category.item_paths.length, 0) as T
     }
     if (command === "restore_item_to_desktop") {
-      return asString(args?.path) as T
+      return asPathString(args?.path) as T
     }
     if (command === "start_classify_desktop_items_task" || command === "start_restore_all_to_desktop_task") {
       return undefined as T
@@ -176,7 +184,7 @@ async function call<T>(command: string, args?: InvokeArgs): Promise<T> {
   }
 
   const result = await invoke<T>(command, args)
-  if (command === "load_snapshot" || command === "load_desktop_snapshot") {
+  if (command === "load_snapshot" || command === "load_desktop_snapshot" || command === "update_runtime_directory") {
     return normalizeSnapshot(result) as T
   }
   if (
@@ -198,6 +206,21 @@ function asRecord(value: unknown): RawRecord {
 
 function asString(value: unknown, fallback = "") {
   return typeof value === "string" ? value : fallback
+}
+
+function asPathString(value: unknown, fallback = "") {
+  return stripWindowsVerbatimPrefix(asString(value, fallback))
+}
+
+function stripWindowsVerbatimPrefix(value: string) {
+  const trimmed = value.trim()
+  if (trimmed.startsWith("\\\\?\\UNC\\")) {
+    return `\\\\${trimmed.slice("\\\\?\\UNC\\".length)}`
+  }
+  if (trimmed.startsWith("\\\\?\\")) {
+    return trimmed.slice("\\\\?\\".length)
+  }
+  return trimmed
 }
 
 function asBoolean(value: unknown, fallback = false) {
@@ -253,9 +276,9 @@ function normalizeDesktopFrameVisibility(value: unknown): DesktopFrameVisibility
 function normalizeSnapshot(value: unknown): AppSnapshot {
   const raw = asRecord(value)
   const snapshot = {
-    data_dir: asString(raw.data_dir ?? raw.DataDir),
-    organizer_root: asString(raw.organizer_root ?? raw.OrganizerRoot),
-    launchers_root: asString(raw.launchers_root ?? raw.LaunchersRoot),
+    data_dir: asPathString(raw.data_dir ?? raw.DataDir),
+    organizer_root: asPathString(raw.organizer_root ?? raw.OrganizerRoot),
+    launchers_root: asPathString(raw.launchers_root ?? raw.LaunchersRoot),
     settings: normalizeSettings(raw.settings ?? raw.Settings),
     desktop_layout: normalizeDesktopLayout(raw.desktop_layout ?? raw.DesktopLayout),
     categories: asArray(raw.categories ?? raw.DesktopCategories).map(normalizeCategory),
@@ -263,7 +286,7 @@ function normalizeSnapshot(value: unknown): AppSnapshot {
       const rawItem = asRecord(item)
       return {
         name: asString(rawItem.name ?? rawItem.Name, "未命名"),
-        path: asString(rawItem.path ?? rawItem.Path),
+        path: asPathString(rawItem.path ?? rawItem.Path),
         extension: asString(rawItem.extension ?? rawItem.Extension, "FILE"),
         is_dir: asBoolean(rawItem.is_dir ?? rawItem.IsDir),
         icon_data_url: asString(rawItem.icon_data_url ?? rawItem.IconDataUrl) || undefined,
@@ -282,14 +305,14 @@ function normalizeSettings(value: unknown): AppSettings {
     clipboard_shortcut: asString(raw.clipboard_shortcut ?? raw.ClipboardShortcut, defaultSettings.clipboard_shortcut),
     search_enabled: asBoolean(raw.search_enabled ?? raw.SearchEnabled, defaultSettings.search_enabled),
     search_shortcut: asString(raw.search_shortcut ?? raw.SearchShortcut, defaultSettings.search_shortcut),
-    search_paths: asArray(raw.search_paths ?? raw.SearchPaths).map((item) => asString(item)).filter(Boolean),
+    search_paths: asArray(raw.search_paths ?? raw.SearchPaths).map((item) => asPathString(item)).filter(Boolean),
     launch_on_startup: asBoolean(raw.launch_on_startup ?? raw.LaunchOnStartup, defaultSettings.launch_on_startup),
   }
 }
 
 function normalizeCategory(value: unknown): DeskCategory {
   const raw = asRecord(value)
-  const itemPaths = asArray(raw.item_paths ?? raw.ItemPaths).map((item) => asString(item)).filter(Boolean)
+  const itemPaths = asArray(raw.item_paths ?? raw.ItemPaths).map((item) => asPathString(item)).filter(Boolean)
   const itemDetails = asArray(raw.item_details ?? raw.ItemDetails).map(normalizeDesktopItem).filter((item) => item.path)
   return {
     name: asString(raw.name ?? raw.Name, "未命名分类"),
@@ -301,7 +324,7 @@ function normalizeCategory(value: unknown): DeskCategory {
 
 function normalizeDesktopItem(value: unknown) {
   const raw = asRecord(value)
-  const path = asString(raw.path ?? raw.Path)
+  const path = asPathString(raw.path ?? raw.Path)
   return {
     name: asString(raw.name ?? raw.Name) || displayPathName(path),
     path,
@@ -324,7 +347,7 @@ function normalizeLauncher(value: unknown): LaunchItem {
   const raw = asRecord(value)
   return {
     name: asString(raw.name ?? raw.Name),
-    path: asString(raw.path ?? raw.Path),
+    path: asPathString(raw.path ?? raw.Path),
     icon_data_url: asString(raw.icon_data_url ?? raw.IconDataUrl) || undefined,
   }
 }
@@ -336,8 +359,8 @@ function normalizeClipboardItem(value: unknown): ClipboardHistoryItem {
     kind: asString(raw.kind ?? raw.Kind, "Text") === "Image" ? "Image" : "Text",
     text: asString(raw.text ?? raw.Text),
     image_png_base64: asString(raw.image_png_base64 ?? raw.ImagePngBase64),
-    image_path: asString(raw.image_path ?? raw.ImagePath),
-    image_thumb_path: asString(raw.image_thumb_path ?? raw.ImageThumbPath),
+    image_path: asPathString(raw.image_path ?? raw.ImagePath),
+    image_thumb_path: asPathString(raw.image_thumb_path ?? raw.ImageThumbPath),
     image_hash: asString(raw.image_hash ?? raw.ImageHash),
     created_at: asString(raw.created_at ?? raw.CreatedAt),
     is_locked: asBoolean(raw.is_locked ?? raw.IsLocked),
@@ -349,7 +372,7 @@ function normalizeSearchOverlay(value: unknown): SearchOverlayData {
   const raw = asRecord(value)
   return {
     settings: normalizeSettings(raw.settings ?? raw.Settings),
-    paths: asArray(raw.paths ?? raw.Paths).map((item) => asString(item)).filter(Boolean),
+    paths: asArray(raw.paths ?? raw.Paths).map((item) => asPathString(item)).filter(Boolean),
     recent: asArray(raw.recent ?? raw.Recent).map(normalizeSearchItem),
     frequent: asArray(raw.frequent ?? raw.Frequent).map(normalizeSearchItem),
   }
@@ -360,7 +383,7 @@ function normalizeSearchItem(value: unknown): SearchItem {
   return {
     id: asString(raw.id ?? raw.Id),
     name: asString(raw.name ?? raw.Name, "未命名"),
-    path: asString(raw.path ?? raw.Path),
+    path: asPathString(raw.path ?? raw.Path),
     kind: normalizeSearchKind(raw.kind ?? raw.Kind),
     extension: asString(raw.extension ?? raw.Extension, "FILE"),
     is_dir: asBoolean(raw.is_dir ?? raw.IsDir),
@@ -380,7 +403,7 @@ function normalizeSearchKind(value: unknown): SearchItemKind {
 function normalizePathIcon(value: unknown): PathIconResult {
   const raw = asRecord(value)
   return {
-    path: asString(raw.path ?? raw.Path),
+    path: asPathString(raw.path ?? raw.Path),
     icon_data_url: asString(raw.icon_data_url ?? raw.IconDataUrl) || undefined,
   }
 }
@@ -945,6 +968,7 @@ export const useDustDeskStore = create<DustDeskState>()(
     },
     updateRuntimeDirectory: async (target, path) => {
       const snapshot = await call<AppSnapshot>("update_runtime_directory", { target, path })
+      resetRuntimeCaches()
       set((state) => {
         state.snapshot = snapshot
         state.selectedCategory = Math.min(state.selectedCategory, Math.max(0, snapshot.categories.length - 1))

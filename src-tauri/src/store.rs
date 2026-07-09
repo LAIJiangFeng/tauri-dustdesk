@@ -55,11 +55,8 @@ impl AppStore {
         }
 
         fs::create_dir_all(path).with_context(|| format!("create {}", path.display()))?;
-        let normalized = path
-            .canonicalize()
-            .unwrap_or_else(|_| path.to_path_buf())
-            .display()
-            .to_string();
+        let normalized =
+            path_to_config_text(&path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
         let settings_root = app_settings_root()?;
         fs::create_dir_all(&settings_root)
             .with_context(|| format!("create {}", settings_root.display()))?;
@@ -195,20 +192,25 @@ fn configured_path(
             .trim()
             .to_owned();
         if !configured.is_empty() {
-            let configured_path = PathBuf::from(&configured);
+            let normalized = normalize_configured_path_text(&configured);
+            let configured_path = PathBuf::from(&normalized);
             if legacy_defaults
                 .iter()
                 .any(|legacy| same_path_for_config(&configured_path, legacy))
             {
-                fs::write(&path_file, default_dir.to_string_lossy().as_bytes())
+                fs::write(&path_file, path_to_config_text(&default_dir).as_bytes())
                     .with_context(|| format!("write {}", path_file.display()))?;
                 return Ok(default_dir);
             }
 
+            if normalized != configured {
+                fs::write(&path_file, normalized.as_bytes())
+                    .with_context(|| format!("write {}", path_file.display()))?;
+            }
             return Ok(configured_path);
         }
     } else {
-        fs::write(&path_file, default_dir.to_string_lossy().as_bytes())
+        fs::write(&path_file, path_to_config_text(&default_dir).as_bytes())
             .with_context(|| format!("write {}", path_file.display()))?;
     }
 
@@ -220,8 +222,23 @@ fn same_path_for_config(left: &Path, right: &Path) -> bool {
 }
 
 fn normalize_path_for_config(path: &Path) -> String {
-    path.to_string_lossy()
+    path_to_config_text(path)
         .replace('/', "\\")
         .trim_end_matches('\\')
         .to_ascii_lowercase()
+}
+
+fn path_to_config_text(path: &Path) -> String {
+    normalize_configured_path_text(&path.to_string_lossy())
+}
+
+fn normalize_configured_path_text(path: &str) -> String {
+    let trimmed = path.trim();
+    if let Some(rest) = trimmed.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = trimmed.strip_prefix(r"\\?\") {
+        rest.to_owned()
+    } else {
+        trimmed.to_owned()
+    }
 }

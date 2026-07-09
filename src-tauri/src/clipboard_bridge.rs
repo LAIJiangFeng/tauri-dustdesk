@@ -23,6 +23,17 @@ const THUMBNAIL_MAX_EDGE: u32 = 420;
 #[cfg(windows)]
 static LAST_TARGET_HWND: OnceLock<Mutex<isize>> = OnceLock::new();
 static CLIPBOARD_MONITOR_SUPPRESSED_UNTIL: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+static CLIPBOARD_HISTORY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+pub fn with_clipboard_history_lock<T>(
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let _guard = CLIPBOARD_HISTORY_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "剪贴板历史写入锁已损坏".to_owned())?;
+    operation()
+}
 
 pub fn spawn_text_history_monitor() {
     thread::spawn(|| {
@@ -204,6 +215,10 @@ fn is_clipboard_monitor_suppressed() -> bool {
 }
 
 fn store_text_history(text: String) -> Result<(), String> {
+    with_clipboard_history_lock(|| store_text_history_locked(text))
+}
+
+fn store_text_history_locked(text: String) -> Result<(), String> {
     let normalized = limit_text(text);
     let store = AppStore::open().map_err(to_message)?;
     let mut clipboard = store.load_clipboard();
@@ -246,6 +261,10 @@ fn store_text_history(text: String) -> Result<(), String> {
 }
 
 fn store_image_history(image_png_base64: String) -> Result<(), String> {
+    with_clipboard_history_lock(|| store_image_history_locked(image_png_base64))
+}
+
+fn store_image_history_locked(image_png_base64: String) -> Result<(), String> {
     let normalized = image_png_base64.trim().to_owned();
     if normalized.is_empty() {
         return Ok(());

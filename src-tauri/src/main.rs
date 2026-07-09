@@ -44,6 +44,7 @@ const DESKTOP_OPERATION_EVENT: &str = "dustdesk://desktop-operation";
 
 static CONFIG_MUTATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static LAUNCHER_MUTATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static RUNTIME_DIRECTORY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static REAL_EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 static DESKTOP_OPERATION_RUNNING: AtomicBool = AtomicBool::new(false);
 
@@ -85,10 +86,13 @@ fn load_snapshot_impl() -> Result<AppSnapshot, String> {
         repair_launchers(&store, &mut launchers)?;
         Ok(launchers)
     })?;
-    let mut clipboard = store.load_clipboard();
-    if clipboard_bridge::normalize_clipboard_image_storage(&mut clipboard).unwrap_or(false) {
-        let _ = store.save_clipboard(&clipboard);
-    }
+    let clipboard = clipboard_bridge::with_clipboard_history_lock(|| {
+        let mut clipboard = store.load_clipboard();
+        if clipboard_bridge::normalize_clipboard_image_storage(&mut clipboard).unwrap_or(false) {
+            store.save_clipboard(&clipboard).map_err(to_message)?;
+        }
+        Ok(clipboard)
+    })?;
 
     let desktop_layout = config.desktop_layout.clone();
 
@@ -656,6 +660,10 @@ async fn update_runtime_directory(target: String, path: String) -> Result<AppSna
 }
 
 fn update_runtime_directory_impl(target: String, path: String) -> Result<AppSnapshot, String> {
+    let _guard = RUNTIME_DIRECTORY_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "运行目录迁移锁已损坏".to_owned())?;
     let target = target.trim().to_owned();
     if !matches!(target.as_str(), "data" | "organizer" | "launchers") {
         return Err("未知目录类型".to_owned());
@@ -692,6 +700,22 @@ fn update_runtime_directory_impl(target: String, path: String) -> Result<AppSnap
                     (&old_launchers_root, &new_launchers_root),
                 ],
             )?;
+            rewrite_launchers_path_prefixes(
+                &new_store,
+                &[
+                    (&old_data_dir, &new_data_dir),
+                    (&old_launchers_root, &new_launchers_root),
+                ],
+            )?;
+            rewrite_clipboard_path_prefixes(&new_store, &[(&old_data_dir, &new_data_dir)])?;
+            rewrite_search_history_path_prefixes(
+                &new_store,
+                &[
+                    (&old_data_dir, &new_data_dir),
+                    (&old_organizer_root, &new_organizer_root),
+                    (&old_launchers_root, &new_launchers_root),
+                ],
+            )?;
         }
         "organizer" => {
             move_directory_contents(&old_organizer_root, &new_organizer_root)?;
@@ -699,9 +723,21 @@ fn update_runtime_directory_impl(target: String, path: String) -> Result<AppSnap
                 &new_store,
                 &[(&old_organizer_root, &new_organizer_root)],
             )?;
+            rewrite_search_history_path_prefixes(
+                &new_store,
+                &[(&old_organizer_root, &new_organizer_root)],
+            )?;
         }
         "launchers" => {
             move_directory_contents(&old_launchers_root, &new_launchers_root)?;
+            rewrite_launchers_path_prefixes(
+                &new_store,
+                &[(&old_launchers_root, &new_launchers_root)],
+            )?;
+            rewrite_search_history_path_prefixes(
+                &new_store,
+                &[(&old_launchers_root, &new_launchers_root)],
+            )?;
         }
         _ => {}
     }
@@ -732,8 +768,10 @@ fn start_all_launchers() -> Result<usize, String> {
 }
 
 #[tauri::command]
-fn show_desktop_widget(app: tauri::AppHandle) -> Result<(), String> {
-    show_persisted_desktop_layout(&app)
+async fn show_desktop_widget(app: tauri::AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || show_persisted_desktop_layout(&app))
+        .await
+        .map_err(to_message)?
 }
 
 #[tauri::command]
@@ -1460,16 +1498,61 @@ fn restore_path_to_desktop(source: &Path, desktop: &Path) -> Result<PathBuf, Str
         ) {
             remove_existing_path(source)?;
         }
+        notify_shell_desktop_restore(&existing_desktop_item, desktop);
         return Ok(existing_desktop_item);
     }
 
     if is_path_within(source, desktop) {
+        notify_shell_desktop_restore(source, desktop);
         return Ok(source.to_path_buf());
     }
 
     let destination = unique_destination(desktop, source);
     move_path(source, &destination)?;
+    notify_shell_desktop_restore(&destination, desktop);
     Ok(destination)
+}
+
+fn notify_shell_desktop_restore(path: &Path, desktop: &Path) {
+    notify_shell_path_created(path);
+    notify_shell_directory_updated(desktop);
+}
+
+#[cfg(windows)]
+fn notify_shell_path_created(path: &Path) {
+    notify_shell_path(path, windows_sys::Win32::UI::Shell::SHCNE_CREATE);
+}
+
+#[cfg(not(windows))]
+fn notify_shell_path_created(_path: &Path) {}
+
+#[cfg(windows)]
+fn notify_shell_directory_updated(path: &Path) {
+    notify_shell_path(path, windows_sys::Win32::UI::Shell::SHCNE_UPDATEDIR);
+}
+
+#[cfg(not(windows))]
+fn notify_shell_directory_updated(_path: &Path) {}
+
+#[cfg(windows)]
+fn notify_shell_path(path: &Path, event: u32) {
+    use std::{os::windows::ffi::OsStrExt, ptr::null};
+
+    use windows_sys::Win32::UI::Shell::{SHChangeNotify, SHCNF_FLUSHNOWAIT, SHCNF_PATHW};
+
+    let wide_path = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    unsafe {
+        SHChangeNotify(
+            event as i32,
+            SHCNF_PATHW | SHCNF_FLUSHNOWAIT,
+            wide_path.as_ptr().cast(),
+            null(),
+        );
+    }
 }
 
 fn organizer_contents(root: &Path) -> Vec<PathBuf> {
@@ -1854,6 +1937,78 @@ fn rewrite_runtime_path_prefixes(
 
         Ok(())
     })
+}
+
+fn rewrite_launchers_path_prefixes(
+    store: &AppStore,
+    replacements: &[(&PathBuf, &PathBuf)],
+) -> Result<(), String> {
+    with_launcher_mutation(|| {
+        let mut launchers = store.load_launchers();
+        let mut changed = false;
+
+        for item in &mut launchers.items {
+            if let Some(next_path) = rewrite_path_prefix(&item.path, replacements) {
+                item.path = next_path;
+                item.icon_data_url = None;
+                changed = true;
+            }
+        }
+
+        if changed {
+            store.save_launchers(&launchers).map_err(to_message)?;
+        }
+
+        Ok(())
+    })
+}
+
+fn rewrite_clipboard_path_prefixes(
+    store: &AppStore,
+    replacements: &[(&PathBuf, &PathBuf)],
+) -> Result<(), String> {
+    clipboard_bridge::with_clipboard_history_lock(|| {
+        let mut clipboard = store.load_clipboard();
+        let mut changed = false;
+
+        for item in &mut clipboard.items {
+            if let Some(next_path) = rewrite_path_prefix(&item.image_path, replacements) {
+                item.image_path = next_path;
+                changed = true;
+            }
+            if let Some(next_path) = rewrite_path_prefix(&item.image_thumb_path, replacements) {
+                item.image_thumb_path = next_path;
+                changed = true;
+            }
+        }
+
+        if changed {
+            store.save_clipboard(&clipboard).map_err(to_message)?;
+        }
+
+        Ok(())
+    })
+}
+
+fn rewrite_search_history_path_prefixes(
+    store: &AppStore,
+    replacements: &[(&PathBuf, &PathBuf)],
+) -> Result<(), String> {
+    let mut history = store.load_search_history();
+    let mut changed = false;
+
+    for item in &mut history.items {
+        if let Some(next_path) = rewrite_path_prefix(&item.path, replacements) {
+            item.path = next_path;
+            changed = true;
+        }
+    }
+
+    if changed {
+        store.save_search_history(&history).map_err(to_message)?;
+    }
+
+    Ok(())
 }
 
 fn rewrite_path_prefix(path_text: &str, replacements: &[(&PathBuf, &PathBuf)]) -> Option<String> {
@@ -3577,14 +3732,14 @@ fn main() {
                 }
             }
 
-            if let Some(window) = app.get_webview_window("desktop-widget") {
-                let _ = place_desktop_widget(&window);
-            }
             let handle = app.handle().clone();
-            if let Err(error) = show_persisted_desktop_layout(&handle) {
-                eprintln!("failed to show desktop cards: {error}");
-            }
             tauri::async_runtime::spawn_blocking(move || {
+                if let Some(window) = handle.get_webview_window("desktop-widget") {
+                    let _ = place_desktop_widget(&window);
+                }
+                if let Err(error) = show_persisted_desktop_layout(&handle) {
+                    eprintln!("failed to show desktop cards: {error}");
+                }
                 if let Ok(store) = AppStore::open() {
                     if let Err(error) = repair_existing_app_desktop_entries(&store) {
                         eprintln!("failed to repair desktop entry shortcuts: {error}");

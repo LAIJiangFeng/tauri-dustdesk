@@ -7,10 +7,79 @@
       name="description"
       content="DustDesk Tauri desktop manager with organizer, launcher, clipboard and local data panels."
     />
+    <script>
+      ;(() => {
+        try {
+          const route = new URLSearchParams(window.location.search).get("dustdeskRoute") || ""
+          const hash = window.location.hash || ""
+          const isDesktopRoute = route.startsWith("desktop-widget") || route.startsWith("desktop-card") || hash.startsWith("#/desktop-widget") || hash.startsWith("#/desktop-card")
+          document.documentElement.classList.add(isDesktopRoute ? "boot-desktop-route" : "boot-main-route")
+          if (isDesktopRoute) document.documentElement.classList.add("desktop-widget-root")
+        } catch {
+          document.documentElement.classList.add("boot-main-route")
+        }
+      })()
+    </script>
+    <style>
+      html.boot-main-route,
+      html.boot-main-route body {
+        background: #0d0f0e;
+        color: #f7f7f4;
+      }
+
+      .app-boot {
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        font-family: "Segoe UI", sans-serif;
+        background:
+          radial-gradient(circle at 20% 16%, rgba(95, 140, 117, 0.25), transparent 28rem),
+          linear-gradient(135deg, #090b0a 0%, #151716 100%);
+      }
+
+      .app-boot-card {
+        width: min(420px, calc(100vw - 48px));
+        padding: 28px;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 28px;
+        background: rgba(255, 255, 255, 0.055);
+        box-shadow: 0 24px 80px rgba(0, 0, 0, 0.32);
+      }
+
+      .app-boot-title {
+        margin: 0;
+        font-size: 28px;
+        font-weight: 700;
+        letter-spacing: -0.04em;
+      }
+
+      .app-boot-subtitle {
+        margin: 10px 0 0;
+        color: rgba(247, 247, 244, 0.65);
+        font-size: 14px;
+      }
+
+      html.boot-desktop-route,
+      html.boot-desktop-route body,
+      html.boot-desktop-route #root {
+        background: transparent;
+      }
+
+      html.boot-desktop-route .app-boot {
+        display: none;
+      }
+    </style>
     <title>DustDesk</title>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <div class="app-boot">
+        <div class="app-boot-card">
+          <p class="app-boot-title">DeskNest</p>
+          <p class="app-boot-subtitle">Loading local workspace...</p>
+        </div>
+      </div>
+    </div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

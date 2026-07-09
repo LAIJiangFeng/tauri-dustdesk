@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent as ReactDragEvent, type ReactNode } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent as ReactDragEvent, type ReactNode } from "react"
 import { useParams } from "react-router"
 import {
   Archive,
@@ -105,6 +105,11 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
   const kind = (routeKind ?? params.kind) === "launcher" ? "launcher" : "category"
   const index = Number(routeIndex ?? params.index ?? 0)
   const windowLabel = kind === "launcher" ? "desktop-launcher" : `desktop-category-${index}`
+  const desktopCardIconOptions = useMemo(() => scopedDesktopCardIconOptions(kind, index), [index, kind])
+  const loadDesktopCardSnapshot = useCallback(
+    (options?: Parameters<typeof loadDesktopSnapshot>[0]) => loadDesktopSnapshot({ ...options, iconOptions: desktopCardIconOptions }),
+    [desktopCardIconOptions, loadDesktopSnapshot],
+  )
   const category = Number.isFinite(index) ? snapshot.categories[index] : undefined
   const visual = useMemo(() => {
     if (kind === "launcher") {
@@ -137,12 +142,12 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
   useEffect(() => {
     let unlisten: (() => void) | undefined
     void safeListen("dustdesk://desktop-cards-changed", () => {
-      void loadDesktopSnapshot({ force: true })
+      void loadDesktopCardSnapshot({ force: true })
     }).then((value) => {
       unlisten = value
     })
     return () => unlisten?.()
-  }, [loadDesktopSnapshot])
+  }, [loadDesktopCardSnapshot])
 
   useEffect(() => {
     let unlisten: (() => void) | undefined
@@ -173,7 +178,7 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
       unlisten = value
     })
     return () => unlisten?.()
-  }, [loadDesktopSnapshot, saveDesktopSplitIndices, splitDesktopWidgets])
+  }, [loadDesktopCardSnapshot, saveDesktopSplitIndices, splitDesktopWidgets])
 
   useEffect(() => {
     globalThis.localStorage.setItem(settingsStorageKey, JSON.stringify(settings))
@@ -310,7 +315,7 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
       const name = window.prompt("分类名称", `新分类 ${snapshot.categories.length + 1}`)?.trim()
       if (!name) return
       await createCategory(name)
-      await loadDesktopSnapshot()
+      await loadDesktopCardSnapshot()
       setNotice("已新增分类")
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error))
@@ -323,7 +328,7 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
       setMenuOpen(false)
       selectCategory(index)
       await renameCategory()
-      await loadDesktopSnapshot()
+      await loadDesktopCardSnapshot()
       setNotice("已重命名分类")
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error))
@@ -348,7 +353,7 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
   async function handleRefresh() {
     try {
       setMenuOpen(false)
-      await loadDesktopSnapshot()
+      await loadDesktopCardSnapshot()
       setNotice("已刷新")
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error))
@@ -377,7 +382,7 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
     try {
       setMenuOpen(false)
       await mergeDesktopWidgets()
-      await loadDesktopSnapshot({ force: true })
+      await loadDesktopCardSnapshot({ force: true })
       writeSplitCategoryIndices([])
       setNotice(previous.length > 0 ? `已合并 ${previous.length} 个分类` : "分类已处于合并状态")
     } catch (error) {
@@ -410,7 +415,7 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
       return
     }
 
-    await loadDesktopSnapshot({ force: true })
+    await loadDesktopCardSnapshot({ force: true })
     const result = classifyResultFromOperation(payload)
     if (pendingClassifyActionRef.current === "split-all") {
       pendingClassifyActionRef.current = null
@@ -438,7 +443,7 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
       return
     }
 
-    await loadDesktopSnapshot({ force: true })
+    await loadDesktopCardSnapshot({ force: true })
     writeSplitCategoryIndices([])
     await saveDesktopSplitIndices([])
     setNotice(payload.message || (payload.restored > 0 ? `已还原 ${payload.restored} 项到桌面` : "没有需要还原到桌面的收纳项目"))
@@ -909,6 +914,17 @@ function readSplitCategoryIndices(): number[] {
 
 function writeSplitCategoryIndices(indices: number[]) {
   globalThis.localStorage.setItem(splitCategoriesStorageKey, JSON.stringify([...new Set(indices)].sort((left, right) => left - right)))
+}
+
+function scopedDesktopCardIconOptions(kind: string, index: number) {
+  if (kind === "launcher") {
+    return { includeDesktopItems: false, includeLaunchers: true, categoryIndices: [] }
+  }
+  return {
+    includeDesktopItems: false,
+    includeLaunchers: false,
+    categoryIndices: Number.isFinite(index) ? [index] : [],
+  }
 }
 
 function clamp(value: number, min: number, max: number) {

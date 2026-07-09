@@ -577,11 +577,14 @@ fn classify_desktop_items_impl() -> Result<ClassifyResult, String> {
                 });
             }
 
-            config.desktop_categories[category_index]
-                .item_paths
-                .push(archived_path);
-            category_counts[category_index] += 1;
-            moved += 1;
+            if push_unique_text_path(
+                &mut config.desktop_categories[category_index].item_paths,
+                archived_path,
+            ) {
+                category_counts[category_index] += 1;
+                moved += 1;
+            }
+            store.save_config(&config).map_err(to_message)?;
         }
 
         store.save_config(&config).map_err(to_message)?;
@@ -1006,19 +1009,23 @@ fn merge_desktop_category_impl(app: &tauri::AppHandle, index: usize) -> Result<(
 fn show_split_desktop_widgets(app: &tauri::AppHandle) -> Result<Vec<usize>, String> {
     let store = AppStore::open().map_err(to_message)?;
     store.ensure_runtime_dirs().map_err(to_message)?;
-    let (categories, split_indices) = with_config_mutation(|| {
+    let categories = with_config_mutation(|| {
         let mut config = store.load_config();
-        let split_indices = (0..config.desktop_categories.len()).collect::<Vec<_>>();
-        config.desktop_layout.split_category_indices = split_indices.clone();
-        store.save_config(&config).map_err(to_message)?;
-        Ok((config.desktop_categories, split_indices))
+        repair_category_item_paths(&store, &mut config)?;
+        Ok(config.desktop_categories)
     })?;
+    let split_indices = categories
+        .iter()
+        .enumerate()
+        .filter_map(|(index, category)| (!category.item_paths.is_empty()).then_some(index))
+        .collect::<Vec<_>>();
 
     if split_indices.is_empty() {
         show_desktop_launcher(app)?;
         return Ok(split_indices);
     }
 
+    let mut shown_indices = Vec::new();
     for index in split_indices.iter().copied() {
         let Some(category) = categories.get(index) else {
             continue;
@@ -1026,10 +1033,29 @@ fn show_split_desktop_widgets(app: &tauri::AppHandle) -> Result<Vec<usize>, Stri
         let label = desktop_category_label(index);
         let title = format!("DustDesk {}", category.name);
         let url = desktop_card_url("category", Some(index));
-        show_or_create_desktop_card(app, &label, &title, &url, index)?;
+        if let Err(error) = show_or_create_desktop_card(app, &label, &title, &url, index) {
+            for shown_index in shown_indices {
+                hide_desktop_category_windows(app, shown_index);
+            }
+            return Err(error);
+        }
+        shown_indices.push(index);
+        std::thread::sleep(std::time::Duration::from_millis(120));
     }
 
-    show_desktop_launcher(app)?;
+    if let Err(error) = show_desktop_launcher(app) {
+        for shown_index in shown_indices {
+            hide_desktop_category_windows(app, shown_index);
+        }
+        return Err(error);
+    }
+
+    with_config_mutation(|| {
+        let mut config = store.load_config();
+        config.desktop_layout.split_category_indices =
+            normalize_desktop_split_indices(split_indices.clone(), config.desktop_categories.len());
+        store.save_config(&config).map_err(to_message)
+    })?;
 
     if let Some(window) = app.get_webview_window("desktop-widget") {
         let _ = window.hide();

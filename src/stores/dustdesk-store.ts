@@ -57,11 +57,14 @@ interface PathIconResult {
 
 interface IconResolutionOptions {
   includeDesktopItems?: boolean
+  includeLaunchers?: boolean
+  categoryIndices?: number[]
 }
 
 interface DesktopSnapshotLoadOptions {
   force?: boolean
   preserveDesktopItems?: boolean
+  iconOptions?: IconResolutionOptions | false
 }
 
 interface RestoreDesktopArgs extends Record<string, unknown> {
@@ -495,6 +498,8 @@ function rememberResolvedIcons(icons: PathIconResult[]) {
 
 function collectMissingIconPaths(snapshot: AppSnapshot, options: IconResolutionOptions) {
   const includeDesktopItems = options.includeDesktopItems ?? true
+  const includeLaunchers = options.includeLaunchers ?? true
+  const categoryIndexSet = options.categoryIndices ? new Set(options.categoryIndices.filter((index) => Number.isInteger(index) && index >= 0)) : null
   const paths: string[] = []
   const seen = new Set<string>()
 
@@ -509,13 +514,16 @@ function collectMissingIconPaths(snapshot: AppSnapshot, options: IconResolutionO
     paths.push(trimmed)
   }
 
-  for (const category of snapshot.categories) {
+  for (const [index, category] of snapshot.categories.entries()) {
+    if (categoryIndexSet && !categoryIndexSet.has(index)) continue
     for (const item of category.item_details) {
       addPath(item.path, item.icon_data_url)
     }
   }
-  for (const launcher of snapshot.launchers) {
-    addPath(launcher.path, launcher.icon_data_url)
+  if (includeLaunchers) {
+    for (const launcher of snapshot.launchers) {
+      addPath(launcher.path, launcher.icon_data_url)
+    }
   }
   if (includeDesktopItems) {
     for (const item of snapshot.desktop_items) {
@@ -534,13 +542,33 @@ function shouldIncludeDesktopItems(options: IconResolutionOptions) {
   return options.includeDesktopItems ?? true
 }
 
+function shouldIncludeLaunchers(options: IconResolutionOptions) {
+  return options.includeLaunchers ?? true
+}
+
+function mergeCategoryIndices(left?: number[], right?: number[]) {
+  if (!left || !right) return undefined
+  return Array.from(new Set([...left, ...right].filter((index) => Number.isInteger(index) && index >= 0)))
+}
+
 function mergeIconResolutionOptions(left: IconResolutionOptions | null, right: IconResolutionOptions) {
   if (!left) {
-    return { includeDesktopItems: shouldIncludeDesktopItems(right) }
+    return {
+      includeDesktopItems: shouldIncludeDesktopItems(right),
+      includeLaunchers: shouldIncludeLaunchers(right),
+      categoryIndices: right.categoryIndices,
+    }
   }
   return {
     includeDesktopItems: shouldIncludeDesktopItems(left) || shouldIncludeDesktopItems(right),
+    includeLaunchers: shouldIncludeLaunchers(left) || shouldIncludeLaunchers(right),
+    categoryIndices: mergeCategoryIndices(left.categoryIndices, right.categoryIndices),
   }
+}
+
+function iconOptionsForDesktopSnapshotLoad(options: DesktopSnapshotLoadOptions) {
+  if (options.iconOptions === false) return null
+  return options.iconOptions ?? { includeDesktopItems: false }
 }
 
 function applyResolvedIcons(snapshot: AppSnapshot, icons: PathIconResult[]) {
@@ -761,6 +789,10 @@ export const useDustDeskStore = create<DustDeskState>()(
     },
     loadDesktopSnapshot: async (options = {}) => {
       if (desktopSnapshotLoadPromise) {
+        const iconOptions = iconOptionsForDesktopSnapshotLoad(options)
+        if (iconOptions) {
+          void desktopSnapshotLoadPromise.then(() => get().resolveSnapshotIcons(iconOptions))
+        }
         return desktopSnapshotLoadPromise
       }
       if (!options.force && Date.now() - desktopSnapshotLoadedAt < desktopSnapshotReloadDedupeMs) {
@@ -786,7 +818,10 @@ export const useDustDeskStore = create<DustDeskState>()(
             state.loading = false
           })
           desktopSnapshotLoadedAt = Date.now()
-          void get().resolveSnapshotIcons({ includeDesktopItems: false })
+          const iconOptions = iconOptionsForDesktopSnapshotLoad(options)
+          if (iconOptions) {
+            void get().resolveSnapshotIcons(iconOptions)
+          }
         } catch (error) {
           set((state) => {
             state.error = error instanceof Error ? error.message : String(error)

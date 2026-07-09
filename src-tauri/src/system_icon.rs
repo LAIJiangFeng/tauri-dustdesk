@@ -57,10 +57,14 @@ mod windows_icon {
     }
 
     pub fn icon_data_url(path: &Path) -> Option<String> {
+        let is_shortcut = is_windows_shortcut(path);
         let hicon = shortcut_icon_sources(path)
             .into_iter()
             .find_map(|source| icon_source_icon(&source))
             .or_else(|| {
+                if is_shortcut {
+                    return None;
+                }
                 let icon_path =
                     internet_shortcut_icon_path(path).unwrap_or_else(|| path.to_path_buf());
                 shell_icon(&icon_path)
@@ -70,6 +74,12 @@ mod windows_icon {
             DestroyIcon(hicon);
         }
         png.map(|bytes| format!("data:image/png;base64,{}", STANDARD.encode(bytes)))
+    }
+
+    fn is_windows_shortcut(path: &Path) -> bool {
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("lnk"))
     }
 
     fn icon_source_icon(source: &IconSource) -> Option<HICON> {

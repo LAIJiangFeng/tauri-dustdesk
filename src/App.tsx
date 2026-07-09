@@ -13,7 +13,7 @@ function App() {
 
   useEffect(() => {
     if (isDesktopRoute) {
-      void loadDesktopSnapshot()
+      void loadDesktopSnapshot({ iconOptions: desktopRouteIconOptions(directDesktopRoute) })
     } else {
       void load()
     }
@@ -56,6 +56,19 @@ function parseDirectDesktopRoute() {
   }
 
   return null
+}
+
+function desktopRouteIconOptions(route: ReturnType<typeof parseDirectDesktopRoute>) {
+  if (route?.page !== "desktop-card") return { includeDesktopItems: false }
+  if (route.kind === "launcher") {
+    return { includeDesktopItems: false, includeLaunchers: true, categoryIndices: [] }
+  }
+  const index = Number(route.index)
+  return {
+    includeDesktopItems: false,
+    includeLaunchers: false,
+    categoryIndices: Number.isFinite(index) ? [index] : [],
+  }
 }
 
 export default App

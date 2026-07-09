@@ -8,7 +8,6 @@ import {
   FolderOpen,
   type Icon,
 } from "@phosphor-icons/react"
-import { useEffect, useState } from "react"
 import { cn } from "@/lib/utils"
 
 interface FileIconProps {
@@ -26,22 +25,10 @@ const codeExtensions = new Set(["TS", "TSX", "JS", "JSX", "RS", "CS", "JSON", "C
 const textExtensions = new Set(["TXT", "MD", "DOC", "DOCX", "PDF", "XLS", "XLSX", "PPT", "PPTX"])
 
 export function FileIcon({ name, extension, isDir, iconDataUrl, className, imageClassName }: FileIconProps) {
-  const [imageFailed, setImageFailed] = useState(false)
-
-  useEffect(() => {
-    setImageFailed(false)
-  }, [iconDataUrl])
-
-  if (iconDataUrl && !imageFailed) {
+  if (iconDataUrl) {
     return (
       <span className={cn("flex size-11 shrink-0 items-center justify-center", className)}>
-        <img
-          draggable={false}
-          src={iconDataUrl}
-          alt={`${name} 图标`}
-          className={cn("pointer-events-none h-[82%] w-[82%] select-none object-contain", imageClassName)}
-          onError={() => setImageFailed(true)}
-        />
+        <img draggable={false} src={iconDataUrl} alt={`${name} 图标`} className={cn("pointer-events-none h-[82%] w-[82%] select-none object-contain", imageClassName)} />
       </span>
     )
   }

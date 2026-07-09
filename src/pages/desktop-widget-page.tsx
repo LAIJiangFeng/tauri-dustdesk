@@ -170,8 +170,6 @@ export function DesktopWidgetPage() {
 
   const splitCategorySet = useMemo(() => new Set(splitCategoryIndices), [splitCategoryIndices])
   const groupedCategories = useMemo(() => categories.filter((category) => !splitCategorySet.has(category.index)), [categories, splitCategorySet])
-  const splitCategories = useMemo(() => categories.filter((category) => splitCategorySet.has(category.index)), [categories, splitCategorySet])
-  const isSplitMode = splitCategories.length > 0
   const activeCategory = groupedCategories.find((category) => category.id === activeCategoryId) ?? groupedCategories[0]
 
   useEffect(() => {
@@ -592,29 +590,13 @@ export function DesktopWidgetPage() {
     setSettings((value) => ({ ...value, ...next }))
   }
 
-  function layoutForCurrentFrame(id: string) {
-    if (!isSplitMode) {
-      return layoutFor(id, frameIndex(id, categories), layouts)
-    }
-
-    if (id === "organizer") {
-      return layoutForSplitFrame(id, 0, false, layouts)
-    }
-
-    const splitIndex = Math.max(
-      0,
-      splitCategories.findIndex((category) => category.id === id),
-    )
-    return layoutForSplitFrame(id, splitIndex, groupedCategories.length > 0, layouts)
-  }
-
   function startDrag(id: string, event: ReactPointerEvent<HTMLElement>) {
     if ((event.target as HTMLElement).closest("button,input")) return
     dragRef.current = {
       id,
       x: event.clientX,
       y: event.clientY,
-      rect: layoutForCurrentFrame(id),
+      rect: layoutFor(id, frameIndex(id, categories), layouts),
     }
   }
 
@@ -625,24 +607,7 @@ export function DesktopWidgetPage() {
       id,
       x: event.clientX,
       y: event.clientY,
-      rect: layoutForCurrentFrame(id),
-    }
-  }
-
-  function menuPropsForCategory(category: CategoryTab): SettingsMenuProps {
-    return {
-      ...menuProps,
-      renameCategory: async () => {
-        selectCategory(category.index)
-        await renameCategory()
-        await loadDesktopSnapshot()
-      },
-      deleteCategory: async () => {
-        selectCategory(category.index)
-        await deleteCategory()
-        await loadDesktopSnapshot()
-      },
-      onSplitCategory: () => handleSplitCategory(category.index),
+      rect: layoutFor(id, frameIndex(id, categories), layouts),
     }
   }
 
@@ -671,136 +636,63 @@ export function DesktopWidgetPage() {
   }
 
   return (
-    <div className={cn("desktop-widget-page h-screen w-screen overflow-hidden bg-transparent text-white", isSplitMode ? "p-0" : "p-2")}>
-      {isSplitMode ? (
-        <div className="relative h-full w-full">
-          {groupedCategories.length > 0 ? (
-            <WidgetFrame
-              frameId="organizer"
-              dropZone={activeCategory?.id ?? "category:0"}
-              layout={layoutForCurrentFrame("organizer")}
-              hoverZone={hoverZone}
-              settings={settings}
-              glow={activeCategory?.glow}
-              onDragStart={(event) => startDrag("organizer", event)}
-              onResizeStart={(event) => startResize("organizer", event)}
-            >
-              <OrganizerTop
-                categories={groupedCategories}
-                activeId={activeCategory?.id ?? "category:0"}
-                hoverZone={hoverZone}
-                menuProps={menuProps}
-                openSettings={openSettingsId === "organizer"}
-                onActiveChange={setActiveCategoryId}
-                onOpenSettings={() => setOpenSettingsId((id) => (id === "organizer" ? "" : "organizer"))}
-                onSplitCategory={handleSplitCategory}
-              />
-              {activeCategory ? (
-                <CategoryItems
-                  category={snapshot.categories[activeCategory.index]}
-                  categoryIndex={activeCategory.index}
-                  settings={settings}
-                  onOpen={openPath}
-                  onShowInFolder={showPathInFolder}
-                  onRestoreToDesktop={restoreItemToDesktopLight}
-                  onRestoreDragOut={handleRestoreDragOut}
-                />
-              ) : (
-                <EmptyDropHint title="分类都已拆出" detail="在设置里点一键合并分类，就会回到这个分类组。" />
-              )}
-            </WidgetFrame>
-          ) : null}
-          {splitCategories.map((category) => (
-            <WidgetFrame
-              key={category.id}
-              frameId={category.id}
-              dropZone={category.id}
-              layout={layoutForCurrentFrame(category.id)}
-              hoverZone={hoverZone}
-              settings={settings}
-              glow={category.glow}
-              onDragStart={(event) => startDrag(category.id, event)}
-              onResizeStart={(event) => startResize(category.id, event)}
-            >
-              <CategoryFrameTop
-                category={category}
-                menuProps={menuPropsForCategory(category)}
-                openSettings={openSettingsId === category.id}
-                onOpenSettings={() => setOpenSettingsId((id) => (id === category.id ? "" : category.id))}
-              />
-              <CategoryItems
-                category={snapshot.categories[category.index]}
-                categoryIndex={category.index}
-                settings={settings}
-                onOpen={openPath}
-                onShowInFolder={showPathInFolder}
-                onRestoreToDesktop={restoreItemToDesktopLight}
-                onRestoreDragOut={handleRestoreDragOut}
-              />
-            </WidgetFrame>
-          ))}
-          {desktopOperationLabel ? <WidgetOperationOverlay label={desktopOperationLabel} /> : null}
-        </div>
-      ) : (
-        <section
-          data-frame-id="organizer"
-          data-drop-zone={activeCategory?.id ?? "category:0"}
-          style={frameStyle}
-          className={cn(
-            "relative flex h-full w-full min-w-0 flex-col overflow-hidden rounded-2xl border border-white/15 backdrop-blur-2xl transition-colors",
-            activeCategory && (hoverZone === "organizer" || hoverZone === activeCategory.id) && "border-emerald-200/80",
-          )}
+    <div className="desktop-widget-page h-screen w-screen overflow-hidden bg-transparent p-2 text-white">
+      <section
+        data-frame-id="organizer"
+        data-drop-zone={activeCategory?.id ?? "category:0"}
+        style={frameStyle}
+        className={cn(
+          "relative flex h-full w-full min-w-0 flex-col overflow-hidden rounded-2xl border border-white/15 backdrop-blur-2xl transition-colors",
+          activeCategory && (hoverZone === "organizer" || hoverZone === activeCategory.id) && "border-emerald-200/80",
+        )}
+      >
+        <div
+          className="cursor-move"
+          onPointerDown={(event) => {
+            if ((event.target as HTMLElement).closest("button,input")) return
+            void startCurrentWindowDragging()
+          }}
         >
-          <div
-            className="cursor-move"
-            onPointerDown={(event) => {
-              if ((event.target as HTMLElement).closest("button,input")) return
-              void startCurrentWindowDragging()
-            }}
-          >
-            <OrganizerTop
-              categories={groupedCategories}
-              activeId={activeCategory?.id ?? "category:0"}
-              hoverZone={hoverZone}
-              menuProps={menuProps}
-              openSettings={openSettingsId === "organizer"}
-              onActiveChange={setActiveCategoryId}
-              onOpenSettings={() => setOpenSettingsId((id) => (id === "organizer" ? "" : "organizer"))}
-              onSplitCategory={handleSplitCategory}
-            />
-          </div>
-          {activeCategory ? (
-            <CategoryItems
-              category={snapshot.categories[activeCategory.index]}
-              categoryIndex={activeCategory.index}
-              settings={settings}
-              onOpen={openPath}
-              onShowInFolder={showPathInFolder}
-              onRestoreToDesktop={restoreItemToDesktopLight}
-              onRestoreDragOut={handleRestoreDragOut}
-            />
-          ) : (
-            <EmptyDropHint title="暂无分类" detail="先在设置里新增分类，或者把桌面项目拖进来。" />
-          )}
-          {desktopOperationLabel ? <WidgetOperationOverlay label={desktopOperationLabel} /> : null}
-        </section>
-      )}
+          <OrganizerTop
+            categories={groupedCategories}
+            activeId={activeCategory?.id ?? "category:0"}
+            hoverZone={hoverZone}
+            menuProps={menuProps}
+            openSettings={openSettingsId === "organizer"}
+            onActiveChange={setActiveCategoryId}
+            onOpenSettings={() => setOpenSettingsId((id) => (id === "organizer" ? "" : "organizer"))}
+            onSplitCategory={handleSplitCategory}
+          />
+        </div>
+        {activeCategory ? (
+          <CategoryItems
+            category={snapshot.categories[activeCategory.index]}
+            categoryIndex={activeCategory.index}
+            settings={settings}
+            onOpen={openPath}
+            onShowInFolder={showPathInFolder}
+            onRestoreToDesktop={restoreItemToDesktopLight}
+            onRestoreDragOut={handleRestoreDragOut}
+          />
+        ) : (
+          <EmptyDropHint title="分类都已拆出" detail="在设置里点一键合并分类，就会回到这个分类组。" />
+        )}
+        {desktopOperationLabel ? <WidgetOperationOverlay label={desktopOperationLabel} /> : null}
+      </section>
       {notice ? (
         <div className="pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full bg-slate-950/70 px-3 py-1 text-xs text-white/80 ring-1 ring-white/10">
           {notice}
         </div>
       ) : null}
-      {!isSplitMode ? (
-        <button
-          type="button"
-          className="no-drag absolute bottom-0 right-0 size-6 cursor-nwse-resize rounded-br-2xl border-b-2 border-r-2 border-white/35"
-          aria-label="调整桌面框窗口大小"
-          onPointerDown={(event) => {
-            event.preventDefault()
-            void startCurrentWindowResizeDragging("SouthEast")
-          }}
-        />
-      ) : null}
+      <button
+        type="button"
+        className="no-drag absolute bottom-0 right-0 size-6 cursor-nwse-resize rounded-br-2xl border-b-2 border-r-2 border-white/35"
+        aria-label="调整桌面框窗口大小"
+        onPointerDown={(event) => {
+          event.preventDefault()
+          void startCurrentWindowResizeDragging("SouthEast")
+        }}
+      />
     </div>
   )
 }
@@ -833,6 +725,8 @@ function WidgetFrame({
   hoverZone: string
   settings: WidgetSettings
   glow?: string
+  openSettings: boolean
+  onOpenSettings: () => void
   onDragStart: (event: ReactPointerEvent<HTMLElement>) => void
   onResizeStart: (event: ReactPointerEvent<HTMLButtonElement>) => void
   children: ReactNode
@@ -856,7 +750,7 @@ function WidgetFrame({
         (hoverZone === frameId || hoverZone === dropZone) && "border-emerald-200/80",
       )}
     >
-      <div className="flex h-full min-h-0 cursor-move flex-col" onPointerDown={onDragStart}>
+      <div className="cursor-move" onPointerDown={onDragStart}>
         {children}
       </div>
       <button
@@ -1316,22 +1210,6 @@ function layoutFor(id: string, index: number, layouts: Record<string, CardLayout
     y: 8 + Math.floor(safeIndex / 2) * 226,
     width: 288,
     height: 210,
-  }
-}
-
-function layoutForSplitFrame(id: string, index: number, hasGroupedOrganizer: boolean, layouts: Record<string, CardLayout>) {
-  const existing = layouts[id]
-  if (existing) return existing
-  if (id === "organizer") return { x: 12, y: 12, width: 560, height: 330 }
-
-  const columns = hasGroupedOrganizer ? 2 : 3
-  const xOffset = hasGroupedOrganizer ? 588 : 12
-  const safeIndex = Math.max(0, index)
-  return {
-    x: xOffset + (safeIndex % columns) * 316,
-    y: 12 + Math.floor(safeIndex / columns) * 236,
-    width: 300,
-    height: 220,
   }
 }
 

@@ -421,7 +421,7 @@ mod windows_icon {
             for pixel in pixels.chunks_exact(4) {
                 rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
             }
-            Some(rgba)
+            has_visible_icon_pixels(&rgba).then_some(rgba)
         } else {
             None
         };
@@ -433,6 +433,35 @@ mod windows_icon {
         }
 
         rgba.and_then(|bytes| encode_png(&bytes, width as u32, height as u32))
+    }
+
+    fn has_visible_icon_pixels(rgba: &[u8]) -> bool {
+        let mut visible_pixels = 0usize;
+        let mut varied_pixels = 0usize;
+        let mut first_visible_color: Option<[u8; 3]> = None;
+
+        for pixel in rgba.chunks_exact(4) {
+            let alpha = pixel[3];
+            if alpha < 12 {
+                continue;
+            }
+
+            visible_pixels += 1;
+            let color = [pixel[0], pixel[1], pixel[2]];
+            match first_visible_color {
+                Some(first) => {
+                    let delta = (i16::from(first[0]) - i16::from(color[0])).abs()
+                        + (i16::from(first[1]) - i16::from(color[1])).abs()
+                        + (i16::from(first[2]) - i16::from(color[2])).abs();
+                    if delta > 18 {
+                        varied_pixels += 1;
+                    }
+                }
+                None => first_visible_color = Some(color),
+            }
+        }
+
+        visible_pixels >= 12 && (visible_pixels >= 48 || varied_pixels >= 4)
     }
 
     fn encode_png(rgba: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {

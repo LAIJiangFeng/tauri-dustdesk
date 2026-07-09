@@ -917,6 +917,14 @@ fn show_merged_desktop_widget(app: &tauri::AppHandle) -> Result<(), String> {
     show_desktop_background_window(&window)
 }
 
+fn show_split_desktop_widget(app: &tauri::AppHandle, frame_count: usize) -> Result<(), String> {
+    let window = app
+        .get_webview_window("desktop-widget")
+        .ok_or_else(|| "桌面框窗口不存在".to_owned())?;
+    place_desktop_split_widget(&window, frame_count).map_err(to_message)?;
+    show_desktop_background_window(&window)
+}
+
 fn show_persisted_desktop_layout(app: &tauri::AppHandle) -> Result<(), String> {
     let store = AppStore::open().map_err(to_message)?;
     store.ensure_runtime_dirs().map_err(to_message)?;
@@ -930,21 +938,10 @@ fn show_persisted_desktop_layout(app: &tauri::AppHandle) -> Result<(), String> {
     if split_indices.is_empty() {
         show_merged_desktop_widget(app)?;
     } else {
-        if split_indices.len() < categories.len() {
-            show_merged_desktop_widget(app)?;
-        } else if let Some(window) = app.get_webview_window("desktop-widget") {
-            let _ = window.hide();
-        }
-
-        for index in split_indices.iter().copied() {
-            let Some(category) = categories.get(index) else {
-                continue;
-            };
-            let label = desktop_category_label(index);
-            let title = format!("DustDesk {}", category.name);
-            let url = desktop_card_url("category", Some(index));
-            show_or_create_desktop_card(app, &label, &title, &url, index)?;
-        }
+        let grouped_count = categories.len().saturating_sub(split_indices.len());
+        let frame_count = split_indices.len() + usize::from(grouped_count > 0);
+        show_split_desktop_widget(app, frame_count)?;
+        destroy_desktop_category_windows(app);
     }
 
     show_desktop_launcher(app)
@@ -967,26 +964,28 @@ async fn split_desktop_category(app: tauri::AppHandle, index: usize) -> Result<(
 fn split_desktop_category_impl(app: &tauri::AppHandle, index: usize) -> Result<(), String> {
     let store = AppStore::open().map_err(to_message)?;
     store.ensure_runtime_dirs().map_err(to_message)?;
-    let category = with_config_mutation(|| {
+    let (category_count, split_count) = with_config_mutation(|| {
         let mut config = store.load_config();
-        let category = config
+        config
             .desktop_categories
             .get(index)
-            .cloned()
             .ok_or_else(|| "分类不存在".to_owned())?;
         let mut split_indices = config.desktop_layout.split_category_indices.clone();
         split_indices.push(index);
         config.desktop_layout.split_category_indices =
             normalize_desktop_split_indices(split_indices, config.desktop_categories.len());
+        let category_count = config.desktop_categories.len();
+        let split_count = config.desktop_layout.split_category_indices.len();
         store.save_config(&config).map_err(to_message)?;
-        Ok(category)
+        Ok((category_count, split_count))
     })?;
 
-    let label = desktop_category_label(index);
-    let title = format!("DustDesk {}", category.name);
-    let url = desktop_card_url("category", Some(index));
-    show_or_create_desktop_card(app, &label, &title, &url, index)?;
+    let grouped_count = category_count.saturating_sub(split_count);
+    let frame_count = split_count + usize::from(grouped_count > 0);
+    show_split_desktop_widget(app, frame_count)?;
+    destroy_desktop_category_windows(app);
     show_desktop_launcher(app)?;
+    let _ = app.emit("dustdesk://desktop-cards-changed", ());
     Ok(())
 }
 
@@ -998,9 +997,13 @@ async fn merge_desktop_category(app: tauri::AppHandle, index: usize) -> Result<(
 }
 
 fn merge_desktop_category_impl(app: &tauri::AppHandle, index: usize) -> Result<(), String> {
-    remove_desktop_split_index(index)?;
-    hide_desktop_category_windows(app, index);
-    show_merged_desktop_widget(app)?;
+    let split_indices = remove_desktop_split_index(index)?;
+    if split_indices.is_empty() {
+        show_merged_desktop_widget(app)?;
+    } else {
+        show_persisted_desktop_layout(app)?;
+    }
+    destroy_desktop_category_windows(app);
     show_desktop_launcher(app)?;
     let _ = app.emit("dustdesk://desktop-cards-changed", ());
     Ok(())
@@ -1025,31 +1028,6 @@ fn show_split_desktop_widgets(app: &tauri::AppHandle) -> Result<Vec<usize>, Stri
         return Ok(split_indices);
     }
 
-    let mut shown_indices = Vec::new();
-    for index in split_indices.iter().copied() {
-        let Some(category) = categories.get(index) else {
-            continue;
-        };
-        let label = desktop_category_label(index);
-        let title = format!("DustDesk {}", category.name);
-        let url = desktop_card_url("category", Some(index));
-        if let Err(error) = show_or_create_desktop_card(app, &label, &title, &url, index) {
-            for shown_index in shown_indices {
-                hide_desktop_category_windows(app, shown_index);
-            }
-            return Err(error);
-        }
-        shown_indices.push(index);
-        std::thread::sleep(std::time::Duration::from_millis(120));
-    }
-
-    if let Err(error) = show_desktop_launcher(app) {
-        for shown_index in shown_indices {
-            hide_desktop_category_windows(app, shown_index);
-        }
-        return Err(error);
-    }
-
     with_config_mutation(|| {
         let mut config = store.load_config();
         config.desktop_layout.split_category_indices =
@@ -1057,21 +1035,12 @@ fn show_split_desktop_widgets(app: &tauri::AppHandle) -> Result<Vec<usize>, Stri
         store.save_config(&config).map_err(to_message)
     })?;
 
-    if let Some(window) = app.get_webview_window("desktop-widget") {
-        let _ = window.hide();
-    }
-
-    for window in app.webview_windows().values() {
-        let label = window.label();
-        let is_legacy_category_window = label
-            .strip_prefix("desktop-category-")
-            .and_then(|suffix| suffix.split_once('-'))
-            .and_then(|(index, _)| index.parse::<usize>().ok())
-            .is_some();
-        if is_legacy_category_window {
-            let _ = window.hide();
-        }
-    }
+    let grouped_count = categories.len().saturating_sub(split_indices.len());
+    let frame_count = split_indices.len() + usize::from(grouped_count > 0);
+    show_split_desktop_widget(app, frame_count)?;
+    destroy_desktop_category_windows(app);
+    show_desktop_launcher(app)?;
+    let _ = app.emit("dustdesk://desktop-cards-changed", ());
 
     Ok(split_indices)
 }
@@ -1121,12 +1090,7 @@ fn normalize_desktop_split_indices(indices: Vec<usize>, category_count: usize) -
 async fn merge_desktop_widgets(app: tauri::AppHandle) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         save_desktop_split_indices_impl(Vec::new())?;
-        for window in app.webview_windows().values() {
-            let label = window.label();
-            if label.starts_with("desktop-category-") || label == "desktop-launcher" {
-                let _ = window.hide();
-            }
-        }
+        destroy_desktop_category_windows(&app);
         show_merged_desktop_widget(&app)?;
         show_desktop_launcher(&app)?;
         let _ = app.emit("dustdesk://desktop-cards-changed", ());
@@ -4028,6 +3992,81 @@ fn place_desktop_widget(window: &WebviewWindow) -> tauri::Result<()> {
     Ok(())
 }
 
+fn place_desktop_split_widget(window: &WebviewWindow, frame_count: usize) -> tauri::Result<()> {
+    const MIN_WIDTH: u32 = 620;
+    const MIN_HEIGHT: u32 = 360;
+    const FRAME_WIDTH: u32 = 300;
+    const FRAME_HEIGHT: u32 = 220;
+    const ORGANIZER_WIDTH: u32 = 560;
+    const ORGANIZER_HEIGHT: u32 = 330;
+    const GAP: u32 = 16;
+    const PADDING: u32 = 16;
+
+    let Some(monitor) = window.current_monitor()?.or(window.primary_monitor()?) else {
+        return Ok(());
+    };
+
+    let work_area = monitor.work_area();
+    let margin = 24i32;
+    let has_grouped_organizer = {
+        let store = AppStore::open().ok();
+        store
+            .map(|store| {
+                let config = store.load_config();
+                let split_indices = normalize_desktop_split_indices(
+                    config.desktop_layout.split_category_indices,
+                    config.desktop_categories.len(),
+                );
+                split_indices.len() < config.desktop_categories.len()
+            })
+            .unwrap_or(false)
+    };
+
+    let split_count = if has_grouped_organizer {
+        frame_count.saturating_sub(1)
+    } else {
+        frame_count
+    };
+    let (content_width, content_height) = if has_grouped_organizer {
+        let split_columns = if split_count <= 1 { 1 } else { 2 };
+        let split_rows = split_count.div_ceil(split_columns).max(1);
+        let split_width =
+            split_columns as u32 * FRAME_WIDTH + split_columns.saturating_sub(1) as u32 * GAP;
+        let split_height =
+            split_rows as u32 * FRAME_HEIGHT + split_rows.saturating_sub(1) as u32 * GAP;
+        (
+            ORGANIZER_WIDTH + GAP + split_width,
+            ORGANIZER_HEIGHT.max(split_height),
+        )
+    } else {
+        let columns = split_count.clamp(1, 3);
+        let rows = split_count.div_ceil(columns).max(1);
+        (
+            columns as u32 * FRAME_WIDTH + columns.saturating_sub(1) as u32 * GAP,
+            rows as u32 * FRAME_HEIGHT + rows.saturating_sub(1) as u32 * GAP,
+        )
+    };
+
+    let max_width = work_area
+        .size
+        .width
+        .saturating_sub((margin * 2) as u32)
+        .max(MIN_WIDTH);
+    let max_height = work_area
+        .size
+        .height
+        .saturating_sub((margin * 2) as u32)
+        .max(MIN_HEIGHT);
+    let width = (content_width + PADDING * 2).clamp(MIN_WIDTH, max_width);
+    let height = (content_height + PADDING * 2).clamp(MIN_HEIGHT, max_height);
+    let x = work_area.position.x + margin;
+    let y = work_area.position.y + 56;
+
+    window.set_size(Size::Physical(PhysicalSize::new(width, height)))?;
+    window.set_position(Position::Physical(PhysicalPosition::new(x, y)))?;
+    Ok(())
+}
+
 fn show_or_create_desktop_card(
     app: &tauri::AppHandle,
     label: &str,
@@ -4145,10 +4184,6 @@ fn desktop_card_url(kind: &str, index: Option<usize>) -> String {
     format!("index.html?dustdeskRoute={}", route.replace('/', "%2F"))
 }
 
-fn desktop_category_label(index: usize) -> String {
-    format!("desktop-category-{index}")
-}
-
 fn show_desktop_launcher(app: &tauri::AppHandle) -> Result<(), String> {
     let store = AppStore::open().map_err(to_message)?;
     store.ensure_runtime_dirs().map_err(to_message)?;
@@ -4162,10 +4197,10 @@ fn show_desktop_launcher(app: &tauri::AppHandle) -> Result<(), String> {
     )
 }
 
-fn hide_desktop_category_windows(app: &tauri::AppHandle, index: usize) {
+fn destroy_desktop_category_windows(app: &tauri::AppHandle) {
     for window in app.webview_windows().values() {
-        if desktop_category_index_from_label(window.label()) == Some(index) {
-            let _ = window.hide();
+        if window.label().starts_with("desktop-category-") {
+            let _ = window.destroy();
         }
     }
 }
@@ -4191,15 +4226,6 @@ fn hide_desktop_card_windows(app: &tauri::AppHandle) {
             let _ = window.hide();
         }
     }
-}
-
-fn desktop_category_index_from_label(label: &str) -> Option<usize> {
-    label
-        .strip_prefix("desktop-category-")?
-        .split('-')
-        .next()?
-        .parse::<usize>()
-        .ok()
 }
 
 fn is_desktop_card_window_label(label: &str) -> bool {

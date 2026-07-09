@@ -12,7 +12,10 @@ pub fn icon_data_url(_path: &Path) -> Option<String> {
 
 #[cfg(windows)]
 mod windows_icon {
-    use std::{ffi::OsStr, io::Cursor, os::windows::ffi::OsStrExt, path::Path, ptr::null_mut};
+    use std::{
+        env, ffi::OsStr, fs, io::Cursor, os::windows::ffi::OsStrExt, path::Path, path::PathBuf,
+        ptr::null_mut,
+    };
 
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use windows_sys::Win32::{
@@ -32,12 +35,72 @@ mod windows_icon {
     const ICON_SIZE: i32 = 48;
 
     pub fn icon_data_url(path: &Path) -> Option<String> {
-        let hicon = shell_icon(path)?;
+        let icon_path = internet_shortcut_icon_path(path).unwrap_or_else(|| path.to_path_buf());
+        let hicon = shell_icon(&icon_path)?;
         let png = unsafe { hicon_to_png(hicon, ICON_SIZE, ICON_SIZE) };
         unsafe {
             DestroyIcon(hicon);
         }
         png.map(|bytes| format!("data:image/png;base64,{}", STANDARD.encode(bytes)))
+    }
+
+    fn internet_shortcut_icon_path(path: &Path) -> Option<PathBuf> {
+        if !path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("url"))
+        {
+            return None;
+        }
+
+        let content = fs::read_to_string(path).ok()?;
+        for line in content.lines() {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            if !key.trim().eq_ignore_ascii_case("IconFile") {
+                continue;
+            }
+            let icon_path = expand_environment_path(value.trim().trim_matches('"'));
+            if icon_path.exists() {
+                return Some(icon_path);
+            }
+        }
+
+        if content.lines().any(|line| {
+            line.trim_start()
+                .to_ascii_lowercase()
+                .starts_with("url=steam://")
+        }) {
+            let steam = steam_executable_path();
+            if steam.exists() {
+                return Some(steam);
+            }
+        }
+
+        None
+    }
+
+    fn expand_environment_path(value: &str) -> PathBuf {
+        if !value.starts_with('%') {
+            return PathBuf::from(value);
+        }
+        let Some(end) = value[1..].find('%') else {
+            return PathBuf::from(value);
+        };
+        let name = &value[1..=end];
+        let Ok(prefix) = env::var(name) else {
+            return PathBuf::from(value);
+        };
+        PathBuf::from(format!("{prefix}{}", &value[end + 2..]))
+    }
+
+    fn steam_executable_path() -> PathBuf {
+        env::var_os("ProgramFiles(x86)")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Program Files (x86)"))
+            .join("Steam")
+            .join("steam.exe")
     }
 
     fn shell_icon(path: &Path) -> Option<HICON> {

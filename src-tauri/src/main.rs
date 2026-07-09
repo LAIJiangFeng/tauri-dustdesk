@@ -298,8 +298,18 @@ fn remove_item_from_category(
 }
 
 #[tauri::command]
-fn restore_item_to_desktop(
+async fn restore_item_to_desktop(
     app: tauri::AppHandle,
+    index: usize,
+    path: String,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || restore_item_to_desktop_impl(&app, index, path))
+        .await
+        .map_err(to_message)?
+}
+
+fn restore_item_to_desktop_impl(
+    app: &tauri::AppHandle,
     index: usize,
     path: String,
 ) -> Result<String, String> {
@@ -314,7 +324,7 @@ fn restore_item_to_desktop(
         store.save_config(&config).map_err(to_message)?;
         Ok(restored_path)
     })?;
-    emit_desktop_cards_changed(&app);
+    emit_desktop_cards_changed(app);
     Ok(restored_path.display().to_string())
 }
 
@@ -3277,7 +3287,7 @@ fn create_desktop_card(
         .always_on_top(false)
         .always_on_bottom(true)
         .focused(false)
-        .visible(false)
+        .visible(true)
         .build()
         .map_err(to_message)
         .and_then(|window| {

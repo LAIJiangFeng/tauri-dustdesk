@@ -1,5 +1,7 @@
 export const dustdeskPathDragType = "application/x-dustdesk-path"
 const nativeFileDragType = "Files"
+const plainTextDragType = "text/plain"
+const uriListDragType = "text/uri-list"
 
 interface DragEndPoint {
   clientX: number
@@ -22,7 +24,7 @@ export function hasDustDeskPathDrag(dataTransfer: DataTransfer) {
 export function hasPathLikeDrag(dataTransfer: DataTransfer | null) {
   if (!dataTransfer) return false
   const types = Array.from(dataTransfer.types)
-  return types.includes(dustdeskPathDragType) || types.includes(nativeFileDragType)
+  return types.includes(dustdeskPathDragType) || types.includes(nativeFileDragType) || types.includes(plainTextDragType) || types.includes(uriListDragType)
 }
 
 export function allowPathLikeDrag(event: DragEvent) {
@@ -35,8 +37,44 @@ export function allowPathLikeDrag(event: DragEvent) {
 }
 
 export function readDustDeskPathDrag(dataTransfer: DataTransfer) {
-  const path = dataTransfer.getData(dustdeskPathDragType).trim()
-  return path ? [path] : []
+  const paths = [
+    ...pathsFromText(dataTransfer.getData(dustdeskPathDragType)),
+    ...pathsFromText(dataTransfer.getData(plainTextDragType)),
+    ...pathsFromUriList(dataTransfer.getData(uriListDragType)),
+  ]
+  return Array.from(new Set(paths))
+}
+
+function pathsFromText(value: string) {
+  return value
+    .split(/\r?\n/)
+    .map((path) => path.trim().replace(/^"|"$/g, ""))
+    .filter(isLocalPathText)
+}
+
+function pathsFromUriList(value: string) {
+  return value
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("#"))
+    .map(fileUriToWindowsPath)
+    .filter(isLocalPathText)
+}
+
+function fileUriToWindowsPath(value: string) {
+  if (!value.toLowerCase().startsWith("file:")) return value
+  try {
+    const url = new URL(value)
+    let path = decodeURIComponent(url.pathname)
+    if (/^\/[a-zA-Z]:\//.test(path)) path = path.slice(1)
+    return path.replace(/\//g, "\\")
+  } catch {
+    return value
+  }
+}
+
+function isLocalPathText(value: string) {
+  return /^[a-zA-Z]:[\\/]/.test(value) || value.startsWith("\\\\")
 }
 
 export function didDragEndOutsideWindow(event: DragEndPoint) {

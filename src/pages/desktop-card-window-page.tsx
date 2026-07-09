@@ -30,7 +30,7 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { usePersistCurrentWindowLayout } from "@/hooks/use-persist-current-window-layout"
 import { useTheme } from "@/hooks/use-theme"
-import { allowPathLikeDrag, didDragEndOutsideWindow, hasDustDeskPathDrag, readDustDeskPathDrag, writeDustDeskPathDrag } from "@/lib/dustdesk-dnd"
+import { allowPathLikeDrag, didDragEndOutsideWindow, hasPathLikeDrag, readDustDeskPathDrag, writeDustDeskPathDrag } from "@/lib/dustdesk-dnd"
 import { repaintCurrentWindow, safeCurrentWebviewDragDropEvent, safeListen, startCurrentWindowDragging, startCurrentWindowResizeDragging } from "@/lib/tauri-window"
 import { displayPathName, extensionFromPath } from "@/lib/utils"
 import { useDustDeskStore } from "@/stores/dustdesk-store"
@@ -68,7 +68,7 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
   const addItemsToCategoryLight = useDustDeskStore((state) => state.addItemsToCategoryLight)
   const addLaunchersLight = useDustDeskStore((state) => state.addLaunchersLight)
   const removeLauncher = useDustDeskStore((state) => state.removeLauncher)
-  const restoreItemToDesktop = useDustDeskStore((state) => state.restoreItemToDesktop)
+  const restoreItemToDesktopLight = useDustDeskStore((state) => state.restoreItemToDesktopLight)
   const startRestoreAllToDesktopTask = useDustDeskStore((state) => state.startRestoreAllToDesktopTask)
   const showPathInFolder = useDustDeskStore((state) => state.showPathInFolder)
   const startClassifyDesktopItemsTask = useDustDeskStore((state) => state.startClassifyDesktopItemsTask)
@@ -199,7 +199,7 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
 
   async function handleRestoreDragOut(path: string) {
     try {
-      const restored = await restoreItemToDesktop(index, path)
+      const restored = await restoreItemToDesktopLight(index, path)
       setNotice(`已移回桌面：${displayPathName(restored)}`)
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error))
@@ -207,13 +207,13 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
   }
 
   function handleLauncherDragOver(event: ReactDragEvent<HTMLElement>) {
-    if (kind !== "launcher" || !hasDustDeskPathDrag(event.dataTransfer)) return
+    if (kind !== "launcher" || !hasPathLikeDrag(event.dataTransfer)) return
     event.preventDefault()
     event.dataTransfer.dropEffect = "copy"
   }
 
   function handleLauncherDrop(event: ReactDragEvent<HTMLElement>) {
-    if (kind !== "launcher" || !hasDustDeskPathDrag(event.dataTransfer)) return
+    if (kind !== "launcher" || !hasPathLikeDrag(event.dataTransfer)) return
     event.preventDefault()
     event.stopPropagation()
     void handleDropped(readDustDeskPathDrag(event.dataTransfer))
@@ -490,7 +490,7 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
             settings={settings}
             onOpen={openPath}
             onShowInFolder={showPathInFolder}
-            onRestoreToDesktop={restoreItemToDesktop}
+            onRestoreToDesktop={restoreItemToDesktopLight}
             onRestoreDragOut={handleRestoreDragOut}
           />
         )}

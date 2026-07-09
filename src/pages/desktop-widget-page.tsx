@@ -39,7 +39,7 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { usePersistCurrentWindowLayout } from "@/hooks/use-persist-current-window-layout"
 import { useTheme } from "@/hooks/use-theme"
-import { allowPathLikeDrag, didDragEndOutsideWindow, writeDustDeskPathDrag } from "@/lib/dustdesk-dnd"
+import { allowPathLikeDrag, didDragEndOutsideWindow, readDustDeskPathDrag, writeDustDeskPathDrag } from "@/lib/dustdesk-dnd"
 import {
   repaintCurrentWindow,
   safeCurrentWebviewDragDropEvent,
@@ -107,7 +107,7 @@ export function DesktopWidgetPage() {
   const addItemsToCategoryLight = useDustDeskStore((state) => state.addItemsToCategoryLight)
   const addLaunchersLight = useDustDeskStore((state) => state.addLaunchersLight)
   const removeLauncher = useDustDeskStore((state) => state.removeLauncher)
-  const restoreItemToDesktop = useDustDeskStore((state) => state.restoreItemToDesktop)
+  const restoreItemToDesktopLight = useDustDeskStore((state) => state.restoreItemToDesktopLight)
   const startRestoreAllToDesktopTask = useDustDeskStore((state) => state.startRestoreAllToDesktopTask)
   const showPathInFolder = useDustDeskStore((state) => state.showPathInFolder)
   const startClassifyDesktopItemsTask = useDustDeskStore((state) => state.startClassifyDesktopItemsTask)
@@ -232,12 +232,19 @@ export function DesktopWidgetPage() {
 
   useEffect(() => {
     const onDragOver = (event: DragEvent) => {
-      allowPathLikeDrag(event)
+      if (!allowPathLikeDrag(event)) return
+      setHoverZone(dropZoneFromClientPoint(event.clientX, event.clientY))
     }
     const onDrop = (event: DragEvent) => {
-      if (allowPathLikeDrag(event)) {
-        setHoverZone("")
-      }
+      if (!allowPathLikeDrag(event)) return
+      setHoverZone("")
+      const dataTransfer = event.dataTransfer
+      if (!dataTransfer) return
+      const paths = readDustDeskPathDrag(dataTransfer)
+      if (paths.length === 0) return
+      const target = parseDropTarget(dropZoneFromClientPoint(event.clientX, event.clientY) || activeCategory?.id || "category:0")
+      if (!target) return
+      void handleDroppedPaths(target, paths)
     }
 
     globalThis.addEventListener("dragover", onDragOver)
@@ -246,7 +253,7 @@ export function DesktopWidgetPage() {
       globalThis.removeEventListener("dragover", onDragOver)
       globalThis.removeEventListener("drop", onDrop)
     }
-  }, [])
+  }, [activeCategory?.id, snapshot.categories])
 
   useEffect(() => {
     let unlisten: (() => void) | undefined
@@ -337,7 +344,7 @@ export function DesktopWidgetPage() {
 
   async function handleRestoreDragOut(index: number, path: string) {
     try {
-      const restored = await restoreItemToDesktop(index, path)
+      const restored = await restoreItemToDesktopLight(index, path)
       setNotice(`已移回桌面：${displayPathName(restored)}`)
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error))
@@ -635,7 +642,7 @@ export function DesktopWidgetPage() {
             settings={settings}
             onOpen={openPath}
             onShowInFolder={showPathInFolder}
-            onRestoreToDesktop={restoreItemToDesktop}
+            onRestoreToDesktop={restoreItemToDesktopLight}
             onRestoreDragOut={handleRestoreDragOut}
           />
         ) : (
@@ -1194,7 +1201,11 @@ function frameIndex(id: string, categories: CategoryTab[]) {
 
 function dropZoneFromPoint(physicalX: number, physicalY: number) {
   const ratio = globalThis.devicePixelRatio || 1
-  const element = document.elementFromPoint(physicalX / ratio, physicalY / ratio)
+  return dropZoneFromClientPoint(physicalX / ratio, physicalY / ratio)
+}
+
+function dropZoneFromClientPoint(clientX: number, clientY: number) {
+  const element = document.elementFromPoint(clientX, clientY)
   return element?.closest<HTMLElement>("[data-drop-zone]")?.dataset.dropZone ?? ""
 }
 

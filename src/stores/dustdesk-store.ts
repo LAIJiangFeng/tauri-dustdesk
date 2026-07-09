@@ -152,6 +152,9 @@ async function call<T>(command: string, args?: InvokeArgs): Promise<T> {
     if (command === "restore_all_to_desktop") {
       return demoSnapshot.categories.reduce((sum, category) => sum + category.item_paths.length, 0) as T
     }
+    if (command === "restore_item_to_desktop") {
+      return asString(args?.path) as T
+    }
     if (command === "start_classify_desktop_items_task" || command === "start_restore_all_to_desktop_task") {
       return undefined as T
     }
@@ -418,7 +421,8 @@ function collectMissingIconPaths(snapshot: AppSnapshot, options: IconResolutionO
     const trimmed = path.trim()
     if (!trimmed || iconDataUrl) return
     const key = trimmed.toLowerCase()
-    if (iconCache.has(key)) return
+    const cached = iconCache.get(key)
+    if (cached || (cached === null && !isShortcutIconPath(trimmed))) return
     if (seen.has(key)) return
     seen.add(key)
     paths.push(trimmed)
@@ -439,6 +443,10 @@ function collectMissingIconPaths(snapshot: AppSnapshot, options: IconResolutionO
   }
 
   return paths.slice(0, iconPathLimit)
+}
+
+function isShortcutIconPath(path: string) {
+  return /\.(lnk|url|appref-ms)$/i.test(path.trim())
 }
 
 function shouldIncludeDesktopItems(options: IconResolutionOptions) {
@@ -586,6 +594,7 @@ interface DustDeskState {
   addItemsToCategoryLight: (index: number, paths: string[]) => Promise<number>
   removeItemFromCategory: (index: number, path: string) => Promise<void>
   restoreItemToDesktop: (index: number, path: string) => Promise<string>
+  restoreItemToDesktopLight: (index: number, path: string) => Promise<string>
   restoreAllToDesktop: () => Promise<number>
   restoreAllToDesktopLight: () => Promise<number>
   startRestoreAllToDesktopTask: () => Promise<void>
@@ -783,6 +792,18 @@ export const useDustDeskStore = create<DustDeskState>()(
     restoreItemToDesktop: async (index, path) => {
       const restored = await call<string>("restore_item_to_desktop", { index, path })
       await get().load()
+      return restored
+    },
+    restoreItemToDesktopLight: async (index, path) => {
+      const restored = await call<string>("restore_item_to_desktop", { index, path })
+      const key = path.trim().toLowerCase()
+      set((state) => {
+        const category = state.snapshot.categories[index]
+        if (!category) return
+        category.item_paths = category.item_paths.filter((itemPath) => itemPath.trim().toLowerCase() !== key)
+        category.item_details = category.item_details.filter((item) => item.path.trim().toLowerCase() !== key)
+      })
+      void get().loadDesktopSnapshot({ force: true })
       return restored
     },
     restoreAllToDesktop: async () => {

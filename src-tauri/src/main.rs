@@ -7,13 +7,25 @@ mod system_icon;
 
 use std::{
     collections::{BTreeMap, VecDeque},
-    env, fs,
+    env,
+    ffi::OsString,
+    fs::{self, File},
+    io::{self, BufReader, Read, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Mutex, OnceLock,
+        mpsc, Arc, Mutex, OnceLock,
     },
+    time::{Duration, Instant, SystemTime},
+};
+
+#[cfg(windows)]
+use std::os::windows::{
+    ffi::{OsStrExt, OsStringExt},
+    fs::OpenOptionsExt,
+    io::AsRawHandle,
+    process::CommandExt,
 };
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -38,6 +50,7 @@ const SEARCH_RESULT_LIMIT: usize = 80;
 const SEARCH_SCAN_LIMIT: usize = 8_000;
 const SEARCH_HISTORY_LIMIT: usize = 500;
 const CLIPBOARD_PREVIEW_IMAGE_MAX_BYTES: u64 = 800_000;
+const MAX_LOCKED_TRANSFER_TREE_ENTRIES: usize = 256;
 const TRAY_MENU_SHOW_MAIN: &str = "show-main-window";
 const TRAY_MENU_QUIT: &str = "quit-app";
 const DESKTOP_OPERATION_EVENT: &str = "dustdesk://desktop-operation";
@@ -45,9 +58,11 @@ const DESKTOP_OPERATION_EVENT: &str = "dustdesk://desktop-operation";
 static CONFIG_MUTATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static LAUNCHER_MUTATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static RUNTIME_DIRECTORY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static TRANSFER_RECOVERY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static ICON_DATA_URL_CACHE: OnceLock<Mutex<BTreeMap<String, Option<String>>>> = OnceLock::new();
 static REAL_EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 static DESKTOP_OPERATION_RUNNING: AtomicBool = AtomicBool::new(false);
+static DESKTOP_OPERATION_LAST: OnceLock<Mutex<Option<DesktopOperationPayload>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, Serialize)]
 struct DesktopFrameVisibility {
@@ -69,6 +84,49 @@ struct DesktopOperationPayload {
     category_counts: Vec<CategoryClassifyCount>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct DesktopOperationStatus {
+    running: bool,
+    last: Option<DesktopOperationPayload>,
+}
+
+#[derive(Debug, Clone)]
+struct ClassifyCandidate {
+    original_path: String,
+    category_index: usize,
+    category_name: String,
+    is_dir: bool,
+    work_estimate: u64,
+}
+
+#[derive(Debug)]
+enum ClassifyWorkerMessage {
+    Started(ClassifyCandidate),
+    Finished(ClassifyCandidate, Result<String, String>, Duration),
+    Failed(String),
+}
+
+#[derive(Debug, Clone)]
+struct RestoreCandidate {
+    source: PathBuf,
+    original_config_path: Option<String>,
+    category_index: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeMigrationJournal {
+    target: String,
+    phase: String,
+    requested_path: String,
+    old_data_dir: String,
+    old_organizer_root: String,
+    old_launchers_root: String,
+    new_data_dir: String,
+    new_organizer_root: String,
+    new_launchers_root: String,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DesktopDropPosition {
@@ -88,17 +146,17 @@ fn load_snapshot_impl() -> Result<AppSnapshot, String> {
     let store = AppStore::open().map_err(to_message)?;
     store.ensure_runtime_dirs().map_err(to_message)?;
     let config = with_config_mutation(|| {
-        let mut config = store.load_config();
+        let mut config = store.load_config_strict().map_err(to_message)?;
         repair_category_item_paths(&store, &mut config)?;
         Ok(config)
     })?;
     let launchers = with_launcher_mutation(|| {
-        let mut launchers = store.load_launchers();
+        let mut launchers = store.load_launchers_strict().map_err(to_message)?;
         repair_launchers(&store, &mut launchers)?;
         Ok(launchers)
     })?;
     let clipboard = clipboard_bridge::with_clipboard_history_lock(|| {
-        let mut clipboard = store.load_clipboard();
+        let mut clipboard = store.load_clipboard_strict().map_err(to_message)?;
         if clipboard_bridge::normalize_clipboard_image_storage(&mut clipboard).unwrap_or(false) {
             store.save_clipboard(&clipboard).map_err(to_message)?;
         }
@@ -131,12 +189,12 @@ fn load_desktop_snapshot_impl() -> Result<AppSnapshot, String> {
     let store = AppStore::open().map_err(to_message)?;
     store.ensure_runtime_dirs().map_err(to_message)?;
     let config = with_config_mutation(|| {
-        let mut config = store.load_config();
+        let mut config = store.load_config_strict().map_err(to_message)?;
         repair_category_item_paths(&store, &mut config)?;
         Ok(config)
     })?;
     let launchers = with_launcher_mutation(|| {
-        let mut launchers = store.load_launchers();
+        let mut launchers = store.load_launchers_strict().map_err(to_message)?;
         repair_launchers(&store, &mut launchers)?;
         Ok(launchers)
     })?;
@@ -231,9 +289,9 @@ async fn add_item_to_category(
     path: String,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        add_items_to_category_impl(index, vec![path])?;
+        let result = add_items_to_category_impl(index, vec![path]);
         emit_desktop_cards_changed(&app);
-        Ok(())
+        result.map(|_| ())
     })
     .await
     .map_err(to_message)?
@@ -246,9 +304,9 @@ async fn add_items_to_category(
     paths: Vec<String>,
 ) -> Result<usize, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let added = add_items_to_category_impl(index, paths)?;
+        let result = add_items_to_category_impl(index, paths);
         emit_desktop_cards_changed(&app);
-        Ok(added)
+        result
     })
     .await
     .map_err(to_message)?
@@ -258,7 +316,8 @@ fn add_items_to_category_impl(index: usize, paths: Vec<String>) -> Result<usize,
     with_config_mutation(|| {
         let store = AppStore::open().map_err(to_message)?;
         store.ensure_runtime_dirs().map_err(to_message)?;
-        let mut config = store.load_config();
+        cleanup_startup_transfer_staging_dirs(&store);
+        let mut config = store.load_config_strict().map_err(to_message)?;
         repair_category_item_paths(&store, &mut config)?;
         config
             .desktop_categories
@@ -286,7 +345,9 @@ fn add_items_to_category_impl(index: usize, paths: Vec<String>) -> Result<usize,
             added += 1;
         }
 
-        store.save_config(&config).map_err(to_message)?;
+        if added > 0 {
+            store.save_config(&config).map_err(to_message)?;
+        }
         Ok(added)
     })
 }
@@ -334,10 +395,12 @@ fn restore_item_to_desktop_impl(
     let restored_path = with_config_mutation(|| {
         let path = normalize_path_input(&path)?;
         let store = AppStore::open().map_err(to_message)?;
-        let mut config = store.load_config();
+        let mut config = store.load_config_strict().map_err(to_message)?;
         let desktop = user_desktop().ok_or_else(|| "没有找到桌面路径".to_owned())?;
         fs::create_dir_all(&desktop).map_err(to_message)?;
-        let restored_path = restore_path_to_desktop(Path::new(&path), &desktop)?;
+        let source = recover_existing_path_from_corrupted_text(&path)
+            .unwrap_or_else(|| PathBuf::from(&path));
+        let restored_path = restore_path_to_desktop(&source, &desktop)?;
         remove_category_path_from_config(&mut config, index, &path)?;
         store.save_config(&config).map_err(to_message)?;
         Ok(restored_path)
@@ -360,6 +423,10 @@ async fn restore_all_to_desktop(app: tauri::AppHandle) -> Result<usize, String> 
 
 #[tauri::command]
 async fn start_restore_all_to_desktop_task(app: tauri::AppHandle) -> Result<(), String> {
+    start_restore_background_operation(app)
+}
+
+fn start_restore_background_operation(app: tauri::AppHandle) -> Result<(), String> {
     start_desktop_background_operation(app.clone(), "restore", move || {
         let progress_app = app.clone();
         let restored =
@@ -441,7 +508,7 @@ fn add_launchers_with_names(items: Vec<(String, String)>) -> Result<usize, Strin
     with_launcher_mutation(|| {
         let store = AppStore::open().map_err(to_message)?;
         store.ensure_runtime_dirs().map_err(to_message)?;
-        let mut launchers = store.load_launchers();
+        let mut launchers = store.load_launchers_strict().map_err(to_message)?;
         repair_launchers(&store, &mut launchers)?;
         let mut added = 0usize;
 
@@ -477,7 +544,7 @@ fn remove_launcher(app: tauri::AppHandle, path: String) -> Result<(), String> {
         let path = normalize_path_input(&path)?;
         let store = AppStore::open().map_err(to_message)?;
         store.ensure_runtime_dirs().map_err(to_message)?;
-        let mut launchers = store.load_launchers();
+        let mut launchers = store.load_launchers_strict().map_err(to_message)?;
         launchers
             .items
             .retain(|item| !same_path_text(&item.path, &path));
@@ -499,17 +566,34 @@ fn show_path_in_folder(path: String) -> Result<(), String> {
 
 #[tauri::command]
 async fn classify_desktop_items(app: tauri::AppHandle) -> Result<ClassifyResult, String> {
-    let result = tauri::async_runtime::spawn_blocking(classify_desktop_items_impl)
+    let result = tauri::async_runtime::spawn_blocking(|| classify_desktop_items_impl())
         .await
-        .map_err(to_message)??;
+        .map_err(to_message)?;
     emit_desktop_cards_changed(&app);
-    Ok(result)
+    result
 }
 
 #[tauri::command]
 async fn start_classify_desktop_items_task(app: tauri::AppHandle) -> Result<(), String> {
     start_desktop_background_operation(app.clone(), "classify", move || {
-        let result = classify_desktop_items_impl()?;
+        let progress_app = app.clone();
+        let result =
+            classify_desktop_items_with_progress(move |current, total, path, moved, skipped| {
+                emit_desktop_operation(
+                    &progress_app,
+                    DesktopOperationPayload {
+                        kind: "classify",
+                        status: "progress",
+                        message: classify_progress_message(current, total, path),
+                        moved,
+                        skipped,
+                        restored: 0,
+                        total,
+                        current_path: path.display().to_string(),
+                        category_counts: Vec::new(),
+                    },
+                );
+            })?;
         let detail = result
             .category_counts
             .iter()
@@ -520,10 +604,15 @@ async fn start_classify_desktop_items_task(app: tauri::AppHandle) -> Result<(), 
             kind: "classify",
             status: "finished",
             message: format!(
-                "已智能收纳 {} 项{}{}",
+                "已智能收纳 {} 项{}{}{}",
                 result.moved,
                 if detail.is_empty() { "" } else { "：" },
-                detail
+                detail,
+                if result.skipped > 0 {
+                    format!("，跳过 {} 项", result.skipped)
+                } else {
+                    String::new()
+                }
             ),
             moved: result.moved,
             skipped: result.skipped,
@@ -536,18 +625,25 @@ async fn start_classify_desktop_items_task(app: tauri::AppHandle) -> Result<(), 
 }
 
 fn classify_desktop_items_impl() -> Result<ClassifyResult, String> {
+    classify_desktop_items_with_progress(|_, _, _, _, _| {})
+}
+
+fn classify_desktop_items_with_progress(
+    mut on_progress: impl FnMut(usize, usize, &Path, usize, usize),
+) -> Result<ClassifyResult, String> {
     with_config_mutation(|| {
+        let overall_started = Instant::now();
         let store = AppStore::open().map_err(to_message)?;
         store.ensure_runtime_dirs().map_err(to_message)?;
-        let mut config = store.load_config();
+        let mut config = store.load_config_strict().map_err(to_message)?;
         repair_category_item_paths(&store, &mut config)?;
         if config.desktop_categories.is_empty() {
             return Err("没有可用分类，请先创建分类".to_owned());
         }
 
         let mut category_counts = vec![0usize; config.desktop_categories.len()];
-        let mut moved = 0usize;
         let mut skipped = 0usize;
+        let mut candidates = Vec::new();
         let items = desktop_items(false);
         for item in items {
             if should_skip_desktop_classify_item(&item) {
@@ -568,26 +664,206 @@ fn classify_desktop_items_impl() -> Result<ClassifyResult, String> {
 
             let original_path = item.path.clone();
             let category_name = config.desktop_categories[category_index].name.clone();
-            let archived_path = archive_item_path(&store, &category_name, &original_path)?;
-
-            for category in &mut config.desktop_categories {
-                category.item_paths.retain(|item_path| {
-                    !same_path_text(item_path, &original_path)
-                        && !same_path_text(item_path, &archived_path)
-                });
-            }
-
-            if push_unique_text_path(
-                &mut config.desktop_categories[category_index].item_paths,
-                archived_path,
-            ) {
-                category_counts[category_index] += 1;
-                moved += 1;
-            }
-            store.save_config(&config).map_err(to_message)?;
+            let work_estimate = estimate_transfer_work(Path::new(&original_path));
+            candidates.push(ClassifyCandidate {
+                original_path,
+                category_index,
+                category_name,
+                is_dir: item.is_dir,
+                work_estimate,
+            });
         }
 
+        let total = candidates.len();
+        let mut directory_candidates = Vec::new();
+        let mut file_candidates = Vec::new();
+        for candidate in candidates {
+            if candidate.is_dir {
+                directory_candidates.push(candidate);
+            } else {
+                file_candidates.push(candidate);
+            }
+        }
+        directory_candidates.sort_by(|left, right| {
+            right
+                .work_estimate
+                .cmp(&left.work_estimate)
+                .then_with(|| left.original_path.cmp(&right.original_path))
+        });
+        file_candidates.sort_by(|left, right| {
+            right
+                .work_estimate
+                .cmp(&left.work_estimate)
+                .then_with(|| left.original_path.cmp(&right.original_path))
+        });
+
+        let directory_count = directory_candidates.len();
+        let file_count = file_candidates.len();
+        let max_workers = desktop_operation_worker_count(total);
+        let directory_worker_count = usize::from(directory_count > 0);
+        let file_worker_count = if file_count > 0 {
+            max_workers
+                .saturating_sub(directory_worker_count)
+                .max(1)
+                .min(file_count)
+        } else {
+            0
+        };
+        let queues = [
+            (
+                Arc::new(Mutex::new(VecDeque::from(directory_candidates))),
+                directory_worker_count,
+            ),
+            (
+                Arc::new(Mutex::new(VecDeque::from(file_candidates))),
+                file_worker_count,
+            ),
+        ];
+        let (sender, receiver) = mpsc::channel();
+        let mut moved = 0usize;
+        let mut handled = 0usize;
+        let mut active = Vec::<ClassifyCandidate>::new();
+
+        std::thread::scope(|scope| -> Result<(), String> {
+            for (queue, worker_count) in queues {
+                for _ in 0..worker_count {
+                    let queue = Arc::clone(&queue);
+                    let sender = sender.clone();
+                    let store = store.clone();
+                    scope.spawn(move || loop {
+                        let candidate = match queue.lock() {
+                            Ok(mut queue) => queue.pop_front(),
+                            Err(_) => {
+                                let _ = sender.send(ClassifyWorkerMessage::Failed(
+                                    "收纳任务队列已损坏".to_owned(),
+                                ));
+                                return;
+                            }
+                        };
+                        let Some(candidate) = candidate else {
+                            return;
+                        };
+                        let _ = sender.send(ClassifyWorkerMessage::Started(candidate.clone()));
+                        let item_started = Instant::now();
+                        let result = archive_item_path(
+                            &store,
+                            &candidate.category_name,
+                            &candidate.original_path,
+                        );
+                        let elapsed = item_started.elapsed();
+                        if sender
+                            .send(ClassifyWorkerMessage::Finished(candidate, result, elapsed))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    });
+                }
+            }
+            drop(sender);
+
+            for message in receiver {
+                let (candidate, archive_result, elapsed) = match message {
+                    ClassifyWorkerMessage::Started(candidate) => {
+                        on_progress(
+                            handled.saturating_add(1).min(total),
+                            total,
+                            Path::new(&candidate.original_path),
+                            moved,
+                            skipped,
+                        );
+                        active.push(candidate);
+                        continue;
+                    }
+                    ClassifyWorkerMessage::Finished(candidate, result, elapsed) => {
+                        handled += 1;
+                        active.retain(|item| {
+                            !same_path_text(&item.original_path, &candidate.original_path)
+                        });
+                        (candidate, result, elapsed)
+                    }
+                    ClassifyWorkerMessage::Failed(error) => {
+                        handled += 1;
+                        skipped += 1;
+                        eprintln!("failed to classify desktop item: {error}");
+                        continue;
+                    }
+                };
+
+                match &archive_result {
+                    Ok(path) => eprintln!(
+                        "[desktop-classify] ok elapsed_ms={} source={} destination={}",
+                        elapsed.as_millis(),
+                        candidate.original_path,
+                        path
+                    ),
+                    Err(error) => eprintln!(
+                        "[desktop-classify] failed elapsed_ms={} source={} error={}",
+                        elapsed.as_millis(),
+                        candidate.original_path,
+                        error
+                    ),
+                }
+
+                match archive_result {
+                    Ok(archived_path) => {
+                        for category in &mut config.desktop_categories {
+                            category.item_paths.retain(|item_path| {
+                                !same_path_text(item_path, &candidate.original_path)
+                                    && !same_path_text(item_path, &archived_path)
+                            });
+                        }
+
+                        push_unique_text_path(
+                            &mut config.desktop_categories[candidate.category_index].item_paths,
+                            archived_path.clone(),
+                        );
+                        category_counts[candidate.category_index] += 1;
+                        moved += 1;
+                        on_progress(handled, total, Path::new(&archived_path), moved, skipped);
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "failed to classify desktop item {}: {error}",
+                            candidate.original_path
+                        );
+                        skipped += 1;
+                        on_progress(
+                            handled,
+                            total,
+                            Path::new(&candidate.original_path),
+                            moved,
+                            skipped,
+                        );
+                    }
+                }
+
+                if handled < total {
+                    if let Some(current) = active.iter().max_by_key(|item| item.work_estimate) {
+                        on_progress(
+                            handled + 1,
+                            total,
+                            Path::new(&current.original_path),
+                            moved,
+                            skipped,
+                        );
+                    }
+                }
+            }
+            Ok(())
+        })?;
+
+        let save_started = Instant::now();
         store.save_config(&config).map_err(to_message)?;
+        eprintln!(
+            "[desktop-classify] complete total_ms={} save_ms={} moved={} skipped={} directories={} files={}",
+            overall_started.elapsed().as_millis(),
+            save_started.elapsed().as_millis(),
+            moved,
+            skipped,
+            directory_count,
+            file_count
+        );
 
         Ok(ClassifyResult {
             moved,
@@ -698,6 +974,11 @@ async fn update_runtime_directory(target: String, path: String) -> Result<AppSna
 }
 
 fn update_runtime_directory_impl(target: String, path: String) -> Result<AppSnapshot, String> {
+    store::with_storage_mutation(move || update_runtime_directory_locked(target, path))?;
+    load_snapshot_impl().map_err(|error| format!("运行目录已切换成功，但刷新界面失败：{error}"))
+}
+
+fn update_runtime_directory_locked(target: String, path: String) -> Result<(), String> {
     let _guard = RUNTIME_DIRECTORY_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -712,77 +993,210 @@ fn update_runtime_directory_impl(target: String, path: String) -> Result<AppSnap
         return Err("目录不能为空".to_owned());
     }
 
+    recover_pending_runtime_migration_locked()?;
+
     let old_store = AppStore::open().map_err(to_message)?;
     let old_data_dir = old_store.data_dir();
     let old_organizer_root = old_store.organizer_root();
     let old_launchers_root = old_store.launchers_root();
     let requested_path = PathBuf::from(path);
     validate_runtime_directory_target(&target, &requested_path, &old_store)?;
-    let new_store =
-        AppStore::set_runtime_directory(&target, &requested_path).map_err(to_message)?;
-    new_store.ensure_runtime_dirs().map_err(to_message)?;
-    let new_data_dir = new_store.data_dir();
-    let new_organizer_root = new_store.organizer_root();
-    let new_launchers_root = new_store.launchers_root();
 
-    match target.as_str() {
-        "data" => {
-            move_directory_contents(&old_data_dir, &new_data_dir)?;
-            move_directory_contents(&old_organizer_root, &new_organizer_root)?;
-            move_directory_contents(&old_launchers_root, &new_launchers_root)?;
-            rewrite_runtime_path_prefixes(
-                &new_store,
-                &[
-                    (&old_data_dir, &new_data_dir),
-                    (&old_organizer_root, &new_organizer_root),
-                    (&old_launchers_root, &new_launchers_root),
-                ],
-            )?;
-            rewrite_launchers_path_prefixes(
-                &new_store,
-                &[
-                    (&old_data_dir, &new_data_dir),
-                    (&old_launchers_root, &new_launchers_root),
-                ],
-            )?;
-            rewrite_clipboard_path_prefixes(&new_store, &[(&old_data_dir, &new_data_dir)])?;
-            rewrite_search_history_path_prefixes(
-                &new_store,
-                &[
-                    (&old_data_dir, &new_data_dir),
-                    (&old_organizer_root, &new_organizer_root),
-                    (&old_launchers_root, &new_launchers_root),
-                ],
-            )?;
-        }
-        "organizer" => {
-            move_directory_contents(&old_organizer_root, &new_organizer_root)?;
-            rewrite_runtime_path_prefixes(
-                &new_store,
-                &[(&old_organizer_root, &new_organizer_root)],
-            )?;
-            rewrite_search_history_path_prefixes(
-                &new_store,
-                &[(&old_organizer_root, &new_organizer_root)],
-            )?;
-        }
-        "launchers" => {
-            move_directory_contents(&old_launchers_root, &new_launchers_root)?;
-            rewrite_launchers_path_prefixes(
-                &new_store,
-                &[(&old_launchers_root, &new_launchers_root)],
-            )?;
-            rewrite_search_history_path_prefixes(
-                &new_store,
-                &[(&old_launchers_root, &new_launchers_root)],
-            )?;
-        }
-        _ => {}
+    let prospective_store = old_store
+        .with_runtime_directory(&target, &requested_path)
+        .map_err(to_message)?;
+    prospective_store
+        .ensure_runtime_dirs()
+        .map_err(to_message)?;
+    let new_data_dir = prospective_store.data_dir();
+    let new_organizer_root = prospective_store.organizer_root();
+    let new_launchers_root = prospective_store.launchers_root();
+
+    let journal = RuntimeMigrationJournal {
+        target,
+        phase: "prepared".to_owned(),
+        requested_path: requested_path.display().to_string(),
+        old_data_dir: old_data_dir.display().to_string(),
+        old_organizer_root: old_organizer_root.display().to_string(),
+        old_launchers_root: old_launchers_root.display().to_string(),
+        new_data_dir: new_data_dir.display().to_string(),
+        new_organizer_root: new_organizer_root.display().to_string(),
+        new_launchers_root: new_launchers_root.display().to_string(),
+    };
+    save_runtime_migration_journal(&journal)?;
+    complete_runtime_migration_journal(journal)?;
+
+    Ok(())
+}
+
+fn recover_pending_runtime_migration_locked() -> Result<(), String> {
+    let Some(content) = AppStore::load_runtime_migration_journal().map_err(to_message)? else {
+        return Ok(());
+    };
+    let journal: RuntimeMigrationJournal = serde_json::from_str(&content).map_err(to_message)?;
+    complete_runtime_migration_journal(journal)
+}
+
+fn complete_runtime_migration_journal(mut journal: RuntimeMigrationJournal) -> Result<(), String> {
+    let prospective_store = AppStore::from_runtime_dirs(
+        PathBuf::from(&journal.new_data_dir),
+        PathBuf::from(&journal.new_organizer_root),
+        PathBuf::from(&journal.new_launchers_root),
+    );
+    prospective_store
+        .ensure_runtime_dirs()
+        .map_err(to_message)?;
+
+    if runtime_migration_phase_index(&journal.phase) < runtime_migration_phase_index("copied") {
+        copy_runtime_migration_contents(&journal)?;
+        verify_runtime_migration_contents(&journal)?;
+        set_runtime_migration_phase(&mut journal, "copied")?;
     }
 
-    repair_existing_app_desktop_entries(&new_store)?;
+    if runtime_migration_phase_index(&journal.phase) < runtime_migration_phase_index("rewritten") {
+        rewrite_runtime_migration_paths(&journal, &prospective_store)?;
+        set_runtime_migration_phase(&mut journal, "rewritten")?;
+    }
 
-    load_snapshot_impl()
+    if runtime_migration_phase_index(&journal.phase) < runtime_migration_phase_index("switched") {
+        let new_store =
+            AppStore::set_runtime_directory(&journal.target, Path::new(&journal.requested_path))
+                .map_err(to_message)?;
+        if let Err(error) = repair_existing_app_desktop_entries(&new_store) {
+            eprintln!("DustDesk 运行目录已切换，但桌面入口暂未更新：{error}");
+        }
+        set_runtime_migration_phase(&mut journal, "switched")?;
+    }
+
+    if runtime_migration_phase_index(&journal.phase) < runtime_migration_phase_index("cleaned") {
+        if let Err(error) = cleanup_runtime_migration_sources(&journal) {
+            eprintln!("DustDesk 运行目录已安全切换，旧目录暂未完全清理：{error}");
+        }
+        set_runtime_migration_phase(&mut journal, "cleaned")?;
+    }
+
+    AppStore::remove_runtime_migration_journal().map_err(to_message)
+}
+
+fn save_runtime_migration_journal(journal: &RuntimeMigrationJournal) -> Result<(), String> {
+    let json = serde_json::to_vec_pretty(journal).map_err(to_message)?;
+    AppStore::save_runtime_migration_journal(&json).map_err(to_message)
+}
+
+fn set_runtime_migration_phase(
+    journal: &mut RuntimeMigrationJournal,
+    phase: &str,
+) -> Result<(), String> {
+    journal.phase = phase.to_owned();
+    save_runtime_migration_journal(journal)
+}
+
+fn runtime_migration_phase_index(phase: &str) -> usize {
+    match phase {
+        "prepared" => 0,
+        "copied" => 1,
+        "rewritten" => 2,
+        "switched" => 3,
+        "cleaned" => 4,
+        _ => 0,
+    }
+}
+
+fn copy_runtime_migration_contents(journal: &RuntimeMigrationJournal) -> Result<(), String> {
+    for (source, target) in runtime_migration_copy_pairs(journal) {
+        copy_directory_contents_preserving_source(&source, &target)?;
+    }
+    Ok(())
+}
+
+fn verify_runtime_migration_contents(journal: &RuntimeMigrationJournal) -> Result<(), String> {
+    for (source, target) in runtime_migration_copy_pairs(journal) {
+        verify_directory_contents_contained(&source, &target)?;
+    }
+    Ok(())
+}
+
+fn cleanup_runtime_migration_sources(journal: &RuntimeMigrationJournal) -> Result<(), String> {
+    for (source, target) in runtime_migration_copy_pairs(journal) {
+        remove_verified_directory_contents(&source, &target)?;
+    }
+    Ok(())
+}
+
+fn rewrite_runtime_migration_paths(
+    journal: &RuntimeMigrationJournal,
+    store: &AppStore,
+) -> Result<(), String> {
+    let old_data_dir = PathBuf::from(&journal.old_data_dir);
+    let old_organizer_root = PathBuf::from(&journal.old_organizer_root);
+    let old_launchers_root = PathBuf::from(&journal.old_launchers_root);
+    let new_data_dir = PathBuf::from(&journal.new_data_dir);
+    let new_organizer_root = PathBuf::from(&journal.new_organizer_root);
+    let new_launchers_root = PathBuf::from(&journal.new_launchers_root);
+
+    match journal.target.as_str() {
+        "data" => {
+            rewrite_runtime_path_prefixes(
+                store,
+                &[
+                    (&old_data_dir, &new_data_dir),
+                    (&old_organizer_root, &new_organizer_root),
+                    (&old_launchers_root, &new_launchers_root),
+                ],
+            )?;
+            rewrite_launchers_path_prefixes(
+                store,
+                &[
+                    (&old_data_dir, &new_data_dir),
+                    (&old_launchers_root, &new_launchers_root),
+                ],
+            )?;
+            rewrite_clipboard_path_prefixes(store, &[(&old_data_dir, &new_data_dir)])?;
+            rewrite_search_history_path_prefixes(
+                store,
+                &[
+                    (&old_data_dir, &new_data_dir),
+                    (&old_organizer_root, &new_organizer_root),
+                    (&old_launchers_root, &new_launchers_root),
+                ],
+            )
+        }
+        "organizer" => {
+            rewrite_runtime_path_prefixes(store, &[(&old_organizer_root, &new_organizer_root)])?;
+            rewrite_search_history_path_prefixes(
+                store,
+                &[(&old_organizer_root, &new_organizer_root)],
+            )
+        }
+        "launchers" => {
+            rewrite_launchers_path_prefixes(store, &[(&old_launchers_root, &new_launchers_root)])?;
+            rewrite_search_history_path_prefixes(
+                store,
+                &[(&old_launchers_root, &new_launchers_root)],
+            )
+        }
+        _ => Ok(()),
+    }
+}
+
+fn runtime_migration_copy_pairs(journal: &RuntimeMigrationJournal) -> Vec<(PathBuf, PathBuf)> {
+    let old_data_dir = PathBuf::from(&journal.old_data_dir);
+    let old_organizer_root = PathBuf::from(&journal.old_organizer_root);
+    let old_launchers_root = PathBuf::from(&journal.old_launchers_root);
+    let new_data_dir = PathBuf::from(&journal.new_data_dir);
+    let new_organizer_root = PathBuf::from(&journal.new_organizer_root);
+    let new_launchers_root = PathBuf::from(&journal.new_launchers_root);
+
+    match journal.target.as_str() {
+        "data" => vec![
+            (old_data_dir, new_data_dir),
+            (old_organizer_root, new_organizer_root),
+            (old_launchers_root, new_launchers_root),
+        ],
+        "organizer" => vec![(old_organizer_root, new_organizer_root)],
+        "launchers" => vec![(old_launchers_root, new_launchers_root)],
+        _ => Vec::new(),
+    }
 }
 
 #[tauri::command]
@@ -885,7 +1299,7 @@ async fn save_desktop_window_layout(app: tauri::AppHandle, label: String) -> Res
 
         with_config_mutation(|| {
             let store = AppStore::open().map_err(to_message)?;
-            let mut config = store.load_config();
+            let mut config = store.load_config_strict().map_err(to_message)?;
             config.desktop_layout.windows.insert(
                 label,
                 DesktopWindowLayout {
@@ -968,7 +1382,7 @@ fn split_desktop_category_impl(app: &tauri::AppHandle, index: usize) -> Result<(
     let store = AppStore::open().map_err(to_message)?;
     store.ensure_runtime_dirs().map_err(to_message)?;
     let category = with_config_mutation(|| {
-        let mut config = store.load_config();
+        let mut config = store.load_config_strict().map_err(to_message)?;
         let category = config
             .desktop_categories
             .get(index)
@@ -1010,7 +1424,7 @@ fn show_split_desktop_widgets(app: &tauri::AppHandle) -> Result<Vec<usize>, Stri
     let store = AppStore::open().map_err(to_message)?;
     store.ensure_runtime_dirs().map_err(to_message)?;
     let categories = with_config_mutation(|| {
-        let mut config = store.load_config();
+        let mut config = store.load_config_strict().map_err(to_message)?;
         repair_category_item_paths(&store, &mut config)?;
         Ok(config.desktop_categories)
     })?;
@@ -1051,7 +1465,7 @@ fn show_split_desktop_widgets(app: &tauri::AppHandle) -> Result<Vec<usize>, Stri
     }
 
     with_config_mutation(|| {
-        let mut config = store.load_config();
+        let mut config = store.load_config_strict().map_err(to_message)?;
         config.desktop_layout.split_category_indices =
             normalize_desktop_split_indices(split_indices.clone(), config.desktop_categories.len());
         store.save_config(&config).map_err(to_message)
@@ -1079,7 +1493,7 @@ fn show_split_desktop_widgets(app: &tauri::AppHandle) -> Result<Vec<usize>, Stri
 fn save_desktop_split_indices_impl(indices: Vec<usize>) -> Result<Vec<usize>, String> {
     with_config_mutation(|| {
         let store = AppStore::open().map_err(to_message)?;
-        let mut config = store.load_config();
+        let mut config = store.load_config_strict().map_err(to_message)?;
         let split_indices =
             normalize_desktop_split_indices(indices, config.desktop_categories.len());
         config.desktop_layout.split_category_indices = split_indices.clone();
@@ -1091,7 +1505,7 @@ fn save_desktop_split_indices_impl(indices: Vec<usize>) -> Result<Vec<usize>, St
 fn remove_desktop_split_index(index: usize) -> Result<Vec<usize>, String> {
     with_config_mutation(|| {
         let store = AppStore::open().map_err(to_message)?;
-        let mut config = store.load_config();
+        let mut config = store.load_config_strict().map_err(to_message)?;
         let split_indices = config
             .desktop_layout
             .split_category_indices
@@ -1294,7 +1708,7 @@ fn update_clipboard_shortcut(
     with_config_mutation(|| {
         let shortcut = normalize_shortcut_input(&shortcut)?;
         let store = AppStore::open().map_err(to_message)?;
-        let mut config = store.load_config();
+        let mut config = store.load_config_strict().map_err(to_message)?;
         if config.settings.search_enabled && shortcut == config.settings.search_shortcut_value() {
             return Err("剪贴板快捷键不能和搜索快捷键相同".to_owned());
         }
@@ -1332,7 +1746,7 @@ fn update_search_settings(
         };
         let store = AppStore::open().map_err(to_message)?;
         store.ensure_runtime_dirs().map_err(to_message)?;
-        let mut config = store.load_config();
+        let mut config = store.load_config_strict().map_err(to_message)?;
 
         if enabled && shortcut == config.settings.clipboard_shortcut_value() {
             return Err("搜索快捷键不能和剪贴板快捷键相同".to_owned());
@@ -1367,7 +1781,7 @@ async fn update_launch_on_startup(enabled: bool) -> Result<AppSettings, String> 
         with_config_mutation(|| {
             let store = AppStore::open().map_err(to_message)?;
             store.ensure_runtime_dirs().map_err(to_message)?;
-            let mut config = store.load_config();
+            let mut config = store.load_config_strict().map_err(to_message)?;
             set_launch_on_startup_entry(enabled)?;
             config.settings.launch_on_startup = enabled;
             store.save_config(&config).map_err(to_message)?;
@@ -1379,19 +1793,23 @@ async fn update_launch_on_startup(enabled: bool) -> Result<AppSettings, String> 
 }
 
 fn with_config_mutation<T>(operation: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
-    let _guard = CONFIG_MUTATION_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .map_err(|_| "配置写入锁已损坏".to_owned())?;
-    operation()
+    store::with_storage_mutation(|| {
+        let _guard = CONFIG_MUTATION_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .map_err(|_| "配置写入锁已损坏".to_owned())?;
+        operation()
+    })
 }
 
 fn with_launcher_mutation<T>(operation: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
-    let _guard = LAUNCHER_MUTATION_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .map_err(|_| "快捷启动写入锁已损坏".to_owned())?;
-    operation()
+    store::with_storage_mutation(|| {
+        let _guard = LAUNCHER_MUTATION_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .map_err(|_| "快捷启动写入锁已损坏".to_owned())?;
+        operation()
+    })
 }
 
 fn mutate_categories(
@@ -1399,7 +1817,7 @@ fn mutate_categories(
 ) -> Result<(), String> {
     with_config_mutation(|| {
         let store = AppStore::open().map_err(to_message)?;
-        let mut config = store.load_config();
+        let mut config = store.load_config_strict().map_err(to_message)?;
         mutator(&mut config.desktop_categories)?;
         store.save_config(&config).map_err(to_message)
     })
@@ -1436,32 +1854,44 @@ fn restore_all_organized_items_to_desktop_impl(
     let (restored, desktop, organizer_root) = with_config_mutation(|| {
         let store = AppStore::open().map_err(to_message)?;
         store.ensure_runtime_dirs().map_err(to_message)?;
+        cleanup_startup_transfer_staging_dirs(&store);
         let desktop = user_desktop().ok_or_else(|| "没有找到桌面路径".to_owned())?;
         fs::create_dir_all(&desktop).map_err(to_message)?;
         let organizer_root = store.organizer_root();
-        let mut config = store.load_config();
+        let (mut config, config_is_writable) = match store.load_config_strict() {
+            Ok(config) => (config, true),
+            Err(error) => {
+                eprintln!("DustDesk 配置无法读取，仍将按收纳目录实物还原且不会覆盖原配置：{error}");
+                (AppConfig::default(), false)
+            }
+        };
         let total = restore_candidate_count(&config, &organizer_root, &desktop);
-        let mut restored = 0usize;
-        let mut handled_paths = Vec::<String>::new();
+        let mut seen_paths = Vec::<String>::new();
+        let mut candidates = Vec::<RestoreCandidate>::new();
 
-        for category in &mut config.desktop_categories {
+        for (category_index, category) in config.desktop_categories.iter_mut().enumerate() {
             let old_paths = std::mem::take(&mut category.item_paths);
             let mut retained_paths = Vec::new();
 
             for item_path in old_paths {
-                let source = PathBuf::from(&item_path);
+                let source = recover_existing_path_from_corrupted_text(&item_path)
+                    .unwrap_or_else(|| PathBuf::from(&item_path));
+                if is_internal_transfer_path(&source) {
+                    continue;
+                }
                 if !source.exists() {
                     continue;
                 }
 
                 if is_path_within(&source, &organizer_root) || is_path_within(&source, &desktop) {
                     let normalized = normalize_path_for_compare(&source);
-                    if !handled_paths.iter().any(|path| path == &normalized) {
-                        let restored_path = restore_path_to_desktop_silent(&source, &desktop)?;
-                        handled_paths.push(normalized);
-                        handled_paths.push(normalize_path_for_compare(&restored_path));
-                        restored += 1;
-                        on_progress(restored, total, &restored_path);
+                    if !seen_paths.iter().any(|path| path == &normalized) {
+                        seen_paths.push(normalized);
+                        candidates.push(RestoreCandidate {
+                            source,
+                            original_config_path: Some(item_path),
+                            category_index: Some(category_index),
+                        });
                     }
                 } else {
                     // External references are not migrated desktop items, so do not move them on exit.
@@ -1477,25 +1907,95 @@ fn restore_all_organized_items_to_desktop_impl(
                 continue;
             }
             let normalized = normalize_path_for_compare(&path);
-            if handled_paths.iter().any(|item| item == &normalized) {
+            if seen_paths.iter().any(|item| item == &normalized) {
                 continue;
             }
-            let restored_path = restore_path_to_desktop_silent(&path, &desktop)?;
-            handled_paths.push(normalized);
-            handled_paths.push(normalize_path_for_compare(&restored_path));
-            restored += 1;
-            on_progress(restored, total, &restored_path);
+            seen_paths.push(normalized);
+            candidates.push(RestoreCandidate {
+                source: path,
+                original_config_path: None,
+                category_index: None,
+            });
         }
+
+        let worker_count = desktop_operation_worker_count(candidates.len());
+        let queue = Arc::new(Mutex::new(VecDeque::from(candidates)));
+        let (sender, receiver) = mpsc::channel();
+        let mut restored = 0usize;
+
+        std::thread::scope(|scope| -> Result<(), String> {
+            for _ in 0..worker_count {
+                let queue = Arc::clone(&queue);
+                let sender = sender.clone();
+                let desktop = desktop.clone();
+                scope.spawn(move || loop {
+                    let candidate = match queue.lock() {
+                        Ok(mut queue) => queue.pop_front(),
+                        Err(_) => {
+                            let _ = sender.send(Err("还原任务队列已损坏".to_owned()));
+                            return;
+                        }
+                    };
+                    let Some(candidate) = candidate else {
+                        return;
+                    };
+                    let result = restore_path_to_desktop_silent(&candidate.source, &desktop);
+                    if sender.send(Ok((candidate, result))).is_err() {
+                        return;
+                    }
+                });
+            }
+            drop(sender);
+
+            for message in receiver {
+                let (candidate, restore_result) = match message {
+                    Ok(value) => value,
+                    Err(error) => {
+                        eprintln!("failed to restore desktop item: {error}");
+                        continue;
+                    }
+                };
+
+                match restore_result {
+                    Ok(restored_path) => {
+                        restored += 1;
+                        on_progress(restored, total, &restored_path);
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "failed to restore desktop item {}: {error}",
+                            candidate.source.display()
+                        );
+                        if let (Some(category_index), Some(original_path)) =
+                            (candidate.category_index, candidate.original_config_path)
+                        {
+                            if let Some(category) =
+                                config.desktop_categories.get_mut(category_index)
+                            {
+                                push_unique_text_path(&mut category.item_paths, original_path);
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })?;
 
         cleanup_empty_organizer_dirs(&organizer_root);
         config.desktop_layout.split_category_indices.clear();
-        store.save_config(&config).map_err(to_message)?;
+        if config_is_writable {
+            store.save_config(&config).map_err(to_message)?;
+        }
         Ok((restored, desktop, organizer_root))
     })?;
 
     if restored > 0 {
-        notify_shell_directory_updated(&desktop);
-        notify_shell_directory_updated(&organizer_root);
+        std::thread::spawn(move || {
+            cleanup_stale_transfer_staging_dirs(&desktop, Duration::ZERO);
+            cleanup_stale_transfer_staging_dirs(&organizer_root, Duration::ZERO);
+            notify_shell_directory_updated(&desktop);
+            notify_shell_directory_updated(&organizer_root);
+        });
     }
 
     Ok(restored)
@@ -1505,7 +2005,11 @@ fn restore_candidate_count(config: &AppConfig, organizer_root: &Path, desktop: &
     let mut seen = Vec::<String>::new();
     for category in &config.desktop_categories {
         for item_path in &category.item_paths {
-            let source = PathBuf::from(item_path);
+            let source = recover_existing_path_from_corrupted_text(item_path)
+                .unwrap_or_else(|| PathBuf::from(item_path));
+            if is_internal_transfer_path(&source) {
+                continue;
+            }
             if !source.exists() {
                 continue;
             }
@@ -1541,6 +2045,53 @@ fn restore_progress_message(current: usize, total: usize, path: &Path) -> String
     }
 }
 
+fn classify_progress_message(current: usize, total: usize, path: &Path) -> String {
+    let name = display_path_name(path);
+    if total > 0 {
+        format!("正在收纳 {current}/{total}：{name}")
+    } else {
+        format!("正在收纳：{name}")
+    }
+}
+
+fn desktop_operation_worker_count(total: usize) -> usize {
+    if total <= 1 {
+        return total;
+    }
+    std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(2)
+        .clamp(1, 4)
+        .min(total)
+}
+
+fn estimate_transfer_work(path: &Path) -> u64 {
+    const ENTRY_OVERHEAD: u64 = 64 * 1024;
+
+    let mut score = 0u64;
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        score = score.saturating_add(ENTRY_OVERHEAD);
+        let Ok(metadata) = fs::symlink_metadata(&current) else {
+            continue;
+        };
+        if metadata.is_file() {
+            score = score.saturating_add(metadata.len());
+            continue;
+        }
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata_is_reparse_point(&metadata)
+        {
+            continue;
+        }
+        if let Ok(entries) = fs::read_dir(&current) {
+            pending.extend(entries.flatten().map(|entry| entry.path()));
+        }
+    }
+    score.max(1)
+}
+
 fn restore_path_to_desktop(source: &Path, desktop: &Path) -> Result<PathBuf, String> {
     restore_path_to_desktop_impl(source, desktop, true)
 }
@@ -1564,19 +2115,31 @@ fn restore_path_to_desktop_impl(
 
     let existing_desktop_item = desktop.join(file_name);
     if existing_desktop_item.exists() {
-        if !same_path_text(
+        if same_path_text(
             &source.display().to_string(),
             &existing_desktop_item.display().to_string(),
         ) {
-            remove_existing_path(source)?;
+            if notify_shell {
+                notify_shell_desktop_restore(&existing_desktop_item, desktop);
+            }
+            return Ok(existing_desktop_item);
+        }
+
+        if remove_duplicate_path_if_identical(source, &existing_desktop_item)? {
             if notify_shell {
                 notify_shell_path_removed(source);
+                notify_shell_desktop_restore(&existing_desktop_item, desktop);
             }
+            return Ok(existing_desktop_item);
         }
+
+        let destination = unique_destination(desktop, source);
+        move_path(source, &destination)?;
         if notify_shell {
-            notify_shell_desktop_restore(&existing_desktop_item, desktop);
+            notify_shell_path_removed(source);
+            notify_shell_desktop_restore(&destination, desktop);
         }
-        return Ok(existing_desktop_item);
+        return Ok(destination);
     }
 
     if is_path_within(source, desktop) {
@@ -1593,6 +2156,23 @@ fn restore_path_to_desktop_impl(
         notify_shell_desktop_restore(&destination, desktop);
     }
     Ok(destination)
+}
+
+fn remove_duplicate_path_if_identical(source: &Path, existing: &Path) -> Result<bool, String> {
+    let locked_source = match lock_transfer_source_tree(source) {
+        Ok(locked) => locked,
+        Err(_) => return Ok(false),
+    };
+    let _locked_existing = match lock_transfer_source_tree(existing) {
+        Ok(locked) => locked,
+        Err(_) => return Ok(false),
+    };
+    if verify_copied_path(source, existing).is_err() {
+        return Ok(false);
+    }
+
+    delete_locked_source_tree(locked_source)?;
+    Ok(true)
 }
 
 fn notify_shell_desktop_restore(path: &Path, desktop: &Path) {
@@ -2044,12 +2624,18 @@ fn organizer_contents(root: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
+        if is_internal_transfer_path(&path) {
+            continue;
+        }
         if path.is_dir() {
             let Ok(children) = fs::read_dir(&path) else {
                 continue;
             };
             for child in children.flatten() {
-                paths.push(child.path());
+                let child_path = child.path();
+                if !is_internal_transfer_path(&child_path) {
+                    paths.push(child_path);
+                }
             }
         } else {
             paths.push(path);
@@ -2285,7 +2871,7 @@ fn desktop_items(include_icons: bool) -> Vec<DesktopItem> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if is_desktop_ini_path(&path) {
+            if is_desktop_ini_path(&path) || is_internal_transfer_path(&path) {
                 continue;
             }
             let key = path.to_string_lossy().to_lowercase();
@@ -2351,14 +2937,208 @@ fn validate_runtime_directory_target(
         return Err("新目录不能设置在原目录内部，请选择原目录外的位置后再迁移".to_owned());
     }
 
+    if target == "data"
+        && (paths_overlap(&old_store.data_dir(), &old_store.organizer_root())
+            || paths_overlap(&old_store.data_dir(), &old_store.launchers_root()))
+    {
+        return Err(
+            "当前收纳或快捷启动目录位于 Data 内部，请先分别迁移到独立目录，再迁移 Data".to_owned(),
+        );
+    }
+
+    let mut prospective_roots = [
+        old_store.data_dir(),
+        old_store.organizer_root(),
+        old_store.launchers_root(),
+    ];
+    prospective_roots[match target {
+        "data" => 0,
+        "organizer" => 1,
+        "launchers" => 2,
+        _ => return Ok(()),
+    }] = requested_path.to_path_buf();
+    for left in 0..prospective_roots.len() {
+        for right in (left + 1)..prospective_roots.len() {
+            if paths_overlap(&prospective_roots[left], &prospective_roots[right]) {
+                return Err(format!(
+                    "Data、DesktopOrganizer、Launchers 必须使用互不包含的独立目录：{} 与 {}",
+                    prospective_roots[left].display(),
+                    prospective_roots[right].display()
+                ));
+            }
+        }
+    }
+
     Ok(())
 }
 
-fn move_directory_contents(source: &Path, target: &Path) -> Result<(), String> {
-    if !source.exists() {
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    same_path_for_move(left, right)
+        || is_target_inside_source(left, right)
+        || is_target_inside_source(right, left)
+}
+
+fn copy_directory_contents_preserving_source(source: &Path, target: &Path) -> Result<(), String> {
+    let source_metadata = match fs::symlink_metadata(source) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(to_message(error)),
+    };
+    validate_transfer_metadata(source, &source_metadata)?;
+    if !source_metadata.is_dir() {
+        return Err(format!("源路径不是目录：{}", source.display()));
+    }
+    if same_path_for_move(source, target) {
         return Ok(());
     }
-    if !source.is_dir() {
+    if is_target_inside_source(source, target) {
+        return Err("新目录不能设置在原目录内部，请选择原目录外的位置后再迁移".to_owned());
+    }
+
+    match fs::symlink_metadata(target) {
+        Ok(metadata) => {
+            validate_transfer_metadata(target, &metadata)?;
+            if !metadata.is_dir() {
+                return Err(format!("目标路径不是目录：{}", target.display()));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(target).map_err(to_message)?;
+        }
+        Err(error) => return Err(to_message(error)),
+    }
+
+    for entry in fs::read_dir(source).map_err(to_message)? {
+        let entry = entry.map_err(to_message)?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        let source_metadata = fs::symlink_metadata(&source_path).map_err(to_message)?;
+        validate_transfer_metadata(&source_path, &source_metadata)?;
+
+        match fs::symlink_metadata(&target_path) {
+            Ok(target_metadata) => {
+                validate_transfer_metadata(&target_path, &target_metadata)?;
+                if source_metadata.is_dir() && target_metadata.is_dir() {
+                    copy_directory_contents_preserving_source(&source_path, &target_path)?;
+                    continue;
+                }
+                let _source_lock = lock_transfer_source_tree(&source_path)?;
+                let _target_lock = lock_transfer_source_tree(&target_path)?;
+                verify_copied_path(&source_path, &target_path).map_err(|_| {
+                    format!(
+                        "迁移目标存在不同内容，已保留源项目：{} -> {}",
+                        source_path.display(),
+                        target_path.display()
+                    )
+                })?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                copy_path_via_staging(&source_path, &target_path)?;
+            }
+            Err(error) => return Err(to_message(error)),
+        }
+    }
+
+    Ok(())
+}
+
+fn verify_directory_contents_contained(source: &Path, target: &Path) -> Result<(), String> {
+    if same_path_for_move(source, target) {
+        return Ok(());
+    }
+    let source_metadata = fs::symlink_metadata(source).map_err(to_message)?;
+    let target_metadata = fs::symlink_metadata(target).map_err(to_message)?;
+    validate_transfer_metadata(source, &source_metadata)?;
+    validate_transfer_metadata(target, &target_metadata)?;
+    if !source_metadata.is_dir() || !target_metadata.is_dir() {
+        return Err(format!(
+            "运行目录迁移校验失败：{} 或 {} 不是目录",
+            source.display(),
+            target.display()
+        ));
+    }
+
+    for entry in fs::read_dir(source).map_err(to_message)? {
+        let entry = entry.map_err(to_message)?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        let source_metadata = fs::symlink_metadata(&source_path).map_err(to_message)?;
+        let target_metadata = fs::symlink_metadata(&target_path).map_err(|error| {
+            format!(
+                "运行目录迁移校验失败，目标缺少 {}：{}",
+                source_path.display(),
+                error
+            )
+        })?;
+        validate_transfer_metadata(&source_path, &source_metadata)?;
+        validate_transfer_metadata(&target_path, &target_metadata)?;
+        if source_metadata.is_dir() && target_metadata.is_dir() {
+            verify_directory_contents_contained(&source_path, &target_path)?;
+            continue;
+        }
+
+        let _source_lock = lock_transfer_source_tree(&source_path)?;
+        let _target_lock = lock_transfer_source_tree(&target_path)?;
+        verify_copied_path(&source_path, &target_path)?;
+    }
+
+    Ok(())
+}
+
+fn remove_verified_directory_contents(source: &Path, target: &Path) -> Result<(), String> {
+    if same_path_for_move(source, target) || !source.exists() {
+        return Ok(());
+    }
+    if is_target_inside_source(source, target) {
+        return Err("不能从源目录内部清理运行目录迁移副本".to_owned());
+    }
+
+    for entry in fs::read_dir(source).map_err(to_message)? {
+        let entry = entry.map_err(to_message)?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        let source_metadata = fs::symlink_metadata(&source_path).map_err(to_message)?;
+        let target_metadata = fs::symlink_metadata(&target_path).map_err(|error| {
+            format!(
+                "新目录缺少已迁移项目，已保留旧目录 {}：{}",
+                source_path.display(),
+                error
+            )
+        })?;
+        validate_transfer_metadata(&source_path, &source_metadata)?;
+        validate_transfer_metadata(&target_path, &target_metadata)?;
+
+        if source_metadata.is_dir() && target_metadata.is_dir() {
+            remove_verified_directory_contents(&source_path, &target_path)?;
+            continue;
+        }
+
+        let locked_source = lock_transfer_source_tree(&source_path)?;
+        let _locked_target = lock_transfer_source_tree(&target_path)?;
+        verify_copied_path(&source_path, &target_path)?;
+        delete_locked_source_tree(locked_source)?;
+    }
+
+    match fs::remove_dir(source) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "新目录已启用，但旧目录仍有未迁移内容，已保留 {}：{}",
+            source.display(),
+            error
+        )),
+    }
+}
+
+#[cfg(test)]
+fn move_directory_contents(source: &Path, target: &Path) -> Result<(), String> {
+    let source_metadata = match fs::symlink_metadata(source) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(to_message(error)),
+    };
+    validate_transfer_metadata(source, &source_metadata)?;
+    if !source_metadata.is_dir() {
         return Err(format!("源路径不是目录：{}", source.display()));
     }
 
@@ -2368,145 +3148,177 @@ fn move_directory_contents(source: &Path, target: &Path) -> Result<(), String> {
     if is_target_inside_source(source, target) {
         return Err("新目录不能设置在原目录内部，请选择原目录外的位置后再迁移".to_owned());
     }
-    fs::create_dir_all(target).map_err(to_message)?;
+    match fs::symlink_metadata(target) {
+        Ok(metadata) => {
+            validate_transfer_metadata(target, &metadata)?;
+            if !metadata.is_dir() {
+                return Err(format!("目标路径不是目录：{}", target.display()));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(target).map_err(to_message)?;
+            let metadata = fs::symlink_metadata(target).map_err(to_message)?;
+            validate_transfer_metadata(target, &metadata)?;
+        }
+        Err(error) => return Err(to_message(error)),
+    }
 
-    for entry in fs::read_dir(source).map_err(to_message)?.flatten() {
+    for entry in fs::read_dir(source).map_err(to_message)? {
+        let entry = entry.map_err(to_message)?;
         let source_path = entry.path();
         let Some(file_name) = source_path.file_name() else {
             continue;
         };
         let target_path = target.join(file_name);
+        let source_metadata = fs::symlink_metadata(&source_path).map_err(to_message)?;
+        validate_transfer_metadata(&source_path, &source_metadata)?;
 
-        if target_path.exists() {
-            if source_path.is_dir() && target_path.is_dir() {
-                move_directory_contents(&source_path, &target_path)?;
-                let _ = fs::remove_dir(&source_path);
+        match fs::symlink_metadata(&target_path) {
+            Ok(target_metadata) => {
+                validate_transfer_metadata(&target_path, &target_metadata)?;
+                if source_metadata.is_dir() && target_metadata.is_dir() {
+                    move_directory_contents(&source_path, &target_path)?;
+                    continue;
+                }
+                return Err(format!(
+                    "迁移目标已存在，已保留源项目：{} -> {}",
+                    source_path.display(),
+                    target_path.display()
+                ));
             }
-            continue;
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(to_message(error)),
         }
 
-        match fs::rename(&source_path, &target_path) {
-            Ok(()) => {}
-            Err(_) if source_path.is_dir() => {
-                move_directory_contents(&source_path, &target_path)?;
-                let _ = fs::remove_dir(&source_path);
-            }
-            Err(error) => {
-                fs::copy(&source_path, &target_path).map_err(to_message)?;
-                fs::remove_file(&source_path).map_err(|remove_error| {
-                    format!(
-                        "已复制到新目录，但删除原文件失败：{}；原始移动错误：{}",
-                        remove_error, error
-                    )
-                })?;
-            }
-        }
+        move_path(&source_path, &target_path)?;
     }
 
-    let _ = fs::remove_dir(source);
-    Ok(())
+    match fs::remove_dir(source) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "迁移后源目录仍有未处理内容，已保留该目录 {}：{}",
+            source.display(),
+            error
+        )),
+    }
 }
 
 fn same_path_for_move(left: &Path, right: &Path) -> bool {
-    normalize_path_for_compare(left) == normalize_path_for_compare(right)
+    normalize_resolved_path_for_compare(left) == normalize_resolved_path_for_compare(right)
 }
 
 fn is_target_inside_source(source: &Path, target: &Path) -> bool {
-    let source_key = normalize_path_for_compare(source);
-    let target_key = normalize_path_for_compare(target);
+    let source_key = normalize_resolved_path_for_compare(source);
+    let target_key = normalize_resolved_path_for_compare(target);
     !source_key.is_empty()
         && source_key != target_key
         && target_key.starts_with(&format!("{source_key}\\"))
+}
+
+fn normalize_resolved_path_for_compare(path: &Path) -> String {
+    let mut existing = path.to_path_buf();
+    let mut missing_names = Vec::new();
+    loop {
+        if let Ok(mut resolved) = existing.canonicalize() {
+            for name in missing_names.iter().rev() {
+                resolved.push(name);
+            }
+            return normalize_path_for_compare(&resolved);
+        }
+
+        let Some(name) = existing.file_name().map(|name| name.to_os_string()) else {
+            return normalize_path_for_compare(path);
+        };
+        missing_names.push(name);
+        if !existing.pop() {
+            return normalize_path_for_compare(path);
+        }
+    }
 }
 
 fn rewrite_runtime_path_prefixes(
     store: &AppStore,
     replacements: &[(&PathBuf, &PathBuf)],
 ) -> Result<(), String> {
-    with_config_mutation(|| {
-        let mut config = store.load_config();
-        let mut changed = false;
+    let mut config = store.load_config_strict().map_err(to_message)?;
+    let mut changed = false;
 
-        for category in &mut config.desktop_categories {
-            for item_path in &mut category.item_paths {
-                if let Some(next_path) = rewrite_path_prefix(item_path, replacements) {
-                    *item_path = next_path;
-                    changed = true;
-                }
-            }
-        }
-
-        for search_path in &mut config.settings.search_paths {
-            if let Some(next_path) = rewrite_path_prefix(search_path, replacements) {
-                *search_path = next_path;
+    for category in &mut config.desktop_categories {
+        for item_path in &mut category.item_paths {
+            if let Some(next_path) = rewrite_path_prefix(item_path, replacements) {
+                *item_path = next_path;
                 changed = true;
             }
         }
+    }
 
-        if changed {
-            store.save_config(&config).map_err(to_message)?;
+    for search_path in &mut config.settings.search_paths {
+        if let Some(next_path) = rewrite_path_prefix(search_path, replacements) {
+            *search_path = next_path;
+            changed = true;
         }
+    }
 
-        Ok(())
-    })
+    if changed {
+        store.save_config(&config).map_err(to_message)?;
+    }
+
+    Ok(())
 }
 
 fn rewrite_launchers_path_prefixes(
     store: &AppStore,
     replacements: &[(&PathBuf, &PathBuf)],
 ) -> Result<(), String> {
-    with_launcher_mutation(|| {
-        let mut launchers = store.load_launchers();
-        let mut changed = false;
+    let mut launchers = store.load_launchers_strict().map_err(to_message)?;
+    let mut changed = false;
 
-        for item in &mut launchers.items {
-            if let Some(next_path) = rewrite_path_prefix(&item.path, replacements) {
-                item.path = next_path;
-                item.icon_data_url = None;
-                changed = true;
-            }
+    for item in &mut launchers.items {
+        if let Some(next_path) = rewrite_path_prefix(&item.path, replacements) {
+            item.path = next_path;
+            item.icon_data_url = None;
+            changed = true;
         }
+    }
 
-        if changed {
-            store.save_launchers(&launchers).map_err(to_message)?;
-        }
+    if changed {
+        store.save_launchers(&launchers).map_err(to_message)?;
+    }
 
-        Ok(())
-    })
+    Ok(())
 }
 
 fn rewrite_clipboard_path_prefixes(
     store: &AppStore,
     replacements: &[(&PathBuf, &PathBuf)],
 ) -> Result<(), String> {
-    clipboard_bridge::with_clipboard_history_lock(|| {
-        let mut clipboard = store.load_clipboard();
-        let mut changed = false;
+    let mut clipboard = store.load_clipboard_strict().map_err(to_message)?;
+    let mut changed = false;
 
-        for item in &mut clipboard.items {
-            if let Some(next_path) = rewrite_path_prefix(&item.image_path, replacements) {
-                item.image_path = next_path;
-                changed = true;
-            }
-            if let Some(next_path) = rewrite_path_prefix(&item.image_thumb_path, replacements) {
-                item.image_thumb_path = next_path;
-                changed = true;
-            }
+    for item in &mut clipboard.items {
+        if let Some(next_path) = rewrite_path_prefix(&item.image_path, replacements) {
+            item.image_path = next_path;
+            changed = true;
         }
-
-        if changed {
-            store.save_clipboard(&clipboard).map_err(to_message)?;
+        if let Some(next_path) = rewrite_path_prefix(&item.image_thumb_path, replacements) {
+            item.image_thumb_path = next_path;
+            changed = true;
         }
+    }
 
-        Ok(())
-    })
+    if changed {
+        store.save_clipboard(&clipboard).map_err(to_message)?;
+    }
+
+    Ok(())
 }
 
 fn rewrite_search_history_path_prefixes(
     store: &AppStore,
     replacements: &[(&PathBuf, &PathBuf)],
 ) -> Result<(), String> {
-    let mut history = store.load_search_history();
+    let mut history = store.load_search_history_strict().map_err(to_message)?;
     let mut changed = false;
 
     for item in &mut history.items {
@@ -2534,15 +3346,34 @@ fn rewrite_path_prefix(path_text: &str, replacements: &[(&PathBuf, &PathBuf)]) -
             continue;
         }
 
-        if let Ok(relative) = path.strip_prefix(old_root) {
+        if let Some(relative) = strip_path_prefix_case_insensitive(&path, old_root) {
             return Some(new_root.join(relative).display().to_string());
-        }
-
-        if let Some(file_name) = path.file_name() {
-            return Some(new_root.join(file_name).display().to_string());
         }
     }
     None
+}
+
+fn strip_path_prefix_case_insensitive(path: &Path, root: &Path) -> Option<PathBuf> {
+    let path_components = path.components().collect::<Vec<_>>();
+    let root_components = root.components().collect::<Vec<_>>();
+    if root_components.len() > path_components.len()
+        || !root_components
+            .iter()
+            .zip(&path_components)
+            .all(|(left, right)| {
+                left.as_os_str()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
+            })
+    {
+        return None;
+    }
+
+    let mut relative = PathBuf::new();
+    for component in &path_components[root_components.len()..] {
+        relative.push(component.as_os_str());
+    }
+    Some(relative)
 }
 
 fn same_path_text(left: &str, right: &str) -> bool {
@@ -2556,6 +3387,10 @@ fn is_desktop_ini_path(path: &Path) -> bool {
 }
 
 fn should_skip_desktop_classify_item(item: &DesktopItem) -> bool {
+    if is_internal_transfer_path(Path::new(&item.path)) {
+        return true;
+    }
+
     let name = item.name.trim();
     let lower_name = name.to_lowercase();
     let extension = item.extension.trim().to_lowercase();
@@ -2796,36 +3631,66 @@ fn has_any(value: &str, keywords: &[&str]) -> bool {
 fn archive_item_path(store: &AppStore, category_name: &str, path: &str) -> Result<String, String> {
     let source = PathBuf::from(path);
     if !source.exists() {
-        return Ok(path.to_owned());
+        return Err(format!("源项目不存在：{}", source.display()));
     }
 
     let organizer_root = store.organizer_root();
-    let is_organizer_item = is_path_within(&source, &organizer_root);
-    if !is_desktop_child(&source) && !is_organizer_item {
-        return Ok(path.to_owned());
-    }
-
     let category_dir = organizer_root.join(safe_windows_file_name(category_name));
-    fs::create_dir_all(&category_dir).map_err(to_message)?;
+    validate_archive_source(store, &source, &organizer_root, &category_dir)?;
     if is_path_within(&source, &category_dir) {
         return Ok(path.to_owned());
     }
+    fs::create_dir_all(&category_dir).map_err(to_message)?;
 
-    let file_name = source
-        .file_name()
-        .ok_or_else(|| "无法识别项目名称".to_owned())?;
-    let destination = category_dir.join(file_name);
-    if destination.exists() {
-        if !same_path_text(path, &destination.display().to_string()) {
-            remove_existing_path(&source)?;
-            notify_shell_path_removed(&source);
+    for _ in 0..1000 {
+        let destination = archive_destination(&category_dir, &source)?;
+        match move_path(&source, &destination) {
+            Ok(()) => {
+                notify_shell_path_moved(&source, &destination);
+                return Ok(destination.display().to_string());
+            }
+            Err(error) if error.contains("目标项目已存在") => continue,
+            Err(error) => return Err(error),
         }
-        return Ok(destination.display().to_string());
     }
 
-    move_path(&source, &destination)?;
-    notify_shell_path_moved(&source, &destination);
-    Ok(destination.display().to_string())
+    Err(format!("无法生成可用的收纳目标名称：{}", source.display()))
+}
+
+fn validate_archive_source(
+    store: &AppStore,
+    source: &Path,
+    organizer_root: &Path,
+    category_dir: &Path,
+) -> Result<(), String> {
+    let protected_roots = [
+        store.data_dir(),
+        organizer_root.to_path_buf(),
+        store.launchers_root(),
+    ];
+    if protected_roots
+        .iter()
+        .any(|root| same_path_for_move(source, root))
+        || desktop_roots()
+            .iter()
+            .any(|root| same_path_for_move(source, root))
+    {
+        return Err(format!(
+            "不能收纳系统或 DustDesk 结构目录：{}",
+            source.display()
+        ));
+    }
+    if same_path_for_move(source, category_dir) || is_target_inside_source(source, category_dir) {
+        return Err(format!("不能把目录迁移到其自身内部：{}", source.display()));
+    }
+    Ok(())
+}
+
+fn archive_destination(category_dir: &Path, source: &Path) -> Result<PathBuf, String> {
+    source
+        .file_name()
+        .ok_or_else(|| "无法识别项目名称".to_owned())?;
+    Ok(unique_destination(category_dir, source))
 }
 
 fn repair_category_item_paths(store: &AppStore, config: &mut AppConfig) -> Result<(), String> {
@@ -2839,8 +3704,9 @@ fn repair_category_item_paths(store: &AppStore, config: &mut AppConfig) -> Resul
         let category_name = category.name.clone();
 
         for item_path in old_paths {
-            let source = PathBuf::from(&item_path);
-            if is_desktop_ini_path(&source) {
+            let source = recover_existing_path_from_corrupted_text(&item_path)
+                .unwrap_or_else(|| PathBuf::from(&item_path));
+            if is_desktop_ini_path(&source) || is_internal_transfer_path(&source) {
                 changed = true;
                 continue;
             }
@@ -2848,12 +3714,15 @@ fn repair_category_item_paths(store: &AppStore, config: &mut AppConfig) -> Resul
                 changed = true;
                 continue;
             }
+            if !same_path_text(&item_path, &source.display().to_string()) {
+                changed = true;
+            }
 
             let repaired_text =
                 if is_desktop_child(&source) && !is_path_within(&source, &organizer_root) {
-                    archive_item_path(store, &category_name, &item_path)?
+                    archive_item_path(store, &category_name, &source.display().to_string())?
                 } else {
-                    item_path
+                    source.display().to_string()
                 };
 
             if !same_path_text(&source.display().to_string(), &repaired_text) {
@@ -2881,7 +3750,7 @@ fn repair_category_item_paths(store: &AppStore, config: &mut AppConfig) -> Resul
 
         for entry in entries.flatten() {
             let path = entry.path();
-            if is_desktop_ini_path(&path) {
+            if is_desktop_ini_path(&path) || is_internal_transfer_path(&path) {
                 continue;
             }
 
@@ -2915,6 +3784,30 @@ fn push_unique_text_path(paths: &mut Vec<String>, path: String) -> bool {
     }
 }
 
+fn recover_existing_path_from_corrupted_text(path_text: &str) -> Option<PathBuf> {
+    let direct = PathBuf::from(path_text);
+    if direct.exists() {
+        return Some(direct);
+    }
+
+    let lower = path_text.to_ascii_lowercase();
+    for extension in [".lnk", ".url", ".exe", ".bat", ".cmd", ".ps1", ".msi"] {
+        let Some(index) = lower.find(extension) else {
+            continue;
+        };
+        let end = index + extension.len();
+        if end >= path_text.len() {
+            continue;
+        }
+        let candidate = PathBuf::from(&path_text[..end]);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
 fn is_desktop_child(path: &Path) -> bool {
     desktop_roots()
         .iter()
@@ -2928,10 +3821,19 @@ fn is_path_within(path: &Path, root: &Path) -> bool {
 }
 
 fn normalize_path_for_compare(path: &Path) -> String {
-    path.to_string_lossy()
+    let normalized = path
+        .to_string_lossy()
         .replace('/', "\\")
         .trim_end_matches('\\')
-        .to_ascii_lowercase()
+        .to_owned();
+    let without_extended_prefix = if let Some(rest) = normalized.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = normalized.strip_prefix(r"\\?\") {
+        rest.to_owned()
+    } else {
+        normalized
+    };
+    without_extended_prefix.to_ascii_lowercase()
 }
 
 fn safe_windows_file_name(value: &str) -> String {
@@ -2992,16 +3894,1399 @@ fn unique_destination(destination_dir: &Path, source: &Path) -> PathBuf {
 }
 
 fn move_path(source: &Path, destination: &Path) -> Result<(), String> {
-    if fs::rename(source, destination).is_ok() {
+    if same_path_for_move(source, destination) {
+        return Ok(());
+    }
+    if !source.exists() {
+        return Err(format!("源项目不存在：{}", source.display()));
+    }
+    if is_target_inside_source(source, destination) {
+        return Err(format!(
+            "不能把目录迁移到其自身内部：{} -> {}",
+            source.display(),
+            destination.display()
+        ));
+    }
+    if destination.exists() {
+        return Err(format!("目标项目已存在：{}", destination.display()));
+    }
+    validate_transfer_source_tree(source)?;
+
+    if rename_path_no_replace(source, destination).is_ok() {
+        return Ok(());
+    }
+    if destination.exists() {
+        return Err(format!("目标项目已存在：{}", destination.display()));
+    }
+
+    move_path_via_staging(source, destination)
+}
+
+fn move_path_via_staging(source: &Path, destination: &Path) -> Result<(), String> {
+    if source.is_dir() {
+        transfer_path_via_staging_with_verifier(source, destination, true, |_, _| Ok(()))
+    } else {
+        transfer_path_via_staging_with_verifier(source, destination, true, verify_copied_path)
+    }
+}
+
+#[cfg(test)]
+fn move_path_via_staging_with_verifier(
+    source: &Path,
+    destination: &Path,
+    verifier: impl FnOnce(&Path, &Path) -> Result<(), String>,
+) -> Result<(), String> {
+    transfer_path_via_staging_with_verifier(source, destination, true, verifier)
+}
+
+fn copy_path_via_staging(source: &Path, destination: &Path) -> Result<(), String> {
+    transfer_path_via_staging_with_verifier(source, destination, false, verify_copied_path)
+}
+
+fn transfer_path_via_staging_with_verifier(
+    source: &Path,
+    destination: &Path,
+    remove_source: bool,
+    verifier: impl FnOnce(&Path, &Path) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut quarantine = if cfg!(windows) && remove_source && source.is_dir() {
+        Some(QuarantinedTransferSource::reserve(source, destination)?)
+    } else {
+        None
+    };
+    let transfer_source = quarantine
+        .as_ref()
+        .map(|item| item.payload.clone())
+        .unwrap_or_else(|| source.to_path_buf());
+    let result = transfer_reserved_path_via_staging(
+        &transfer_source,
+        destination,
+        remove_source,
+        quarantine.as_mut(),
+        verifier,
+    );
+
+    if let Some(quarantine) = quarantine.as_mut() {
+        if result.is_err() && !quarantine.destination_committed {
+            if let Err(restore_error) = quarantine.restore() {
+                return Err(format!(
+                    "{}；隔离源目录恢复失败：{restore_error}",
+                    result.expect_err("checked transfer error")
+                ));
+            }
+        } else if quarantine.source_deleted {
+            if let Err(error) = quarantine.cleanup_metadata() {
+                eprintln!(
+                    "failed to cleanup committed transfer quarantine {}: {error}",
+                    quarantine.container.display()
+                );
+            }
+        }
+    }
+    result
+}
+
+fn transfer_reserved_path_via_staging(
+    source: &Path,
+    destination: &Path,
+    remove_source: bool,
+    mut quarantine: Option<&mut QuarantinedTransferSource>,
+    verifier: impl FnOnce(&Path, &Path) -> Result<(), String>,
+) -> Result<(), String> {
+    let locked_source = lock_transfer_source_tree(source)?;
+    let mut reserved_staging = reserve_transfer_staging_path(source, destination)?;
+    let staging = reserved_staging.path.clone();
+    let mut staging_commit_root = None;
+    let mut committed = false;
+    let transfer_result = (|| {
+        if source.is_dir() {
+            copy_directory_for_transfer(source, &staging)
+                .map_err(|error| format!("复制目录到临时位置失败：{error}"))?;
+            drop(reserved_staging.root.take());
+            reserved_staging.root =
+                Some(open_reserved_transfer_directory(&staging).map_err(|error| {
+                    format!("重新锁定临时目录失败 {}：{error}", staging.display())
+                })?);
+        } else if source.is_file() {
+            copy_file_contents(source, &staging)?;
+            reserved_staging.root =
+                Some(open_reserved_transfer_file(&staging).map_err(to_message)?);
+        } else {
+            return Err(format!("不支持移动此项目：{}", source.display()));
+        }
+
+        verifier(source, &staging)?;
+        verify_copied_path_shape(source, &staging)
+            .map_err(|error| format!("迁移结构校验失败：{error}"))?;
+        staging_commit_root = reserved_staging.root.take();
+        commit_staging_handle_no_replace(
+            staging_commit_root
+                .as_ref()
+                .ok_or_else(|| "无法锁定临时迁移项目".to_owned())?,
+            &staging,
+            destination,
+        )
+        .map_err(|error| format!("提交临时迁移目录失败：{error}"))?;
+        committed = true;
+        if remove_source {
+            if let Some(quarantine) = quarantine.as_deref_mut() {
+                quarantine.destination_committed = true;
+                if let Err(error) = quarantine.mark_committed() {
+                    eprintln!(
+                        "failed to persist committed transfer marker for {}: {error}",
+                        quarantine.original.display()
+                    );
+                    drop(locked_source);
+                    return Ok(());
+                }
+                #[cfg(test)]
+                {
+                    if let Err(error) = quarantine.mark_cleanup_started() {
+                        eprintln!(
+                            "failed to persist transfer cleanup marker for {}: {error}",
+                            quarantine.original.display()
+                        );
+                        drop(locked_source);
+                    } else {
+                        match delete_locked_source_tree(locked_source) {
+                            Ok(()) => quarantine.source_deleted = true,
+                            Err(error) => eprintln!(
+                                "committed transfer source cleanup deferred for {}: {error}",
+                                quarantine.original.display()
+                            ),
+                        }
+                    }
+                }
+                #[cfg(not(test))]
+                {
+                    drop(locked_source);
+                    let journal_path = quarantine.journal_path.clone();
+                    if let Err(error) = std::thread::Builder::new()
+                        .name("dustdesk-transfer-cleanup".to_owned())
+                        .spawn(move || {
+                            if let Err(error) =
+                                recover_transfer_quarantine_journal_serialized(&journal_path)
+                            {
+                                eprintln!(
+                                    "failed to cleanup committed transfer quarantine {}: {error}",
+                                    journal_path.display()
+                                );
+                            }
+                        })
+                    {
+                        eprintln!("failed to start committed transfer cleanup: {error}");
+                    }
+                }
+                Ok(())
+            } else {
+                delete_locked_source_tree(locked_source)
+            }
+        } else {
+            drop(locked_source);
+            Ok(())
+        }
+    })();
+
+    if !committed {
+        drop(reserved_staging.root.take());
+        drop(staging_commit_root.take());
+        let cleanup_root = if staging.is_dir() {
+            open_reserved_transfer_directory(&staging).ok()
+        } else if staging.is_file() {
+            open_reserved_transfer_file(&staging).ok()
+        } else {
+            None
+        };
+        let cleanup_tree =
+            cleanup_root.and_then(|root| lock_transfer_source_tree_from_root(&staging, root).ok());
+        if let Some(locked) = cleanup_tree {
+            let _ = delete_locked_source_tree(locked);
+        }
+    }
+    if let Some((container_path, container_root)) = reserved_staging.container.take() {
+        if let Ok(locked) = lock_transfer_source_tree_from_root(&container_path, container_root) {
+            let _ = delete_locked_source_tree(locked);
+        }
+    }
+    transfer_result
+}
+
+struct ReservedTransferStaging {
+    path: PathBuf,
+    root: Option<File>,
+    container: Option<(PathBuf, File)>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TransferQuarantineJournal {
+    version: u32,
+    original_path_utf16: Vec<u16>,
+    destination_path_utf16: Vec<u16>,
+    container_path_utf16: Vec<u16>,
+}
+
+struct QuarantinedTransferSource {
+    original: PathBuf,
+    destination: PathBuf,
+    container: PathBuf,
+    payload: PathBuf,
+    journal_path: PathBuf,
+    committed_marker_path: PathBuf,
+    cleanup_started_marker_path: PathBuf,
+    destination_committed: bool,
+    source_deleted: bool,
+}
+
+impl QuarantinedTransferSource {
+    fn reserve(source: &Path, destination: &Path) -> Result<Self, String> {
+        let parent = source
+            .parent()
+            .ok_or_else(|| "无法识别源目录位置".to_owned())?;
+        let file_name = source
+            .file_name()
+            .ok_or_else(|| "无法识别源目录名称".to_owned())?;
+        let journal_root = transfer_quarantine_journal_root()?;
+        fs::create_dir_all(&journal_root).map_err(to_message)?;
+        let id = now_id();
+
+        for index in 0..1000 {
+            let container = parent.join(format!(".dustdesk-source-transfer-{id}-{index}.tmp"));
+            match fs::create_dir(&container) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(to_message(error)),
+            }
+            hide_transfer_staging_path(&container);
+
+            let payload = container.join(file_name);
+            let journal_path = journal_root.join(format!("source-transfer-{id}-{index}.json"));
+            let committed_marker_path = journal_path.with_extension("committed");
+            let cleanup_started_marker_path = journal_path.with_extension("cleaning");
+            let journal = TransferQuarantineJournal {
+                version: 1,
+                original_path_utf16: path_to_utf16(source),
+                destination_path_utf16: path_to_utf16(destination),
+                container_path_utf16: path_to_utf16(&container),
+            };
+            if let Err(error) = write_new_transfer_quarantine_journal(&journal_path, &journal) {
+                let _ = remove_existing_path(&container);
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    continue;
+                }
+                return Err(to_message(error));
+            }
+
+            if let Err(error) = rename_path_no_replace(source, &payload) {
+                let _ = fs::remove_file(&journal_path);
+                let _ = remove_existing_path(&container);
+                return Err(error);
+            }
+
+            return Ok(Self {
+                original: source.to_path_buf(),
+                destination: destination.to_path_buf(),
+                container,
+                payload,
+                journal_path,
+                committed_marker_path,
+                cleanup_started_marker_path,
+                destination_committed: false,
+                source_deleted: false,
+            });
+        }
+
+        Err("无法创建源目录隔离区".to_owned())
+    }
+
+    fn mark_committed(&self) -> Result<(), String> {
+        write_transfer_marker(&self.committed_marker_path, b"committed\n")
+    }
+
+    fn mark_cleanup_started(&self) -> Result<(), String> {
+        write_transfer_marker(&self.cleanup_started_marker_path, b"cleaning\n")
+    }
+
+    fn restore(&mut self) -> Result<(), String> {
+        if self.cleanup_started_marker_path.exists() {
+            return Err(format!(
+                "隔离源清理已经开始，为避免恢复不完整目录，数据保留在 {}",
+                self.container.display()
+            ));
+        }
+        if self.payload.exists() {
+            if self.original.exists() {
+                return Err(format!(
+                    "原位置已存在同名项目，隔离数据保留在 {}",
+                    self.container.display()
+                ));
+            }
+            rename_path_no_replace(&self.payload, &self.original)?;
+            notify_shell_parent_updated(&self.original);
+        } else if !self.original.exists() {
+            return Err(format!(
+                "隔离源目录和原目录都不存在：{}",
+                self.original.display()
+            ));
+        }
+        self.cleanup_metadata()
+    }
+
+    fn cleanup_metadata(&self) -> Result<(), String> {
+        if self.payload.exists() {
+            return Err(format!("隔离源目录仍有数据：{}", self.payload.display()));
+        }
+        match fs::remove_dir(&self.container) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(to_message(error)),
+        }
+        match fs::remove_file(&self.cleanup_started_marker_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(to_message(error)),
+        }
+        match fs::remove_file(&self.committed_marker_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(to_message(error)),
+        }
+        match fs::remove_file(&self.journal_path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(to_message(error)),
+        }
+    }
+
+    fn from_journal(
+        journal_path: PathBuf,
+        journal: TransferQuarantineJournal,
+    ) -> Result<Self, String> {
+        if journal.version != 1 {
+            return Err("不支持的迁移隔离日志版本".to_owned());
+        }
+        let original = path_from_utf16(&journal.original_path_utf16)?;
+        let destination = path_from_utf16(&journal.destination_path_utf16)?;
+        let container = path_from_utf16(&journal.container_path_utf16)?;
+        if !is_source_transfer_staging_path(&container)
+            || original.parent().map(normalize_path_for_compare)
+                != container.parent().map(normalize_path_for_compare)
+        {
+            return Err("迁移隔离日志路径校验失败".to_owned());
+        }
+        let file_name = original
+            .file_name()
+            .ok_or_else(|| "迁移隔离日志缺少源目录名称".to_owned())?;
+        let payload = container.join(file_name);
+        Ok(Self {
+            original,
+            destination,
+            container,
+            payload,
+            committed_marker_path: journal_path.with_extension("committed"),
+            cleanup_started_marker_path: journal_path.with_extension("cleaning"),
+            journal_path,
+            destination_committed: false,
+            source_deleted: false,
+        })
+    }
+}
+
+fn write_transfer_marker(path: &Path, contents: &[u8]) -> Result<(), String> {
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut file) => {
+            file.write_all(contents).map_err(to_message)?;
+            file.sync_all().map_err(to_message)
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(to_message(error)),
+    }
+}
+
+fn transfer_quarantine_journal_root() -> Result<PathBuf, String> {
+    #[cfg(test)]
+    {
+        return Ok(env::temp_dir().join("dustdesk-transfer-journals-test"));
+    }
+    #[cfg(not(test))]
+    {
+        let appdata = env::var_os("APPDATA").ok_or_else(|| "没有找到 APPDATA 目录".to_owned())?;
+        Ok(PathBuf::from(appdata)
+            .join("DustDesk")
+            .join("transfer-journals"))
+    }
+}
+
+fn write_new_transfer_quarantine_journal(
+    path: &Path,
+    journal: &TransferQuarantineJournal,
+) -> io::Result<()> {
+    let bytes = serde_json::to_vec(journal).map_err(io::Error::other)?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn path_to_utf16(path: &Path) -> Vec<u16> {
+    path.as_os_str().encode_wide().collect()
+}
+
+#[cfg(not(windows))]
+fn path_to_utf16(path: &Path) -> Vec<u16> {
+    path.to_string_lossy().encode_utf16().collect()
+}
+
+#[cfg(windows)]
+fn path_from_utf16(value: &[u16]) -> Result<PathBuf, String> {
+    if value.is_empty() || value.contains(&0) {
+        return Err("迁移隔离日志包含无效路径".to_owned());
+    }
+    Ok(PathBuf::from(OsString::from_wide(value)))
+}
+
+#[cfg(not(windows))]
+fn path_from_utf16(value: &[u16]) -> Result<PathBuf, String> {
+    String::from_utf16(value)
+        .map(PathBuf::from)
+        .map_err(to_message)
+}
+
+fn reserve_transfer_staging_path(
+    source: &Path,
+    destination: &Path,
+) -> Result<ReservedTransferStaging, String> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| "无法识别目标目录".to_owned())?;
+    let source_metadata = fs::symlink_metadata(source).map_err(to_message)?;
+    validate_transfer_metadata(source, &source_metadata)?;
+    for index in 0..1000 {
+        let candidate = parent.join(format!(".dustdesk-transfer-{}-{index}.tmp", now_id()));
+        if source_metadata.is_dir() {
+            match fs::create_dir(&candidate) {
+                Ok(()) => {
+                    hide_transfer_staging_path(&candidate);
+                    let root = open_transfer_directory_guard(&candidate).map_err(to_message)?;
+                    return Ok(ReservedTransferStaging {
+                        path: candidate,
+                        root: Some(root),
+                        container: None,
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(to_message(error)),
+            }
+        } else if source_metadata.is_file() {
+            match fs::create_dir(&candidate) {
+                Ok(()) => {
+                    hide_transfer_staging_path(&candidate);
+                    let container_root =
+                        open_reserved_transfer_directory(&candidate).map_err(to_message)?;
+                    return Ok(ReservedTransferStaging {
+                        path: candidate.join("payload"),
+                        root: None,
+                        container: Some((candidate, container_root)),
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(to_message(error)),
+            }
+        } else {
+            return Err(format!("不支持移动此项目：{}", source.display()));
+        }
+    }
+    Err("无法创建临时迁移项目".to_owned())
+}
+
+#[cfg(windows)]
+fn hide_transfer_staging_path(path: &Path) {
+    use windows_sys::Win32::Storage::FileSystem::{
+        SetFileAttributesW, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_SYSTEM, FILE_ATTRIBUTE_TEMPORARY,
+    };
+
+    let wide_path = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    unsafe {
+        let _ = SetFileAttributesW(
+            wide_path.as_ptr(),
+            FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_TEMPORARY,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn hide_transfer_staging_path(_path: &Path) {}
+
+fn cleanup_stale_transfer_staging_dirs(root: &Path, minimum_age: Duration) -> usize {
+    let Ok(entries) = fs::read_dir(root) else {
+        return 0;
+    };
+    let now = SystemTime::now();
+    let mut removed = 0usize;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !is_transfer_staging_path(&path) {
+            continue;
+        }
+        let is_old_enough = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_none_or(|age| age >= minimum_age);
+        if !is_old_enough {
+            continue;
+        }
+        match remove_existing_path(&path) {
+            Ok(()) => removed += 1,
+            Err(error) => eprintln!(
+                "failed to cleanup transfer staging {}: {error}",
+                path.display()
+            ),
+        }
+    }
+
+    removed
+}
+
+fn recover_transfer_quarantine_journals() {
+    let Ok(_guard) = TRANSFER_RECOVERY_LOCK.get_or_init(|| Mutex::new(())).lock() else {
+        eprintln!("failed to lock transfer quarantine recovery");
+        return;
+    };
+    let Ok(journal_root) = transfer_quarantine_journal_root() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(&journal_root) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let journal_path = entry.path();
+        let is_journal = journal_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("source-transfer-") && name.ends_with(".json"));
+        if !is_journal {
+            continue;
+        }
+        if let Err(error) = recover_transfer_quarantine_journal(&journal_path) {
+            eprintln!(
+                "failed to recover transfer quarantine {}: {error}",
+                journal_path.display()
+            );
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn recover_transfer_quarantine_journal_serialized(journal_path: &Path) -> Result<(), String> {
+    let _guard = TRANSFER_RECOVERY_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "迁移隔离恢复锁已损坏".to_owned())?;
+    if !journal_path.exists() {
+        return Ok(());
+    }
+    recover_transfer_quarantine_journal(journal_path)
+}
+
+fn recover_transfer_quarantine_journal(journal_path: &Path) -> Result<(), String> {
+    let bytes = fs::read(journal_path).map_err(to_message)?;
+    let journal =
+        serde_json::from_slice::<TransferQuarantineJournal>(&bytes).map_err(to_message)?;
+    let mut quarantine =
+        QuarantinedTransferSource::from_journal(journal_path.to_path_buf(), journal)?;
+    let committed = quarantine.committed_marker_path.exists();
+    let cleanup_started = quarantine.cleanup_started_marker_path.exists();
+    quarantine.destination_committed = committed;
+
+    if committed {
+        if !quarantine.destination.exists() {
+            if cleanup_started {
+                return Err(format!(
+                    "目标目录已不存在且隔离源清理已经开始，已保留剩余数据：{}",
+                    quarantine.container.display()
+                ));
+            }
+            return quarantine.restore();
+        }
+        if quarantine.payload.exists() {
+            if !cleanup_started {
+                verify_copied_path_shape(&quarantine.payload, &quarantine.destination).map_err(
+                    |error| {
+                        format!(
+                            "提交后的目标复核失败，已保留隔离源 {}：{error}",
+                            quarantine.container.display()
+                        )
+                    },
+                )?;
+                quarantine.mark_cleanup_started()?;
+            }
+            delete_transfer_quarantine_payload(&quarantine.payload)?;
+        }
+        quarantine.source_deleted = true;
+        return quarantine.cleanup_metadata();
+    }
+
+    if !quarantine.payload.exists() {
+        if quarantine.original.exists() || quarantine.destination.exists() {
+            return quarantine.cleanup_metadata();
+        }
+        return Err(format!(
+            "迁移隔离数据、原目录和目标目录均不存在：{}",
+            quarantine.original.display()
+        ));
+    }
+
+    if quarantine.destination.exists()
+        && verify_copied_path_shape(&quarantine.payload, &quarantine.destination).is_ok()
+    {
+        quarantine.mark_committed()?;
+        quarantine.destination_committed = true;
+        quarantine.mark_cleanup_started()?;
+        delete_transfer_quarantine_payload(&quarantine.payload)?;
+        quarantine.source_deleted = true;
+        quarantine.cleanup_metadata()
+    } else {
+        quarantine.restore()
+    }
+}
+
+fn delete_transfer_quarantine_payload(path: &Path) -> Result<(), String> {
+    let locked = lock_transfer_source_tree(path)?;
+    delete_locked_source_tree(locked)
+}
+
+fn cleanup_startup_transfer_staging_dirs(store: &AppStore) {
+    recover_transfer_quarantine_journals();
+
+    for root in desktop_roots() {
+        let removed = cleanup_stale_transfer_staging_dirs(&root, Duration::ZERO);
+        if removed > 0 {
+            notify_shell_directory_updated(&root);
+        }
+    }
+
+    let organizer_root = store.organizer_root();
+    let removed = cleanup_stale_transfer_staging_dirs(&organizer_root, Duration::ZERO);
+    if removed > 0 {
+        notify_shell_directory_updated(&organizer_root);
+    }
+
+    if let Ok(categories) = fs::read_dir(&organizer_root) {
+        for entry in categories.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let removed = cleanup_stale_transfer_staging_dirs(&path, Duration::ZERO);
+            if removed > 0 {
+                notify_shell_directory_updated(&path);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn open_reserved_transfer_directory(path: &Path) -> io::Result<File> {
+    use windows_sys::Win32::{
+        Foundation::GENERIC_READ,
+        Storage::FileSystem::{
+            DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+            FILE_SHARE_WRITE,
+        },
+    };
+
+    let file = fs::OpenOptions::new()
+        .access_mode(GENERIC_READ | DELETE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    validate_transfer_metadata(path, &metadata).map_err(io::Error::other)?;
+    if !metadata.is_dir() {
+        return Err(io::Error::other("临时迁移项目不是目录"));
+    }
+    Ok(file)
+}
+
+#[cfg(not(windows))]
+fn open_reserved_transfer_directory(path: &Path) -> io::Result<File> {
+    File::open(path)
+}
+
+#[cfg(windows)]
+fn open_reserved_transfer_file(path: &Path) -> io::Result<File> {
+    use windows_sys::Win32::{
+        Foundation::GENERIC_READ,
+        Storage::FileSystem::{DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ},
+    };
+
+    fs::OpenOptions::new()
+        .read(true)
+        .access_mode(GENERIC_READ | DELETE)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+#[cfg(not(windows))]
+fn open_reserved_transfer_file(path: &Path) -> io::Result<File> {
+    File::open(path)
+}
+
+fn is_transfer_staging_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| {
+            name.strip_prefix(".dustdesk-transfer-")
+                .and_then(|name| name.strip_suffix(".tmp"))
+        })
+        .and_then(|name| name.rsplit_once('-'))
+        .map(|(id, index)| {
+            id.strip_prefix('s')
+                .map(|hex| !hex.is_empty() && hex.chars().all(|ch| ch.is_ascii_hexdigit()))
+                .unwrap_or(false)
+                && !index.is_empty()
+                && index.chars().all(|ch| ch.is_ascii_digit())
+        })
+        .unwrap_or(false)
+}
+
+fn is_source_transfer_staging_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| {
+            name.strip_prefix(".dustdesk-source-transfer-")
+                .and_then(|name| name.strip_suffix(".tmp"))
+        })
+        .and_then(|name| name.rsplit_once('-'))
+        .map(|(id, index)| {
+            id.strip_prefix('s')
+                .map(|hex| !hex.is_empty() && hex.chars().all(|ch| ch.is_ascii_hexdigit()))
+                .unwrap_or(false)
+                && !index.is_empty()
+                && index.chars().all(|ch| ch.is_ascii_digit())
+        })
+        .unwrap_or(false)
+}
+
+fn is_internal_transfer_path(path: &Path) -> bool {
+    is_transfer_staging_path(path) || is_source_transfer_staging_path(path)
+}
+
+#[cfg(windows)]
+fn rename_path_no_replace(source: &Path, destination: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(source).map_err(to_message)?;
+    validate_transfer_metadata(source, &metadata)?;
+    let source_handle = if metadata.is_dir() {
+        open_reserved_transfer_directory(source).map_err(to_message)?
+    } else if metadata.is_file() {
+        open_reserved_transfer_file(source).map_err(to_message)?
+    } else {
+        return Err(format!("不支持移动此项目：{}", source.display()));
+    };
+    commit_staging_handle_no_replace(&source_handle, source, destination)
+}
+
+#[cfg(not(windows))]
+fn rename_path_no_replace(source: &Path, destination: &Path) -> Result<(), String> {
+    if destination.exists() {
+        return Err(format!("目标项目已存在：{}", destination.display()));
+    }
+    fs::rename(source, destination).map_err(to_message)
+}
+
+fn validate_transfer_source_tree(path: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path).map_err(to_message)?;
+    validate_transfer_metadata(path, &metadata)?;
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path).map_err(to_message)? {
+            validate_transfer_source_tree(&entry.map_err(to_message)?.path())?;
+        }
+    } else if !metadata.is_file() {
+        return Err(format!("不支持移动此项目：{}", path.display()));
+    }
+    Ok(())
+}
+
+fn validate_transfer_metadata(path: &Path, metadata: &fs::Metadata) -> Result<(), String> {
+    if metadata.file_type().is_symlink() || metadata_is_reparse_point(metadata) {
+        return Err(format!(
+            "为避免误操作链接目标，不能移动符号链接或目录联接：{}",
+            path.display()
+        ));
+    }
+    validate_windows_extended_metadata(path, metadata)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_windows_extended_metadata(path: &Path, metadata: &fs::Metadata) -> Result<(), String> {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_EA;
+
+    if metadata.file_attributes() & FILE_ATTRIBUTE_EA != 0 {
+        return Err(format!(
+            "检测到无法可靠校验的 Windows 扩展属性，已保留源项目：{}",
+            path.display()
+        ));
+    }
+    let directory_streams = if metadata.is_dir() {
+        windows_named_streams(path)
+            .map_err(|error| format!("无法检查目录的 Windows 命名流 {}：{error}", path.display()))?
+    } else {
+        Vec::new()
+    };
+    if !directory_streams.is_empty() {
+        return Err(format!(
+            "暂不迁移带 NTFS 命名流的目录，已保留源项目：{}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn validate_windows_extended_metadata(
+    _path: &Path,
+    _metadata: &fs::Metadata,
+) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn metadata_is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn transfer_tree_exceeds_lock_limit(source: &Path) -> Result<bool, String> {
+    let mut pending = vec![source.to_path_buf()];
+    let mut count = 0usize;
+    let mut exceeds_limit = false;
+    while let Some(path) = pending.pop() {
+        let metadata = fs::symlink_metadata(&path).map_err(to_message)?;
+        validate_transfer_metadata(&path, &metadata)?;
+        count += 1;
+        if count > MAX_LOCKED_TRANSFER_TREE_ENTRIES {
+            exceeds_limit = true;
+        }
+        if metadata.is_dir() {
+            for entry in fs::read_dir(&path).map_err(to_message)? {
+                pending.push(entry.map_err(to_message)?.path());
+            }
+        } else if !metadata.is_file() {
+            return Err(format!("不支持移动此项目：{}", path.display()));
+        }
+    }
+    Ok(exceeds_limit)
+}
+
+#[cfg(windows)]
+struct LockedSourceEntry {
+    path: PathBuf,
+    file: File,
+}
+
+#[cfg(windows)]
+struct LockedSourceTree {
+    entries: Vec<LockedSourceEntry>,
+    fully_locked: bool,
+}
+
+#[cfg(windows)]
+fn lock_transfer_source_tree(source: &Path) -> Result<LockedSourceTree, String> {
+    let fully_locked = !transfer_tree_exceeds_lock_limit(source)?;
+    let mut entries = Vec::new();
+    if fully_locked {
+        lock_transfer_source_entry(source, &mut entries)?;
+    } else {
+        let file = open_transfer_directory_guard(source).map_err(to_message)?;
+        lock_transfer_source_entry_from_file(source, file, &mut entries, false)?;
+    }
+    Ok(LockedSourceTree {
+        entries,
+        fully_locked,
+    })
+}
+
+#[cfg(windows)]
+fn open_transfer_directory_guard(path: &Path) -> io::Result<File> {
+    use windows_sys::Win32::{
+        Foundation::GENERIC_READ,
+        Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+            FILE_SHARE_WRITE,
+        },
+    };
+
+    let file = fs::OpenOptions::new()
+        .access_mode(GENERIC_READ)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    validate_transfer_metadata(path, &metadata).map_err(io::Error::other)?;
+    if !metadata.is_dir() {
+        return Err(io::Error::other("临时迁移项目不是目录"));
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn lock_transfer_source_entry(
+    path: &Path,
+    entries: &mut Vec<LockedSourceEntry>,
+) -> Result<(), String> {
+    let file = open_locked_transfer_source_entry(path)?;
+    lock_transfer_source_entry_from_file(path, file, entries, true)
+}
+
+#[cfg(windows)]
+fn open_locked_transfer_source_entry(path: &Path) -> Result<File, String> {
+    use windows_sys::Win32::{
+        Foundation::GENERIC_READ,
+        Storage::FileSystem::{
+            DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        },
+    };
+
+    fs::OpenOptions::new()
+        .access_mode(GENERIC_READ | DELETE)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(to_message)
+}
+
+#[cfg(windows)]
+fn lock_transfer_source_entry_from_file(
+    path: &Path,
+    file: File,
+    entries: &mut Vec<LockedSourceEntry>,
+    recurse: bool,
+) -> Result<(), String> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY,
+        FILE_ATTRIBUTE_REPARSE_POINT,
+    };
+
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut information) } == 0 {
+        return Err(io::Error::last_os_error().to_string());
+    }
+    if information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(format!(
+            "为避免误操作链接目标，不能移动符号链接或目录联接：{}",
+            path.display()
+        ));
+    }
+
+    let is_directory = information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+    entries.push(LockedSourceEntry {
+        path: path.to_path_buf(),
+        file,
+    });
+    if recurse && is_directory {
+        for entry in fs::read_dir(path).map_err(to_message)? {
+            lock_transfer_source_entry(&entry.map_err(to_message)?.path(), entries)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn lock_transfer_source_tree_from_root(
+    source: &Path,
+    root: File,
+) -> Result<LockedSourceTree, String> {
+    let fully_locked = !transfer_tree_exceeds_lock_limit(source)?;
+    let mut entries = Vec::new();
+    lock_transfer_source_entry_from_file(source, root, &mut entries, fully_locked)?;
+    Ok(LockedSourceTree {
+        entries,
+        fully_locked,
+    })
+}
+
+#[cfg(windows)]
+fn commit_staging_handle_no_replace(
+    root: &File,
+    _staging: &Path,
+    destination: &Path,
+) -> Result<(), String> {
+    use std::{mem::offset_of, ptr::null_mut};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileRenameInfoEx, SetFileInformationByHandle, FILE_RENAME_INFO,
+    };
+    let mut name = destination.as_os_str().encode_wide().collect::<Vec<_>>();
+    let name_bytes = name
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or_else(|| "目标路径过长".to_owned())?;
+    let buffer_bytes = offset_of!(FILE_RENAME_INFO, FileName)
+        .checked_add(name_bytes)
+        .and_then(|length| length.checked_add(std::mem::size_of::<u16>()))
+        .ok_or_else(|| "目标路径过长".to_owned())?;
+    name.push(0);
+    let mut buffer = vec![0usize; buffer_bytes.div_ceil(std::mem::size_of::<usize>())];
+    let information = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+
+    unsafe {
+        (*information).Anonymous.Flags = 0;
+        (*information).RootDirectory = null_mut();
+        (*information).FileNameLength = name_bytes as u32;
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            std::ptr::addr_of_mut!((*information).FileName).cast::<u16>(),
+            name.len(),
+        );
+        if SetFileInformationByHandle(
+            root.as_raw_handle() as _,
+            FileRenameInfoEx,
+            information.cast(),
+            buffer_bytes as u32,
+        ) == 0
+        {
+            return Err(io::Error::last_os_error().to_string());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn delete_locked_source_tree(locked: LockedSourceTree) -> Result<(), String> {
+    use std::mem::size_of;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileDispositionInfoEx, SetFileInformationByHandle, FILE_DISPOSITION_FLAG_DELETE,
+        FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE, FILE_DISPOSITION_INFO_EX,
+    };
+
+    let LockedSourceTree {
+        entries,
+        fully_locked,
+    } = locked;
+    if !fully_locked {
+        let source = entries
+            .first()
+            .map(|entry| entry.path.clone())
+            .ok_or_else(|| "无法识别待删除的源项目".to_owned())?;
+        drop(entries);
+        return remove_existing_path(&source)
+            .map_err(|error| format!("已安全复制但无法删除源项目 {}：{error}", source.display()));
+    }
+
+    // Delete exact handles child-first. Unverified late entries keep their parent non-empty.
+    for entry in entries.into_iter().rev() {
+        let disposition = FILE_DISPOSITION_INFO_EX {
+            Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+        };
+        if unsafe {
+            SetFileInformationByHandle(
+                entry.file.as_raw_handle() as _,
+                FileDispositionInfoEx,
+                (&disposition as *const FILE_DISPOSITION_INFO_EX).cast(),
+                size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
+            )
+        } == 0
+        {
+            return Err(format!(
+                "已安全复制但无法删除源项目 {}：{}",
+                entry.path.display(),
+                io::Error::last_os_error()
+            ));
+        }
+        drop(entry.file);
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+struct LockedSourceTree {
+    source: PathBuf,
+}
+
+#[cfg(not(windows))]
+fn lock_transfer_source_tree(source: &Path) -> Result<LockedSourceTree, String> {
+    validate_transfer_source_tree(source)?;
+    Ok(LockedSourceTree {
+        source: source.to_path_buf(),
+    })
+}
+
+#[cfg(not(windows))]
+fn lock_transfer_source_tree_from_root(
+    source: &Path,
+    _root: File,
+) -> Result<LockedSourceTree, String> {
+    lock_transfer_source_tree(source)
+}
+
+#[cfg(not(windows))]
+fn commit_staging_handle_no_replace(
+    _root: &File,
+    staging: &Path,
+    destination: &Path,
+) -> Result<(), String> {
+    rename_path_no_replace(staging, destination)
+}
+
+#[cfg(not(windows))]
+fn delete_locked_source_tree(locked: LockedSourceTree) -> Result<(), String> {
+    remove_existing_path(&locked.source)
+}
+
+fn verify_copied_path_shape(source: &Path, destination: &Path) -> Result<(), String> {
+    let source_metadata = fs::symlink_metadata(source).map_err(to_message)?;
+    let destination_metadata = fs::symlink_metadata(destination).map_err(to_message)?;
+    validate_transfer_metadata(source, &source_metadata)?;
+    validate_transfer_metadata(destination, &destination_metadata)?;
+
+    if source_metadata.is_dir() != destination_metadata.is_dir()
+        || source_metadata.is_file() != destination_metadata.is_file()
+    {
+        return Err(format!("迁移校验失败：项目类型不一致 {}", source.display()));
+    }
+    if source_metadata.is_file() {
+        let modified_matches = match (source_metadata.modified(), destination_metadata.modified()) {
+            (Ok(source_modified), Ok(destination_modified)) => {
+                source_modified == destination_modified
+            }
+            _ => false,
+        };
+        return (source_metadata.len() == destination_metadata.len() && modified_matches)
+            .then_some(())
+            .ok_or_else(|| format!("迁移校验失败：文件大小或时间不一致 {}", source.display()));
+    }
+
+    let source_entries = fs::read_dir(source)
+        .map_err(to_message)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(to_message)?;
+    let destination_entry_count = fs::read_dir(destination)
+        .map_err(to_message)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(to_message)?
+        .len();
+    if source_entries.len() != destination_entry_count {
+        return Err(format!(
+            "迁移校验失败：目录内容不完整 {}（源 {} 项，目标 {} 项）",
+            source.display(),
+            source_entries.len(),
+            destination_entry_count
+        ));
+    }
+    for entry in source_entries {
+        verify_copied_path_shape(&entry.path(), &destination.join(entry.file_name()))?;
+    }
+    Ok(())
+}
+
+fn verify_copied_path(source: &Path, destination: &Path) -> Result<(), String> {
+    let source_metadata = fs::symlink_metadata(source).map_err(to_message)?;
+    let destination_metadata = fs::symlink_metadata(destination).map_err(to_message)?;
+    validate_transfer_metadata(source, &source_metadata)?;
+    validate_transfer_metadata(destination, &destination_metadata)?;
+
+    if source_metadata.is_dir() != destination_metadata.is_dir()
+        || source_metadata.is_file() != destination_metadata.is_file()
+    {
+        return Err(format!("迁移校验失败：项目类型不一致 {}", source.display()));
+    }
+
+    if source_metadata.is_dir() {
+        let source_entries = fs::read_dir(source)
+            .map_err(to_message)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(to_message)?;
+        let destination_entry_count = fs::read_dir(destination)
+            .map_err(to_message)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(to_message)?
+            .len();
+        if source_entries.len() != destination_entry_count {
+            return Err(format!("迁移校验失败：目录内容不完整 {}", source.display()));
+        }
+
+        for entry in source_entries {
+            verify_copied_path(&entry.path(), &destination.join(entry.file_name()))?;
+        }
         return Ok(());
     }
 
-    if source.is_dir() {
-        copy_dir_recursive(source, destination)?;
-        fs::remove_dir_all(source).map_err(to_message)
-    } else {
-        fs::copy(source, destination).map_err(to_message)?;
-        fs::remove_file(source).map_err(to_message)
+    if source_metadata.len() != destination_metadata.len()
+        || !files_have_same_contents(source, destination)?
+        || !named_streams_have_same_contents(source, destination)?
+    {
+        return Err(format!("迁移校验失败：文件内容不一致 {}", source.display()));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct WindowsNamedStream {
+    name: String,
+    size: i64,
+}
+
+#[cfg(windows)]
+fn named_streams_have_same_contents(left: &Path, right: &Path) -> Result<bool, String> {
+    let left_streams = windows_named_streams(left)?;
+    let right_streams = windows_named_streams(right)?;
+    if left_streams.len() != right_streams.len() {
+        return Ok(false);
+    }
+
+    for (left_stream, right_stream) in left_streams.iter().zip(&right_streams) {
+        if !left_stream.name.eq_ignore_ascii_case(&right_stream.name)
+            || left_stream.size != right_stream.size
+            || !files_have_same_contents(
+                &path_with_windows_stream(left, &left_stream.name),
+                &path_with_windows_stream(right, &right_stream.name),
+            )?
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(not(windows))]
+fn named_streams_have_same_contents(_left: &Path, _right: &Path) -> Result<bool, String> {
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn windows_named_streams(path: &Path) -> Result<Vec<WindowsNamedStream>, String> {
+    use windows_sys::Win32::{
+        Foundation::{ERROR_HANDLE_EOF, ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE},
+        Storage::FileSystem::{
+            FindClose, FindFirstStreamW, FindNextStreamW, FindStreamInfoStandard,
+            WIN32_FIND_STREAM_DATA,
+        },
+    };
+
+    struct FindStreamHandle(windows_sys::Win32::Foundation::HANDLE);
+    impl Drop for FindStreamHandle {
+        fn drop(&mut self) {
+            unsafe {
+                FindClose(self.0);
+            }
+        }
+    }
+
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut data = WIN32_FIND_STREAM_DATA::default();
+    let handle = unsafe {
+        FindFirstStreamW(
+            wide.as_ptr(),
+            FindStreamInfoStandard,
+            (&mut data as *mut WIN32_FIND_STREAM_DATA).cast(),
+            0,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_HANDLE_EOF as i32) {
+            return Ok(Vec::new());
+        }
+        return Err(format!(
+            "无法枚举 NTFS 命名流，已保留源项目 {}：{}",
+            path.display(),
+            error
+        ));
+    }
+    let _guard = FindStreamHandle(handle);
+    let mut streams = Vec::new();
+    loop {
+        let length = data
+            .cStreamName
+            .iter()
+            .position(|ch| *ch == 0)
+            .unwrap_or(data.cStreamName.len());
+        let name = String::from_utf16(&data.cStreamName[..length])
+            .map_err(|_| format!("NTFS 命名流名称无效：{}", path.display()))?;
+        if !name.eq_ignore_ascii_case("::$DATA") {
+            streams.push(WindowsNamedStream {
+                name,
+                size: data.StreamSize,
+            });
+        }
+
+        data = WIN32_FIND_STREAM_DATA::default();
+        if unsafe { FindNextStreamW(handle, (&mut data as *mut WIN32_FIND_STREAM_DATA).cast()) }
+            == 0
+        {
+            let error = io::Error::last_os_error();
+            if matches!(
+                error.raw_os_error(),
+                Some(code) if code == ERROR_HANDLE_EOF as i32 || code == ERROR_NO_MORE_FILES as i32
+            ) {
+                break;
+            }
+            return Err(format!(
+                "无法枚举 NTFS 命名流，已保留源项目 {}：{}",
+                path.display(),
+                error
+            ));
+        }
+    }
+    streams.sort_by_key(|stream| stream.name.to_ascii_lowercase());
+    Ok(streams)
+}
+
+#[cfg(windows)]
+fn path_with_windows_stream(path: &Path, stream: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(stream);
+    PathBuf::from(value)
+}
+
+fn files_have_same_contents(left: &Path, right: &Path) -> Result<bool, String> {
+    let mut left = BufReader::new(File::open(left).map_err(to_message)?);
+    let mut right = BufReader::new(File::open(right).map_err(to_message)?);
+    let mut left_buffer = [0u8; 64 * 1024];
+    let mut right_buffer = [0u8; 64 * 1024];
+
+    loop {
+        let left_read = left.read(&mut left_buffer).map_err(to_message)?;
+        let right_read = right.read(&mut right_buffer).map_err(to_message)?;
+        if left_read != right_read || left_buffer[..left_read] != right_buffer[..right_read] {
+            return Ok(false);
+        }
+        if left_read == 0 {
+            return Ok(true);
+        }
     }
 }
 
@@ -3016,18 +5301,259 @@ fn remove_existing_path(path: &Path) -> Result<(), String> {
     }
 }
 
+fn copy_directory_for_transfer(source: &Path, destination: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    if directory_entry_count_exceeds(source, MAX_LOCKED_TRANSFER_TREE_ENTRIES)?
+        && fs::read_dir(destination)
+            .map_err(to_message)?
+            .next()
+            .transpose()
+            .map_err(to_message)?
+            .is_none()
+    {
+        match try_copy_directory_with_robocopy(source, destination)? {
+            true => return copy_directory_basic_metadata(source, destination),
+            false => {}
+        }
+    }
+
+    copy_dir_recursive(source, destination)
+}
+
+#[cfg(windows)]
+fn directory_entry_count_exceeds(source: &Path, limit: usize) -> Result<bool, String> {
+    let mut pending = vec![source.to_path_buf()];
+    let mut count = 0usize;
+    while let Some(path) = pending.pop() {
+        for entry in fs::read_dir(&path).map_err(to_message)? {
+            let path = entry.map_err(to_message)?.path();
+            let metadata = fs::symlink_metadata(&path).map_err(to_message)?;
+            validate_transfer_metadata(&path, &metadata)?;
+            count += 1;
+            if count > limit {
+                return Ok(true);
+            }
+            if metadata.is_dir() {
+                pending.push(path);
+            } else if !metadata.is_file() {
+                return Err(format!("不支持移动此项目：{}", path.display()));
+            }
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(windows)]
+fn try_copy_directory_with_robocopy(source: &Path, destination: &Path) -> Result<bool, String> {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let started = Instant::now();
+    let status = Command::new("robocopy.exe")
+        .arg(source)
+        .arg(destination)
+        .args([
+            "/E",
+            "/COPY:DAT",
+            "/DCOPY:DAT",
+            "/R:1",
+            "/W:1",
+            "/MT:8",
+            "/XJ",
+            "/NFL",
+            "/NDL",
+            "/NJH",
+            "/NJS",
+            "/NP",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+
+    let status = match status {
+        Ok(status) => status,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("启动 Windows 多线程目录复制失败：{error}")),
+    };
+    eprintln!(
+        "[desktop-transfer] robocopy elapsed_ms={} exit_code={:?} source={} destination={}",
+        started.elapsed().as_millis(),
+        status.code(),
+        source.display(),
+        destination.display()
+    );
+    match status.code() {
+        Some(code) if (0..4).contains(&code) => Ok(true),
+        Some(code) => Err(format!("Windows 多线程目录复制校验失败，退出码 {code}")),
+        None => Err("Windows 多线程目录复制异常终止".to_owned()),
+    }
+}
+
 fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), String> {
-    fs::create_dir_all(destination).map_err(to_message)?;
+    let source_metadata = fs::symlink_metadata(source).map_err(to_message)?;
+    let destination_metadata = fs::symlink_metadata(destination).map_err(to_message)?;
+    validate_transfer_metadata(source, &source_metadata)?;
+    validate_transfer_metadata(destination, &destination_metadata)?;
+    if !source_metadata.is_dir() || !destination_metadata.is_dir() {
+        return Err(format!("迁移目录类型不正确：{}", source.display()));
+    }
     for entry in fs::read_dir(source).map_err(to_message)? {
         let entry = entry.map_err(to_message)?;
         let from = entry.path();
         let to = destination.join(entry.file_name());
-        let file_type = entry.file_type().map_err(to_message)?;
-        if file_type.is_dir() {
+        let metadata = fs::symlink_metadata(&from).map_err(to_message)?;
+        validate_transfer_metadata(&from, &metadata)?;
+        if metadata.is_dir() {
+            fs::create_dir(&to).map_err(to_message)?;
             copy_dir_recursive(&from, &to)?;
+        } else if metadata.is_file() {
+            copy_file_contents(&from, &to)?;
         } else {
-            fs::copy(&from, &to).map_err(to_message)?;
+            return Err(format!("不支持移动此项目：{}", from.display()));
         }
+    }
+    copy_directory_basic_metadata(source, destination)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn copy_file_contents(source: &Path, destination: &Path) -> Result<(), String> {
+    use std::mem::size_of;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CopyFile2, COPYFILE2_EXTENDED_PARAMETERS, COPY_FILE_FAIL_IF_EXISTS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_WRITE_ATTRIBUTES,
+    };
+
+    let metadata = fs::symlink_metadata(source).map_err(to_message)?;
+    validate_transfer_metadata(source, &metadata)?;
+    if !metadata.is_file() {
+        return Err(format!("源项目不是文件：{}", source.display()));
+    }
+
+    let source_wide = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination_wide = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut parameters = COPYFILE2_EXTENDED_PARAMETERS::default();
+    parameters.dwSize = size_of::<COPYFILE2_EXTENDED_PARAMETERS>() as u32;
+    parameters.dwCopyFlags = COPY_FILE_FAIL_IF_EXISTS;
+    let result = unsafe { CopyFile2(source_wide.as_ptr(), destination_wide.as_ptr(), &parameters) };
+    if result < 0 {
+        return Err(format!("CopyFile2 失败：HRESULT 0x{:08X}", result as u32));
+    }
+
+    let destination_file = fs::OpenOptions::new()
+        .access_mode(FILE_WRITE_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(destination)
+        .map_err(to_message)?;
+    copy_file_basic_metadata(source, &destination_file)
+}
+
+#[cfg(not(windows))]
+fn copy_file_contents(source: &Path, destination: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(source).map_err(to_message)?;
+    validate_transfer_metadata(source, &metadata)?;
+    if !metadata.is_file() {
+        return Err(format!("源项目不是文件：{}", source.display()));
+    }
+
+    let mut source_file = File::open(source).map_err(to_message)?;
+    let mut destination_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .map_err(to_message)?;
+    io::copy(&mut source_file, &mut destination_file).map_err(to_message)?;
+    destination_file.sync_all().map_err(to_message)?;
+    copy_file_basic_metadata(source, &destination_file)
+}
+
+#[cfg(windows)]
+fn copy_file_basic_metadata(source: &Path, destination: &File) -> Result<(), String> {
+    let source = File::open(source).map_err(to_message)?;
+    copy_windows_basic_metadata(&source, destination)
+}
+
+#[cfg(not(windows))]
+fn copy_file_basic_metadata(source: &Path, destination: &File) -> Result<(), String> {
+    destination
+        .set_permissions(fs::metadata(source).map_err(to_message)?.permissions())
+        .map_err(to_message)
+}
+
+#[cfg(windows)]
+fn copy_directory_basic_metadata(source: &Path, destination: &Path) -> Result<(), String> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES,
+    };
+
+    let source = fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(source)
+        .map_err(to_message)?;
+    let destination = fs::OpenOptions::new()
+        .access_mode(FILE_WRITE_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(destination)
+        .map_err(to_message)?;
+    copy_windows_basic_metadata(&source, &destination)
+}
+
+#[cfg(not(windows))]
+fn copy_directory_basic_metadata(source: &Path, destination: &Path) -> Result<(), String> {
+    fs::set_permissions(
+        destination,
+        fs::metadata(source).map_err(to_message)?.permissions(),
+    )
+    .map_err(to_message)
+}
+
+#[cfg(windows)]
+fn copy_windows_basic_metadata(source: &File, destination: &File) -> Result<(), String> {
+    use std::mem::size_of;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileBasicInfo, GetFileInformationByHandleEx, SetFileInformationByHandle,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO,
+    };
+
+    let mut source_info = FILE_BASIC_INFO::default();
+    if unsafe {
+        GetFileInformationByHandleEx(
+            source.as_raw_handle() as _,
+            FileBasicInfo,
+            (&mut source_info as *mut FILE_BASIC_INFO).cast(),
+            size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error().to_string());
+    }
+    if source_info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err("不能复制符号链接或目录联接的元数据".to_owned());
+    }
+    if unsafe {
+        SetFileInformationByHandle(
+            destination.as_raw_handle() as _,
+            FileBasicInfo,
+            (&source_info as *const FILE_BASIC_INFO).cast(),
+            size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error().to_string());
     }
     Ok(())
 }
@@ -3136,38 +5662,40 @@ fn record_search_open(item: &SearchItem) -> Result<(), String> {
         return Ok(());
     }
 
-    let store = AppStore::open().map_err(to_message)?;
-    let mut history = store.load_search_history();
-    let key = item.path.to_lowercase();
-    let now = now_local_string();
+    store::with_storage_mutation(|| {
+        let store = AppStore::open().map_err(to_message)?;
+        let mut history = store.load_search_history_strict().map_err(to_message)?;
+        let key = item.path.to_lowercase();
+        let now = now_local_string();
 
-    if let Some(record) = history
-        .items
-        .iter_mut()
-        .find(|record| record.path.to_lowercase() == key)
-    {
-        record.name = item.name.clone();
-        record.kind = item.kind;
-        record.extension = item.extension.clone();
-        record.open_count = record.open_count.saturating_add(1);
-        record.last_opened_at = now;
-    } else {
-        history.items.push(SearchHistoryItem {
-            id: now_id(),
-            name: item.name.clone(),
-            path: item.path.clone(),
-            kind: item.kind,
-            extension: item.extension.clone(),
-            open_count: 1,
-            last_opened_at: now,
-        });
-    }
+        if let Some(record) = history
+            .items
+            .iter_mut()
+            .find(|record| record.path.to_lowercase() == key)
+        {
+            record.name = item.name.clone();
+            record.kind = item.kind;
+            record.extension = item.extension.clone();
+            record.open_count = record.open_count.saturating_add(1);
+            record.last_opened_at = now;
+        } else {
+            history.items.push(SearchHistoryItem {
+                id: now_id(),
+                name: item.name.clone(),
+                path: item.path.clone(),
+                kind: item.kind,
+                extension: item.extension.clone(),
+                open_count: 1,
+                last_opened_at: now,
+            });
+        }
 
-    history
-        .items
-        .sort_by(|left, right| right.last_opened_at.cmp(&left.last_opened_at));
-    history.items.truncate(SEARCH_HISTORY_LIMIT);
-    store.save_search_history(&history).map_err(to_message)
+        history
+            .items
+            .sort_by(|left, right| right.last_opened_at.cmp(&left.last_opened_at));
+        history.items.truncate(SEARCH_HISTORY_LIMIT);
+        store.save_search_history(&history).map_err(to_message)
+    })
 }
 
 fn launcher_search_item(launcher: &LaunchItem, name: String) -> SearchItem {
@@ -3335,6 +5863,810 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn archive_collision_uses_unique_destination_without_deleting_either_item() {
+        let root = unique_test_dir("dustdesk-archive-collision");
+        let incoming_dir = root.join("incoming");
+        let category_dir = root.join("category");
+        fs::create_dir_all(&incoming_dir).expect("create incoming dir");
+        fs::create_dir_all(&category_dir).expect("create category dir");
+        let source = incoming_dir.join("report.txt");
+        let existing = category_dir.join("report.txt");
+        fs::write(&source, b"new report").expect("write source");
+        fs::write(&existing, b"existing report").expect("write existing destination");
+
+        let destination = archive_destination(&category_dir, &source).expect("choose destination");
+        assert_ne!(destination, existing);
+        move_path(&source, &destination).expect("move to unique destination");
+
+        assert_eq!(
+            fs::read(&existing).expect("read existing"),
+            b"existing report"
+        );
+        assert_eq!(fs::read(&destination).expect("read moved"), b"new report");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn archiving_external_item_moves_it_into_the_category_instead_of_storing_a_reference() {
+        let root = unique_test_dir("dustdesk-archive-external");
+        let data = root.join("data");
+        let organizer = root.join("organizer");
+        let launchers = root.join("launchers");
+        let incoming = root.join("incoming");
+        fs::create_dir_all(&data).expect("create data root");
+        fs::create_dir_all(&organizer).expect("create organizer root");
+        fs::create_dir_all(&launchers).expect("create launcher root");
+        fs::create_dir_all(&incoming).expect("create incoming root");
+        let source = incoming.join("important.txt");
+        fs::write(&source, b"important data").expect("write source");
+        let store = AppStore::for_test(data, organizer.clone(), launchers);
+
+        let archived = archive_item_path(&store, "documents", &source.display().to_string())
+            .expect("archive external item");
+        let archived = PathBuf::from(archived);
+
+        assert!(!source.exists(), "archive must use cut semantics");
+        assert!(is_path_within(&archived, &organizer.join("documents")));
+        assert_eq!(
+            fs::read(&archived).expect("read archived item"),
+            b"important data"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn move_rejects_destination_inside_source_and_keeps_the_source_tree() {
+        let root = unique_test_dir("dustdesk-move-inside-source");
+        let source = root.join("source");
+        let destination = source.join("nested").join("destination");
+        fs::create_dir_all(source.join("nested")).expect("create source tree");
+        fs::write(source.join("important.txt"), b"keep this data").expect("write source");
+
+        let error = move_path(&source, &destination).expect_err("reject recursive move");
+
+        assert!(error.contains("自身内部"));
+        assert_eq!(
+            fs::read(source.join("important.txt")).expect("source remains"),
+            b"keep this data"
+        );
+        assert!(!destination.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn move_rejects_destination_inside_source_through_a_directory_alias() {
+        let root = unique_test_dir("dustdesk-move-alias-inside-source");
+        let source = root.join("source");
+        let alias = root.join("source-alias");
+        fs::create_dir_all(&source).expect("create source");
+        fs::write(source.join("important.txt"), b"keep this data").expect("write source");
+        create_test_directory_reparse_point(&alias, &source);
+        let destination = alias.join("nested").join("destination");
+
+        let error = move_path(&source, &destination).expect_err("reject aliased recursive move");
+
+        assert!(error.contains("自身内部"));
+        assert_eq!(
+            fs::read(source.join("important.txt")).expect("source remains"),
+            b"keep this data"
+        );
+        assert!(!destination.exists());
+        fs::remove_dir(&alias).expect("remove source alias");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_directory_copy_keeps_source_until_verified_cleanup() {
+        let root = unique_test_dir("dustdesk-runtime-copy");
+        let source = root.join("source");
+        let target = root.join("target");
+        fs::create_dir_all(source.join("nested")).expect("create source tree");
+        fs::write(source.join("nested").join("important.txt"), b"runtime data")
+            .expect("write source data");
+
+        copy_directory_contents_preserving_source(&source, &target)
+            .expect("copy complete directory before switching");
+
+        assert_eq!(
+            fs::read(source.join("nested").join("important.txt")).expect("source remains"),
+            b"runtime data"
+        );
+        assert_eq!(
+            fs::read(target.join("nested").join("important.txt")).expect("target copied"),
+            b"runtime data"
+        );
+
+        remove_verified_directory_contents(&source, &target)
+            .expect("remove old directory only after verification");
+        assert!(!source.exists());
+        assert_eq!(
+            fs::read(target.join("nested").join("important.txt")).expect("target remains"),
+            b"runtime data"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_directory_copy_rejects_conflict_and_preserves_both_versions() {
+        let root = unique_test_dir("dustdesk-runtime-conflict");
+        let source = root.join("source");
+        let target = root.join("target");
+        fs::create_dir_all(&source).expect("create source");
+        fs::create_dir_all(&target).expect("create target");
+        fs::write(source.join("config.json"), b"source config").expect("write source config");
+        fs::write(target.join("config.json"), b"target config").expect("write target config");
+
+        let error = copy_directory_contents_preserving_source(&source, &target)
+            .expect_err("reject conflicting migration target");
+
+        assert!(error.contains("不同内容"));
+        assert_eq!(
+            fs::read(source.join("config.json")).expect("source preserved"),
+            b"source config"
+        );
+        assert_eq!(
+            fs::read(target.join("config.json")).expect("target preserved"),
+            b"target config"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn path_rewrite_preserves_nested_components_when_windows_path_case_differs() {
+        let old_root = PathBuf::from(r"D:\Data");
+        let new_root = PathBuf::from(r"E:\DustDeskData");
+        let rewritten = rewrite_path_prefix(
+            r"d:\data\ClipboardImages\nested\image.png",
+            &[(&old_root, &new_root)],
+        )
+        .expect("rewrite nested path");
+
+        assert!(same_path_text(
+            &rewritten,
+            r"E:\DustDeskData\ClipboardImages\nested\image.png"
+        ));
+    }
+
+    #[test]
+    fn runtime_roots_must_not_overlap() {
+        let data = PathBuf::from(r"D:\DustDesk\Data");
+        let organizer = data.join("DesktopOrganizer");
+        let launchers = PathBuf::from(r"D:\DustDesk\Launchers");
+
+        assert!(paths_overlap(&data, &organizer));
+        assert!(paths_overlap(&organizer, &data));
+        assert!(!paths_overlap(&data, &launchers));
+    }
+
+    #[test]
+    fn restore_collision_preserves_both_items_with_unique_desktop_name() {
+        let root = unique_test_dir("dustdesk-restore-collision");
+        let organizer = root.join("organizer");
+        let desktop = root.join("desktop");
+        fs::create_dir_all(&organizer).expect("create organizer");
+        fs::create_dir_all(&desktop).expect("create desktop");
+        let source = organizer.join("report.txt");
+        let existing = desktop.join("report.txt");
+        fs::write(&source, b"organized report").expect("write organized source");
+        fs::write(&existing, b"desktop report").expect("write desktop item");
+
+        let restored =
+            restore_path_to_desktop_silent(&source, &desktop).expect("restore collision safely");
+
+        assert_ne!(restored, existing);
+        assert_eq!(
+            fs::read(&existing).expect("read desktop item"),
+            b"desktop report"
+        );
+        assert_eq!(
+            fs::read(&restored).expect("read restored item"),
+            b"organized report"
+        );
+        assert!(
+            !source.exists(),
+            "organized data should be moved, not discarded"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_collision_removes_only_a_byte_identical_organized_duplicate() {
+        let root = unique_test_dir("dustdesk-restore-identical");
+        let organizer = root.join("organizer");
+        let desktop = root.join("desktop");
+        fs::create_dir_all(&organizer).expect("create organizer");
+        fs::create_dir_all(&desktop).expect("create desktop");
+        let source = organizer.join("report.txt");
+        let existing = desktop.join("report.txt");
+        fs::write(&source, b"identical report").expect("write organized source");
+        fs::write(&existing, b"identical report").expect("write desktop item");
+
+        let restored =
+            restore_path_to_desktop_silent(&source, &desktop).expect("deduplicate identical item");
+
+        assert_eq!(restored, existing);
+        assert!(!source.exists(), "verified duplicate should be removed");
+        assert_eq!(
+            fs::read(&existing).expect("desktop item remains"),
+            b"identical report"
+        );
+        assert!(!desktop.join("report 2.txt").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restore_collision_preserves_items_when_named_streams_differ() {
+        let root = unique_test_dir("dustdesk-restore-ads-different");
+        let organizer = root.join("organizer");
+        let desktop = root.join("desktop");
+        fs::create_dir_all(&organizer).expect("create organizer");
+        fs::create_dir_all(&desktop).expect("create desktop");
+        let source = organizer.join("report.txt");
+        let existing = desktop.join("report.txt");
+        fs::write(&source, b"same default stream").expect("write organized source");
+        fs::write(&existing, b"same default stream").expect("write desktop item");
+        fs::write(
+            path_with_windows_stream(&source, ":critical"),
+            b"source ADS",
+        )
+        .expect("write source ADS");
+        fs::write(
+            path_with_windows_stream(&existing, ":critical"),
+            b"desktop ADS",
+        )
+        .expect("write desktop ADS");
+
+        let restored = restore_path_to_desktop_silent(&source, &desktop)
+            .expect("preserve different named streams");
+
+        assert_ne!(restored, existing);
+        assert_eq!(
+            fs::read(path_with_windows_stream(&existing, ":critical")).expect("read desktop ADS"),
+            b"desktop ADS"
+        );
+        assert_eq!(
+            fs::read(path_with_windows_stream(&restored, ":critical")).expect("read restored ADS"),
+            b"source ADS"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn staged_directory_move_verifies_nested_contents_before_source_removal() {
+        let root = unique_test_dir("dustdesk-staged-move");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::create_dir_all(source.join("nested")).expect("create source tree");
+        fs::write(source.join("root.bin"), [0, 1, 2, 3]).expect("write root file");
+        fs::write(source.join("nested").join("child.txt"), b"nested content")
+            .expect("write nested file");
+
+        move_path_via_staging(&source, &destination).expect("move through staging");
+
+        assert!(!source.exists());
+        assert_eq!(
+            fs::read(destination.join("root.bin")).expect("read root file"),
+            [0, 1, 2, 3]
+        );
+        assert_eq!(
+            fs::read(destination.join("nested").join("child.txt")).expect("read nested file"),
+            b"nested content"
+        );
+
+        let file_source = root.join("source.txt");
+        let file_destination = root.join("destination.txt");
+        fs::write(&file_source, b"file content").expect("write file source");
+        #[cfg(windows)]
+        fs::write(
+            path_with_windows_stream(&file_source, ":critical"),
+            b"critical ADS content",
+        )
+        .expect("write source ADS");
+        let mut source_permissions = fs::metadata(&file_source)
+            .expect("read source metadata")
+            .permissions();
+        source_permissions.set_readonly(true);
+        fs::set_permissions(&file_source, source_permissions).expect("make source read-only");
+        let source_modified = fs::metadata(&file_source)
+            .expect("read source metadata")
+            .modified()
+            .expect("read source last-write time");
+        move_path_via_staging(&file_source, &file_destination)
+            .expect("move file through reserved staging");
+        assert!(!file_source.exists());
+        assert_eq!(
+            fs::read(file_destination).expect("read moved file"),
+            b"file content"
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            fs::read(path_with_windows_stream(
+                &root.join("destination.txt"),
+                ":critical"
+            ))
+            .expect("read moved ADS"),
+            b"critical ADS content"
+        );
+        let destination_metadata =
+            fs::metadata(root.join("destination.txt")).expect("read destination metadata");
+        assert!(destination_metadata.permissions().readonly());
+        assert_eq!(
+            destination_metadata
+                .modified()
+                .expect("read destination last-write time"),
+            source_modified
+        );
+        let mut cleanup_permissions = destination_metadata.permissions();
+        cleanup_permissions.set_readonly(false);
+        fs::set_permissions(root.join("destination.txt"), cleanup_permissions)
+            .expect("clear destination read-only flag");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn large_transfer_tree_uses_a_bounded_root_lock() {
+        let root = unique_test_dir("dustdesk-bounded-transfer-lock");
+        let source = root.join("source");
+        fs::create_dir_all(&source).expect("create source");
+        for index in 0..=MAX_LOCKED_TRANSFER_TREE_ENTRIES {
+            fs::write(source.join(format!("item-{index}.txt")), b"data")
+                .expect("write source item");
+        }
+
+        let locked = lock_transfer_source_tree(&source).expect("lock large source tree");
+        assert!(!locked.fully_locked);
+        assert_eq!(locked.entries.len(), 1);
+        drop(locked);
+
+        let destination = root.join("destination");
+        move_path_via_staging(&source, &destination).expect("move large source tree");
+        assert!(!source.exists());
+        assert_eq!(
+            fs::read(destination.join("item-0.txt")).expect("read moved item"),
+            b"data"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn uncommitted_quarantine_recovers_the_original_directory() {
+        let root = unique_test_dir("dustdesk-uncommitted-quarantine");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::create_dir_all(&source).expect("create source");
+        fs::write(source.join("important.txt"), b"keep this data").expect("write source");
+
+        let quarantine =
+            QuarantinedTransferSource::reserve(&source, &destination).expect("reserve quarantine");
+        let journal_path = quarantine.journal_path.clone();
+        assert!(!source.exists());
+        assert!(quarantine.payload.exists());
+        drop(quarantine);
+
+        recover_transfer_quarantine_journal(&journal_path).expect("recover quarantine");
+
+        assert_eq!(
+            fs::read(source.join("important.txt")).expect("read restored source"),
+            b"keep this data"
+        );
+        assert!(!destination.exists());
+        assert!(!journal_path.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn committed_quarantine_finishes_cleanup_after_interruption() {
+        let root = unique_test_dir("dustdesk-committed-quarantine");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::create_dir_all(&source).expect("create source");
+        fs::write(source.join("first.txt"), b"first").expect("write first source");
+        fs::write(source.join("second.txt"), b"second").expect("write second source");
+
+        let quarantine =
+            QuarantinedTransferSource::reserve(&source, &destination).expect("reserve quarantine");
+        fs::create_dir_all(&destination).expect("create destination");
+        copy_dir_recursive(&quarantine.payload, &destination).expect("copy quarantined source");
+        quarantine
+            .mark_committed()
+            .expect("mark destination committed");
+        quarantine
+            .mark_cleanup_started()
+            .expect("mark source cleanup started");
+        fs::remove_file(quarantine.payload.join("first.txt"))
+            .expect("simulate interrupted source cleanup");
+        let journal_path = quarantine.journal_path.clone();
+        drop(quarantine);
+
+        recover_transfer_quarantine_journal(&journal_path).expect("finish committed cleanup");
+
+        assert!(!source.exists());
+        assert_eq!(
+            fs::read(destination.join("first.txt")).expect("read committed first file"),
+            b"first"
+        );
+        assert_eq!(
+            fs::read(destination.join("second.txt")).expect("read committed second file"),
+            b"second"
+        );
+        assert!(!journal_path.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn committed_quarantine_keeps_source_when_destination_changes_before_cleanup() {
+        let root = unique_test_dir("dustdesk-changed-committed-destination");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::create_dir_all(&source).expect("create source");
+        fs::write(source.join("important.txt"), b"original data").expect("write source");
+
+        let quarantine =
+            QuarantinedTransferSource::reserve(&source, &destination).expect("reserve quarantine");
+        fs::create_dir_all(&destination).expect("create destination");
+        copy_dir_recursive(&quarantine.payload, &destination).expect("copy quarantined source");
+        quarantine
+            .mark_committed()
+            .expect("mark destination committed");
+        fs::write(destination.join("important.txt"), b"changed destination")
+            .expect("change committed destination");
+        let journal_path = quarantine.journal_path.clone();
+        let payload = quarantine.payload.clone();
+        drop(quarantine);
+
+        let error = recover_transfer_quarantine_journal(&journal_path)
+            .expect_err("changed destination must keep isolated source");
+        assert!(error.contains("目标复核失败"));
+        assert_eq!(
+            fs::read(payload.join("important.txt")).expect("read preserved isolated source"),
+            b"original data"
+        );
+        assert!(journal_path.exists());
+
+        fs::remove_dir_all(&destination).expect("remove changed destination");
+        recover_transfer_quarantine_journal(&journal_path).expect("restore preserved source");
+        assert_eq!(
+            fs::read(source.join("important.txt")).expect("read restored source"),
+            b"original data"
+        );
+        assert!(!journal_path.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn staged_move_keeps_source_when_copy_verification_fails() {
+        let root = unique_test_dir("dustdesk-staged-move-failure");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::create_dir_all(&source).expect("create source");
+        fs::write(source.join("important.txt"), b"keep this data").expect("write source data");
+
+        let error = move_path_via_staging_with_verifier(&source, &destination, |_, _| {
+            Err("injected verification failure".to_owned())
+        })
+        .expect_err("abort failed verification");
+
+        assert_eq!(error, "injected verification failure");
+        assert_eq!(
+            fs::read(source.join("important.txt")).expect("source remains intact"),
+            b"keep this data"
+        );
+        assert!(!destination.exists(), "destination must not be committed");
+        assert!(
+            fs::read_dir(&root)
+                .expect("read test root")
+                .all(|entry| !is_internal_transfer_path(&entry.expect("read entry").path())),
+            "failed staging copy should be cleaned"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn copy_verification_rejects_same_length_content_mismatch() {
+        let root = unique_test_dir("dustdesk-copy-verification");
+        fs::create_dir_all(&root).expect("create test dir");
+        let source = root.join("source.bin");
+        let destination = root.join("destination.bin");
+        fs::write(&source, b"source").expect("write source");
+        fs::write(&destination, b"target").expect("write destination");
+
+        let error = verify_copied_path(&source, &destination).expect_err("detect corruption");
+
+        assert!(error.contains("文件内容不一致"));
+        assert_eq!(fs::read(&source).expect("source remains"), b"source");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn move_refuses_existing_destination_and_keeps_source() {
+        let root = unique_test_dir("dustdesk-move-collision");
+        fs::create_dir_all(&root).expect("create test dir");
+        let source = root.join("source.txt");
+        let destination = root.join("destination.txt");
+        fs::write(&source, b"source").expect("write source");
+        fs::write(&destination, b"destination").expect("write destination");
+
+        let error = move_path(&source, &destination).expect_err("reject destination collision");
+
+        assert!(error.contains("目标项目已存在"));
+        assert_eq!(fs::read(&source).expect("source remains"), b"source");
+        assert_eq!(
+            fs::read(&destination).expect("destination remains"),
+            b"destination"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn directory_migration_reports_nested_collision_and_preserves_both_files() {
+        let root = unique_test_dir("dustdesk-directory-collision");
+        let source = root.join("source");
+        let target = root.join("target");
+        fs::create_dir_all(source.join("nested")).expect("create source tree");
+        fs::create_dir_all(target.join("nested")).expect("create target tree");
+        let source_file = source.join("nested").join("report.txt");
+        let target_file = target.join("nested").join("report.txt");
+        fs::write(&source_file, b"source report").expect("write source report");
+        fs::write(&target_file, b"target report").expect("write target report");
+
+        let error = move_directory_contents(&source, &target).expect_err("report collision");
+
+        assert!(error.contains("迁移目标已存在"));
+        assert_eq!(
+            fs::read(&source_file).expect("source remains"),
+            b"source report"
+        );
+        assert_eq!(
+            fs::read(&target_file).expect("target remains"),
+            b"target report"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_no_replace_rename_preserves_existing_destination() {
+        let root = unique_test_dir("dustdesk-no-replace");
+        fs::create_dir_all(&root).expect("create test dir");
+        let source = root.join("source.txt");
+        let destination = root.join("destination.txt");
+        fs::write(&source, b"source").expect("write source");
+        fs::write(&destination, b"destination").expect("write destination");
+
+        rename_path_no_replace(&source, &destination).expect_err("must not replace destination");
+
+        assert_eq!(fs::read(&source).expect("source remains"), b"source");
+        assert_eq!(
+            fs::read(&destination).expect("destination remains"),
+            b"destination"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn staged_commit_does_not_replace_destination_created_during_copy() {
+        let root = unique_test_dir("dustdesk-staged-race");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::create_dir_all(&source).expect("create source");
+        fs::write(source.join("important.txt"), b"source data").expect("write source data");
+
+        let error =
+            move_path_via_staging_with_verifier(&source, &destination, |source, staging| {
+                verify_copied_path(source, staging)?;
+                fs::write(&destination, b"late destination").map_err(to_message)
+            })
+            .expect_err("no-replace commit must reject late destination");
+
+        assert!(!error.is_empty());
+        assert_eq!(
+            fs::read(source.join("important.txt")).expect("source remains"),
+            b"source data"
+        );
+        assert_eq!(
+            fs::read(&destination).expect("late destination remains"),
+            b"late destination"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn staged_move_rejects_new_source_entries_created_after_verification() {
+        let root = unique_test_dir("dustdesk-source-lock");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        let renamed_source = root.join("renamed-source");
+        fs::create_dir_all(&source).expect("create source");
+        fs::write(source.join("important.txt"), b"stable data").expect("write source data");
+
+        let error =
+            move_path_via_staging_with_verifier(&source, &destination, |source, staging| {
+                verify_copied_path(source, staging)?;
+                assert!(
+                    rename_path_no_replace(source, &renamed_source).is_err(),
+                    "locked source path must not be replaceable"
+                );
+                assert!(
+                    fs::write(source.join("important.txt"), b"changed data").is_err(),
+                    "locked source file must not be writable"
+                );
+                fs::write(source.join("late.txt"), b"late data").map_err(to_message)?;
+                Ok(())
+            })
+            .expect_err("source cleanup must stop when an unverified entry appears");
+
+        assert!(error.contains("目录内容不完整"));
+        assert!(source.exists());
+        assert!(!renamed_source.exists());
+        assert_eq!(
+            fs::read(source.join("important.txt")).expect("verified source data remains"),
+            b"stable data"
+        );
+        assert!(!destination.exists());
+        assert_eq!(
+            fs::read(source.join("late.txt")).expect("late source data remains"),
+            b"late data"
+        );
+        assert!(!destination.join("late.txt").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn transfer_rejects_top_level_and_nested_directory_reparse_points() {
+        let root = unique_test_dir("dustdesk-reparse");
+        let target = root.join("target");
+        fs::create_dir_all(&target).expect("create target");
+        fs::write(target.join("secret.txt"), b"target data").expect("write target data");
+
+        let top_level_link = root.join("top-level-link");
+        create_test_directory_reparse_point(&top_level_link, &target);
+        let top_level_destination = root.join("top-level-destination");
+        let top_level_error = move_path(&top_level_link, &top_level_destination)
+            .expect_err("reject top-level reparse point");
+        assert!(top_level_error.contains("符号链接或目录联接"));
+        assert!(!top_level_destination.exists());
+
+        let nested_source = root.join("nested-source");
+        fs::create_dir_all(&nested_source).expect("create nested source");
+        let nested_link = nested_source.join("nested-link");
+        create_test_directory_reparse_point(&nested_link, &target);
+        let nested_destination = root.join("nested-destination");
+        let nested_error = move_path(&nested_source, &nested_destination)
+            .expect_err("reject nested reparse point");
+        assert!(nested_error.contains("符号链接或目录联接"));
+        assert!(nested_source.exists());
+        assert!(!nested_destination.exists());
+        assert_eq!(
+            fs::read(target.join("secret.txt")).expect("target remains"),
+            b"target data"
+        );
+
+        fs::remove_dir(&nested_link).expect("remove nested reparse point");
+        fs::remove_dir(&top_level_link).expect("remove top-level reparse point");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn staging_copy_and_cleanup_never_follow_preexisting_paths_or_nested_reparse_points() {
+        let root = unique_test_dir("dustdesk-staging-reparse");
+        let target = root.join("target");
+        fs::create_dir_all(&target).expect("create target");
+        fs::write(target.join("secret.txt"), b"target data").expect("write target data");
+
+        let directory_source = root.join("directory-source");
+        let directory_staging = root.join("directory-staging");
+        fs::create_dir_all(directory_source.join("nested")).expect("create directory source");
+        fs::create_dir_all(&directory_staging).expect("reserve directory staging");
+        let nested_reparse = directory_staging.join("nested");
+        create_test_directory_reparse_point(&nested_reparse, &target);
+
+        copy_dir_recursive(&directory_source, &directory_staging)
+            .expect_err("preexisting nested path must abort copy");
+        assert!(
+            lock_transfer_source_tree(&directory_staging).is_err(),
+            "cleanup validation must reject nested reparse points"
+        );
+        assert!(
+            directory_staging.exists(),
+            "cleanup must retain a tree containing a reparse point"
+        );
+        assert_eq!(
+            fs::read(target.join("secret.txt")).expect("target remains"),
+            b"target data"
+        );
+
+        let file_source = root.join("file-source");
+        let file_staging = root.join("file-staging");
+        fs::create_dir_all(&file_source).expect("create file source");
+        fs::create_dir_all(&file_staging).expect("reserve file staging");
+        fs::write(file_source.join("data.txt"), b"source data").expect("write source file");
+        fs::write(file_staging.join("data.txt"), b"existing data")
+            .expect("write preexisting staging file");
+
+        copy_dir_recursive(&file_source, &file_staging)
+            .expect_err("create_new must reject preexisting file");
+        assert_eq!(
+            fs::read(file_staging.join("data.txt")).expect("existing file remains"),
+            b"existing data"
+        );
+
+        fs::remove_dir(&nested_reparse).expect("remove nested reparse point");
+        delete_locked_source_tree(
+            lock_transfer_source_tree(&directory_staging).expect("lock safe staging tree"),
+        )
+        .expect("clean safe staging tree");
+        assert!(!directory_staging.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn organizer_recovery_scan_excludes_transfer_staging_paths() {
+        let root = unique_test_dir("dustdesk-staging-scan");
+        let category = root.join("documents");
+        let real_item = category.join("report.txt");
+        let staging = category.join(".dustdesk-transfer-s123-0.tmp");
+        let source_staging = category.join(".dustdesk-source-transfer-s456-0.tmp");
+        fs::create_dir_all(&staging).expect("create staging dir");
+        fs::create_dir_all(&source_staging).expect("create source staging dir");
+        fs::write(&real_item, b"report").expect("write real item");
+        fs::write(staging.join("partial.txt"), b"partial").expect("write staging item");
+        fs::write(source_staging.join("preserved.txt"), b"preserved")
+            .expect("write source staging item");
+
+        let items = organizer_contents(&root);
+
+        assert_eq!(items, vec![real_item]);
+        assert!(is_transfer_staging_path(&staging));
+        assert!(is_source_transfer_staging_path(&source_staging));
+        let config = AppConfig {
+            desktop_categories: vec![DeskCategory {
+                name: "documents".to_owned(),
+                item_paths: vec![
+                    category.join("report.txt").display().to_string(),
+                    staging.display().to_string(),
+                    source_staging.display().to_string(),
+                ],
+                ..DeskCategory::default()
+            }],
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            restore_candidate_count(&config, &root, &root.join("desktop")),
+            1
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    fn create_test_directory_reparse_point(link: &Path, target: &Path) {
+        if std::os::windows::fs::symlink_dir(target, link).is_ok() {
+            return;
+        }
+
+        let output = Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .expect("create directory junction");
+        assert!(
+            output.status.success(),
+            "unable to create test reparse point: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn unique_test_dir(prefix: &str) -> PathBuf {
@@ -3893,29 +7225,28 @@ fn start_desktop_background_operation(
         return Err("已有桌面整理任务正在执行，请稍后再试".to_owned());
     }
 
-    emit_desktop_operation(
-        &app,
-        DesktopOperationPayload {
-            kind,
-            status: "started",
-            message: match kind {
-                "classify" => "正在智能收纳桌面...".to_owned(),
-                "restore" => "正在还原桌面...".to_owned(),
-                _ => "正在处理桌面项目...".to_owned(),
-            },
-            moved: 0,
-            skipped: 0,
-            restored: 0,
-            total: 0,
-            current_path: String::new(),
-            category_counts: Vec::new(),
+    let started_payload = DesktopOperationPayload {
+        kind,
+        status: "started",
+        message: match kind {
+            "classify" => "正在智能收纳桌面...".to_owned(),
+            "restore" => "正在还原桌面...".to_owned(),
+            _ => "正在处理桌面项目...".to_owned(),
         },
-    );
+        moved: 0,
+        skipped: 0,
+        restored: 0,
+        total: 0,
+        current_path: String::new(),
+        category_counts: Vec::new(),
+    };
+    set_last_desktop_operation(started_payload.clone());
+    emit_desktop_operation(&app, started_payload);
 
     tauri::async_runtime::spawn_blocking(move || {
-        let payload = match operation() {
-            Ok(payload) => payload,
-            Err(error) => DesktopOperationPayload {
+        let payload = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)) {
+            Ok(Ok(payload)) => payload,
+            Ok(Err(error)) => DesktopOperationPayload {
                 kind,
                 status: "failed",
                 message: error,
@@ -3926,12 +7257,46 @@ fn start_desktop_background_operation(
                 current_path: String::new(),
                 category_counts: Vec::new(),
             },
+            Err(_) => DesktopOperationPayload {
+                kind,
+                status: "failed",
+                message: "桌面整理任务异常中断，请刷新后重试".to_owned(),
+                moved: 0,
+                skipped: 0,
+                restored: 0,
+                total: 0,
+                current_path: String::new(),
+                category_counts: Vec::new(),
+            },
         };
-        emit_desktop_operation(&app, payload);
         DESKTOP_OPERATION_RUNNING.store(false, Ordering::SeqCst);
+        set_last_desktop_operation(payload.clone());
+        emit_desktop_operation(&app, payload);
+        emit_desktop_cards_changed(&app);
     });
 
     Ok(())
+}
+
+#[tauri::command]
+fn desktop_operation_status() -> DesktopOperationStatus {
+    DesktopOperationStatus {
+        running: DESKTOP_OPERATION_RUNNING.load(Ordering::SeqCst),
+        last: DESKTOP_OPERATION_LAST
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .ok()
+            .and_then(|payload| payload.clone()),
+    }
+}
+
+fn set_last_desktop_operation(payload: DesktopOperationPayload) {
+    if let Ok(mut last) = DESKTOP_OPERATION_LAST
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+    {
+        *last = Some(payload);
+    }
 }
 
 fn emit_desktop_operation(app: &tauri::AppHandle, payload: DesktopOperationPayload) {
@@ -4287,6 +7652,7 @@ fn show_main_window_impl(app: &tauri::AppHandle) -> Result<(), String> {
         window.show().map_err(to_message)?;
         let _ = window.unminimize();
         let _ = window.set_focus();
+        let _ = app.emit("dustdesk://main-window-shown", ());
     }
     Ok(())
 }
@@ -4452,6 +7818,11 @@ fn main() {
 
             let handle = app.handle().clone();
             tauri::async_runtime::spawn_blocking(move || {
+                if let Err(error) =
+                    store::with_storage_mutation(recover_pending_runtime_migration_locked)
+                {
+                    eprintln!("failed to recover pending runtime directory migration: {error}");
+                }
                 if let Some(window) = handle.get_webview_window("desktop-widget") {
                     let _ = place_desktop_widget(&window);
                 }
@@ -4459,14 +7830,14 @@ fn main() {
                     eprintln!("failed to show desktop cards: {error}");
                 }
                 if let Ok(store) = AppStore::open() {
+                    cleanup_startup_transfer_staging_dirs(&store);
                     if let Err(error) = repair_existing_app_desktop_entries(&store) {
                         eprintln!("failed to repair desktop entry shortcuts: {error}");
                     }
                 }
-                if let Err(error) = restore_all_organized_items_to_desktop_and_clear_markers() {
-                    eprintln!("failed to restore organized desktop items on startup: {error}");
+                if let Err(error) = start_restore_background_operation(handle.clone()) {
+                    eprintln!("failed to start desktop restore on startup: {error}");
                 }
-                emit_desktop_cards_changed(&handle);
             });
             Ok(())
         })
@@ -4484,6 +7855,7 @@ fn main() {
             restore_item_to_desktop,
             restore_all_to_desktop,
             start_restore_all_to_desktop_task,
+            desktop_operation_status,
             add_launcher,
             add_launchers,
             remove_launcher,

@@ -63,6 +63,11 @@ export interface DesktopOperationEvent {
   category_counts: CategoryClassifyCount[]
 }
 
+export interface DesktopOperationStatus {
+  running: boolean
+  last?: DesktopOperationEvent | null
+}
+
 export interface CategoryClassifyCount {
   name: string
   count: number

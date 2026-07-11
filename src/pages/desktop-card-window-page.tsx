@@ -80,6 +80,7 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
   const startRestoreAllToDesktopTask = useDustDeskStore((state) => state.startRestoreAllToDesktopTask)
   const showPathInFolder = useDustDeskStore((state) => state.showPathInFolder)
   const startClassifyDesktopItemsTask = useDustDeskStore((state) => state.startClassifyDesktopItemsTask)
+  const getDesktopOperationStatus = useDustDeskStore((state) => state.getDesktopOperationStatus)
   const openPath = useDustDeskStore((state) => state.openPath)
   const startAllLaunchers = useDustDeskStore((state) => state.startAllLaunchers)
   const splitDesktopWidgets = useDustDeskStore((state) => state.splitDesktopWidgets)
@@ -93,15 +94,18 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
   const [isClassifyingDesktop, setIsClassifyingDesktop] = useState(false)
   const [isRestoringDesktop, setIsRestoringDesktop] = useState(false)
   const [isMergingCategories, setIsMergingCategories] = useState(false)
+  const [dropOperationLabel, setDropOperationLabel] = useState("")
   const desktopOperationLabel = isClassifyingDesktop
     ? notice || "正在智能收纳桌面..."
     : isRestoringDesktop
       ? notice || "正在还原桌面..."
       : isMergingCategories
         ? "正在合并分类..."
-        : ""
+        : dropOperationLabel
   const pendingClassifyActionRef = useRef<"split-all" | null>(null)
   const previousSplitCategoryIndicesRef = useRef<number[]>([])
+  const desktopOperationRef = useRef<{ kind: DesktopOperationEvent["kind"] | null; done: boolean }>({ kind: null, done: true })
+  const desktopOperationTimeoutRef = useRef<number | null>(null)
   const kind = (routeKind ?? params.kind) === "launcher" ? "launcher" : "category"
   const index = Number(routeIndex ?? params.index ?? 0)
   const windowLabel = kind === "launcher" ? "desktop-launcher" : `desktop-category-${index}`
@@ -154,6 +158,7 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
     void safeListen<DesktopOperationEvent>("dustdesk://desktop-operation", (event) => {
       const payload = event.payload
       if (payload.status === "started") {
+        beginDesktopOperation(payload.kind)
         setNotice(payload.message)
         if (payload.kind === "classify") {
           setIsClassifyingDesktop(true)
@@ -163,7 +168,11 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
         return
       }
       if (payload.status === "progress") {
+        beginDesktopOperation(payload.kind)
         setNotice(payload.message)
+        if (payload.kind === "classify") {
+          setIsClassifyingDesktop(true)
+        }
         if (payload.kind === "restore") {
           setIsRestoringDesktop(true)
         }
@@ -177,7 +186,11 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
     }).then((value) => {
       unlisten = value
     })
-    return () => unlisten?.()
+    void syncDesktopOperationStatus()
+    return () => {
+      unlisten?.()
+      clearDesktopOperationTimeout()
+    }
   }, [loadDesktopCardSnapshot, saveDesktopSplitIndices, splitDesktopWidgets])
 
   useEffect(() => {
@@ -224,23 +237,30 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
     }
     try {
       if (kind === "launcher") {
+        setDropOperationLabel(`正在加入快捷启动 ${paths.length} 项...`)
         const added = await addLaunchersLight(paths)
         setNotice(countNotice("已加入快捷启动", added, paths.length, "没有新增启动项"))
       } else {
+        setDropOperationLabel(`正在收纳 ${paths.length} 项...`)
         const added = await addItemsToCategoryLight(index, paths)
         setNotice(countNotice("已收纳", added, paths.length, "没有新增收纳项目"))
       }
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error))
+    } finally {
+      setDropOperationLabel("")
     }
   }
 
   async function handleRestoreDragOut(path: string, position: DesktopDropPosition) {
     try {
+      setDropOperationLabel(`正在移回桌面：${displayPathName(path)}`)
       const restored = await restoreItemToDesktopLight(index, path, position)
       setNotice(`已移回桌面：${displayPathName(restored)}`)
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error))
+    } finally {
+      setDropOperationLabel("")
     }
   }
 
@@ -265,6 +285,7 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
   async function handleClassifyDesktopItems() {
     if (isClassifyingDesktop) return
     pendingClassifyActionRef.current = null
+    beginDesktopOperation("classify")
     setIsClassifyingDesktop(true)
     setNotice("正在智能收纳桌面...")
     try {
@@ -282,6 +303,7 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
     const previous = readSplitCategoryIndices()
     pendingClassifyActionRef.current = "split-all"
     previousSplitCategoryIndicesRef.current = previous
+    beginDesktopOperation("classify")
     setIsClassifyingDesktop(true)
     setNotice("正在智能收纳并拆分...")
     try {
@@ -396,6 +418,7 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
     if (isRestoringDesktop) return
     if (!window.confirm("确认把所有收纳箱项目移回桌面吗？这会清空对应的收纳记录。")) return
 
+    beginDesktopOperation("restore")
     setIsRestoringDesktop(true)
     setNotice("正在还原桌面...")
     try {
@@ -408,6 +431,7 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
   }
 
   async function finishClassifyOperation(payload: DesktopOperationEvent) {
+    if (!completeDesktopOperation("classify")) return
     if (payload.status === "failed") {
       pendingClassifyActionRef.current = null
       setNotice(payload.message || "智能收纳失败")
@@ -415,7 +439,6 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
       return
     }
 
-    await loadDesktopCardSnapshot({ force: true })
     const result = classifyResultFromOperation(payload)
     if (pendingClassifyActionRef.current === "split-all") {
       pendingClassifyActionRef.current = null
@@ -437,17 +460,72 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
   }
 
   async function finishRestoreOperation(payload: DesktopOperationEvent) {
+    if (!completeDesktopOperation("restore")) return
     if (payload.status === "failed") {
       setNotice(payload.message || "还原桌面失败")
       setIsRestoringDesktop(false)
       return
     }
 
-    await loadDesktopCardSnapshot({ force: true })
     writeSplitCategoryIndices([])
     await saveDesktopSplitIndices([])
     setNotice(payload.message || (payload.restored > 0 ? `已还原 ${payload.restored} 项到桌面` : "没有需要还原到桌面的收纳项目"))
     setIsRestoringDesktop(false)
+  }
+
+  function beginDesktopOperation(kind: DesktopOperationEvent["kind"]) {
+    clearDesktopOperationTimeout()
+    desktopOperationRef.current = { kind, done: false }
+    desktopOperationTimeoutRef.current = window.setTimeout(() => {
+      const current = desktopOperationRef.current
+      if (current.kind !== kind || current.done) return
+      desktopOperationTimeoutRef.current = null
+      void syncDesktopOperationStatus()
+    }, 10_000)
+  }
+
+  function completeDesktopOperation(kind: DesktopOperationEvent["kind"]) {
+    const current = desktopOperationRef.current
+    if (current.kind !== kind || current.done) return false
+    clearDesktopOperationTimeout()
+    desktopOperationRef.current = { kind, done: true }
+    return true
+  }
+
+  function clearDesktopOperationTimeout() {
+    if (desktopOperationTimeoutRef.current === null) return
+    window.clearTimeout(desktopOperationTimeoutRef.current)
+    desktopOperationTimeoutRef.current = null
+  }
+
+  async function syncDesktopOperationStatus() {
+    try {
+      const status = await getDesktopOperationStatus()
+      const payload = status.last
+      if (!status.running) {
+        if (!payload || payload.status === "finished" || payload.status === "failed") {
+          clearDesktopOperationTimeout()
+          desktopOperationRef.current = { kind: payload?.kind ?? null, done: true }
+          setIsClassifyingDesktop(false)
+          setIsRestoringDesktop(false)
+        }
+        return
+      }
+      if (payload?.kind === "classify") {
+        beginDesktopOperation("classify")
+        setIsClassifyingDesktop(true)
+        setNotice(payload.message || "正在智能收纳桌面...")
+      } else if (payload?.kind === "restore") {
+        beginDesktopOperation("restore")
+        setIsRestoringDesktop(true)
+        setNotice(payload.message || "正在还原桌面...")
+      }
+    } catch {
+      clearDesktopOperationTimeout()
+      desktopOperationRef.current = { kind: null, done: true }
+      setIsClassifyingDesktop(false)
+      setIsRestoringDesktop(false)
+    }
   }
 
   function updateSettings(next: Partial<WidgetSettings>) {
@@ -554,7 +632,7 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
 
 function WidgetOperationOverlay({ label }: { label: string }) {
   return (
-    <div className="no-drag absolute inset-0 z-40 grid place-items-center bg-slate-950/60 backdrop-blur-md">
+    <div className="no-drag pointer-events-none absolute inset-0 z-40 grid place-items-center bg-slate-950/60 backdrop-blur-md">
       <div className="flex items-center gap-2 rounded-xl border border-white/15 bg-slate-950/90 px-3 py-2 text-xs font-semibold text-white shadow-2xl shadow-black/30">
         <ArrowsClockwise className="size-4 animate-spin text-emerald-300" weight="duotone" />
         <span>{label}</span>
@@ -619,9 +697,6 @@ function SettingsMenu({
           <MenuButton icon={Archive} label={isClassifyingDesktop ? "智能收纳中" : "智能收纳桌面"} disabled={isClassifyingDesktop} onClick={() => void onClassifyDesktop()} />
           <MenuButton icon={Desktop} label={isRestoringDesktop ? "还原中" : "一键还原桌面"} disabled={isRestoringDesktop} onClick={() => void onRestoreAllToDesktop()} />
         </>
-      ) : null}
-      {kind === "launcher" ? (
-        <MenuButton icon={Columns} label={isMergingCategories ? "合并中" : "一键合并分类"} disabled={isMergingCategories} onClick={() => void onMergeAllCategories()} />
       ) : null}
       <MenuButton icon={ArrowsClockwise} label="刷新" onClick={() => void onRefresh()} />
       <div className="my-1 h-px bg-white/10" />

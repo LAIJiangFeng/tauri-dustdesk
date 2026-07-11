@@ -1,4 +1,4 @@
-import { startTransition, useEffect } from "react"
+import { startTransition, useEffect, useRef } from "react"
 import { NavLink, Outlet, useLocation } from "react-router"
 import { ArrowsClockwise, Crosshair, Desktop, Minus, MoonStars, Square, SunDim, Warning, X } from "@phosphor-icons/react"
 import { Badge } from "@/components/ui/badge"
@@ -7,7 +7,7 @@ import { ScrollArea } from "@/components/ui/scroll-area"
 import { Separator } from "@/components/ui/separator"
 import { navigationItems, pageFromPath, pageMeta } from "@/config/navigation"
 import { useTheme } from "@/hooks/use-theme"
-import { hideMainWindowToTray, minimizeCurrentWindow, toggleCurrentWindowMaximize } from "@/lib/tauri-window"
+import { hideMainWindowToTray, minimizeCurrentWindow, safeListen, toggleCurrentWindowMaximize } from "@/lib/tauri-window"
 import { truncate } from "@/lib/utils"
 import { useDustDeskStore } from "@/stores/dustdesk-store"
 
@@ -15,11 +15,47 @@ export function AppShell() {
   const location = useLocation()
   const activePage = pageFromPath(location.pathname)
   const setPage = useDustDeskStore((state) => state.setPage)
+  const load = useDustDeskStore((state) => state.load)
   const { theme, toggleTheme } = useTheme()
+  const previousPageRef = useRef(activePage)
 
   useEffect(() => {
     startTransition(() => setPage(activePage))
-  }, [activePage, setPage])
+    if (previousPageRef.current !== activePage) {
+      previousPageRef.current = activePage
+      void load({ force: true })
+    }
+  }, [activePage, load, setPage])
+
+  useEffect(() => {
+    let disposed = false
+    const unlisteners: Array<() => void> = []
+    const refreshSnapshot = () => void load({ force: true })
+    const register = (event: "dustdesk://desktop-cards-changed" | "dustdesk://main-window-shown") => {
+      void safeListen(event, refreshSnapshot).then((unlisten) => {
+        if (!unlisten) return
+        if (disposed) {
+          unlisten()
+        } else {
+          unlisteners.push(unlisten)
+        }
+      })
+    }
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") refreshSnapshot()
+    }
+
+    register("dustdesk://desktop-cards-changed")
+    register("dustdesk://main-window-shown")
+    window.addEventListener("focus", refreshSnapshot)
+    document.addEventListener("visibilitychange", handleVisibilityChange)
+    return () => {
+      disposed = true
+      unlisteners.forEach((unlisten) => unlisten())
+      window.removeEventListener("focus", refreshSnapshot)
+      document.removeEventListener("visibilitychange", handleVisibilityChange)
+    }
+  }, [load])
 
   return (
     <div className="flex h-screen w-screen flex-col overflow-hidden bg-background text-foreground">

@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core"
 import { create } from "zustand"
 import { immer } from "zustand/middleware/immer"
 import type { DesktopDropPosition } from "@/lib/dustdesk-dnd"
-import { displayPathName, extensionFromPath } from "@/lib/utils"
+import { displayPathName, displayWindowsEntryName, extensionFromPath } from "@/lib/utils"
 import type {
   AppPage,
   AppSettings,
@@ -12,6 +12,7 @@ import type {
   DeskCategory,
   DesktopFrameVisibility,
   DesktopLayout,
+  DesktopOperationStatus,
   DesktopWindowLayout,
   LaunchItem,
   SearchItem,
@@ -67,6 +68,10 @@ interface DesktopSnapshotLoadOptions {
   iconOptions?: IconResolutionOptions | false
 }
 
+interface SnapshotLoadOptions {
+  force?: boolean
+}
+
 interface RestoreDesktopArgs extends Record<string, unknown> {
   index: number
   path: string
@@ -75,19 +80,28 @@ interface RestoreDesktopArgs extends Record<string, unknown> {
 
 const iconBatchSize = 24
 const iconPathLimit = 512
+const snapshotReloadDedupeMs = 120
 const desktopSnapshotReloadDedupeMs = 120
 let iconResolutionToken = 0
 let iconResolutionActive = false
 let queuedIconResolutionOptions: IconResolutionOptions | null = null
 const iconCache = new Map<string, string | null>()
+let snapshotLoadPromise: Promise<void> | null = null
+let snapshotForceReloadQueued = false
+let snapshotLoadedAt = 0
 let desktopSnapshotLoadPromise: Promise<void> | null = null
+let desktopSnapshotForceReloadQueued = false
 let desktopSnapshotLoadedAt = 0
 
 function resetRuntimeCaches() {
   iconResolutionToken += 1
   queuedIconResolutionOptions = null
   iconCache.clear()
+  snapshotLoadPromise = null
+  snapshotForceReloadQueued = false
+  snapshotLoadedAt = 0
   desktopSnapshotLoadPromise = null
+  desktopSnapshotForceReloadQueued = false
   desktopSnapshotLoadedAt = 0
 }
 
@@ -384,8 +398,9 @@ function normalizeCategory(value: unknown): DeskCategory {
 function normalizeDesktopItem(value: unknown) {
   const raw = asRecord(value)
   const path = asPathString(raw.path ?? raw.Path)
+  const rawName = asString(raw.name ?? raw.Name)
   return {
-    name: asString(raw.name ?? raw.Name) || displayPathName(path),
+    name: displayWindowsEntryName(rawName, path),
     path,
     extension: asString(raw.extension ?? raw.Extension) || extensionFromPath(path),
     is_dir: asBoolean(raw.is_dir ?? raw.IsDir),
@@ -395,7 +410,7 @@ function normalizeDesktopItem(value: unknown) {
 
 function pathToDesktopItem(path: string) {
   return {
-    name: displayPathName(path),
+    name: displayWindowsEntryName(undefined, path),
     path,
     extension: extensionFromPath(path),
     is_dir: false,
@@ -404,9 +419,10 @@ function pathToDesktopItem(path: string) {
 
 function normalizeLauncher(value: unknown): LaunchItem {
   const raw = asRecord(value)
+  const path = asPathString(raw.path ?? raw.Path)
   return {
-    name: asString(raw.name ?? raw.Name),
-    path: asPathString(raw.path ?? raw.Path),
+    name: displayWindowsEntryName(asString(raw.name ?? raw.Name), path),
+    path,
     icon_data_url: asString(raw.icon_data_url ?? raw.IconDataUrl) || undefined,
   }
 }
@@ -441,10 +457,11 @@ function normalizeSearchOverlay(value: unknown): SearchOverlayData {
 
 function normalizeSearchItem(value: unknown): SearchItem {
   const raw = asRecord(value)
+  const path = asPathString(raw.path ?? raw.Path)
   return {
     id: asString(raw.id ?? raw.Id),
-    name: asString(raw.name ?? raw.Name, "未命名"),
-    path: asPathString(raw.path ?? raw.Path),
+    name: displayWindowsEntryName(asString(raw.name ?? raw.Name, "未命名"), path),
+    path,
     kind: normalizeSearchKind(raw.kind ?? raw.Kind),
     extension: asString(raw.extension ?? raw.Extension, "FILE"),
     is_dir: asBoolean(raw.is_dir ?? raw.IsDir),
@@ -696,7 +713,7 @@ interface DustDeskState {
   error: string | null
   setPage: (page: AppPage) => void
   selectCategory: (index: number) => void
-  load: () => Promise<void>
+  load: (options?: SnapshotLoadOptions) => Promise<void>
   loadDesktopSnapshot: (options?: DesktopSnapshotLoadOptions) => Promise<void>
   resolveSnapshotIcons: (options?: IconResolutionOptions) => Promise<void>
   refresh: () => Promise<void>
@@ -721,6 +738,7 @@ interface DustDeskState {
   classifyDesktopItems: () => Promise<ClassifyResult>
   classifyDesktopItemsLight: () => Promise<ClassifyResult>
   startClassifyDesktopItemsTask: () => Promise<void>
+  getDesktopOperationStatus: () => Promise<DesktopOperationStatus>
   createDesktopEntries: () => Promise<string[]>
   showDesktopWidget: () => Promise<void>
   refreshDesktopFrameVisibility: () => Promise<void>
@@ -767,28 +785,47 @@ export const useDustDeskStore = create<DustDeskState>()(
       set((state) => {
         state.selectedCategory = index
       }),
-    load: async () => {
-      set((state) => {
-        state.loading = true
-        state.error = null
-      })
+    load: async (options = {}) => {
+      if (snapshotLoadPromise) {
+        if (options.force) snapshotForceReloadQueued = true
+        return snapshotLoadPromise
+      }
+      if (!options.force && Date.now() - snapshotLoadedAt < snapshotReloadDedupeMs) return
+
+      snapshotLoadPromise = (async () => {
+        do {
+          snapshotForceReloadQueued = false
+          set((state) => {
+            state.loading = true
+            state.error = null
+          })
+          try {
+            const snapshot = await call<AppSnapshot>("load_snapshot")
+            set((state) => {
+              state.snapshot = snapshot
+              state.selectedCategory = Math.min(state.selectedCategory, Math.max(0, snapshot.categories.length - 1))
+              state.loading = false
+            })
+            snapshotLoadedAt = Date.now()
+            void get().resolveSnapshotIcons({ includeDesktopItems: true })
+          } catch (error) {
+            set((state) => {
+              state.error = error instanceof Error ? error.message : String(error)
+              state.loading = false
+            })
+          }
+        } while (snapshotForceReloadQueued)
+      })()
+
       try {
-        const snapshot = await call<AppSnapshot>("load_snapshot")
-        set((state) => {
-          state.snapshot = snapshot
-          state.selectedCategory = Math.min(state.selectedCategory, Math.max(0, snapshot.categories.length - 1))
-          state.loading = false
-        })
-        void get().resolveSnapshotIcons({ includeDesktopItems: true })
-      } catch (error) {
-        set((state) => {
-          state.error = error instanceof Error ? error.message : String(error)
-          state.loading = false
-        })
+        await snapshotLoadPromise
+      } finally {
+        snapshotLoadPromise = null
       }
     },
     loadDesktopSnapshot: async (options = {}) => {
       if (desktopSnapshotLoadPromise) {
+        if (options.force) desktopSnapshotForceReloadQueued = true
         const iconOptions = iconOptionsForDesktopSnapshotLoad(options)
         if (iconOptions) {
           void desktopSnapshotLoadPromise.then(() => get().resolveSnapshotIcons(iconOptions))
@@ -800,34 +837,37 @@ export const useDustDeskStore = create<DustDeskState>()(
       }
 
       desktopSnapshotLoadPromise = (async () => {
-        set((state) => {
-          state.loading = true
-          state.error = null
-        })
-        try {
-          let snapshot = await call<AppSnapshot>("load_desktop_snapshot")
-          if (options.preserveDesktopItems && snapshot.desktop_items.length === 0) {
-            snapshot = {
-              ...snapshot,
-              desktop_items: get().snapshot.desktop_items,
+        do {
+          desktopSnapshotForceReloadQueued = false
+          set((state) => {
+            state.loading = true
+            state.error = null
+          })
+          try {
+            let snapshot = await call<AppSnapshot>("load_desktop_snapshot")
+            if (options.preserveDesktopItems && snapshot.desktop_items.length === 0) {
+              snapshot = {
+                ...snapshot,
+                desktop_items: get().snapshot.desktop_items,
+              }
             }
+            set((state) => {
+              state.snapshot = snapshot
+              state.selectedCategory = Math.min(state.selectedCategory, Math.max(0, snapshot.categories.length - 1))
+              state.loading = false
+            })
+            desktopSnapshotLoadedAt = Date.now()
+            const iconOptions = iconOptionsForDesktopSnapshotLoad(options)
+            if (iconOptions) {
+              void get().resolveSnapshotIcons(iconOptions)
+            }
+          } catch (error) {
+            set((state) => {
+              state.error = error instanceof Error ? error.message : String(error)
+              state.loading = false
+            })
           }
-          set((state) => {
-            state.snapshot = snapshot
-            state.selectedCategory = Math.min(state.selectedCategory, Math.max(0, snapshot.categories.length - 1))
-            state.loading = false
-          })
-          desktopSnapshotLoadedAt = Date.now()
-          const iconOptions = iconOptionsForDesktopSnapshotLoad(options)
-          if (iconOptions) {
-            void get().resolveSnapshotIcons(iconOptions)
-          }
-        } catch (error) {
-          set((state) => {
-            state.error = error instanceof Error ? error.message : String(error)
-            state.loading = false
-          })
-        }
+        } while (desktopSnapshotForceReloadQueued)
       })()
 
       try {
@@ -873,7 +913,7 @@ export const useDustDeskStore = create<DustDeskState>()(
         }
       }
     },
-    refresh: async () => get().load(),
+    refresh: async () => get().load({ force: true }),
     createCategory: async (name) => {
       name = name?.trim() || `新分类 ${get().snapshot.categories.length + 1}`
       await call("create_category", { name })
@@ -1016,6 +1056,9 @@ export const useDustDeskStore = create<DustDeskState>()(
     },
     startClassifyDesktopItemsTask: async () => {
       await call("start_classify_desktop_items_task")
+    },
+    getDesktopOperationStatus: async () => {
+      return call<DesktopOperationStatus>("desktop_operation_status")
     },
     createDesktopEntries: async () => {
       return call<string[]>("create_desktop_entries")

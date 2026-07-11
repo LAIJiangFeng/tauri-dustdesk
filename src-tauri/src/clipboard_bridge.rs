@@ -28,11 +28,13 @@ static CLIPBOARD_HISTORY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 pub fn with_clipboard_history_lock<T>(
     operation: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
-    let _guard = CLIPBOARD_HISTORY_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .map_err(|_| "剪贴板历史写入锁已损坏".to_owned())?;
-    operation()
+    crate::store::with_storage_mutation(|| {
+        let _guard = CLIPBOARD_HISTORY_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .map_err(|_| "剪贴板历史写入锁已损坏".to_owned())?;
+        operation()
+    })
 }
 
 pub fn spawn_text_history_monitor() {
@@ -227,7 +229,7 @@ fn store_text_history(text: String) -> Result<(), String> {
 fn store_text_history_locked(text: String) -> Result<(), String> {
     let normalized = limit_text(text);
     let store = AppStore::open().map_err(to_message)?;
-    let mut clipboard = store.load_clipboard();
+    let mut clipboard = store.load_clipboard_strict().map_err(to_message)?;
     if clipboard
         .items
         .first()
@@ -280,7 +282,7 @@ fn store_image_history_locked(image_png_base64: String) -> Result<(), String> {
     }
 
     let store = AppStore::open().map_err(to_message)?;
-    let mut clipboard = store.load_clipboard();
+    let mut clipboard = store.load_clipboard_strict().map_err(to_message)?;
     let image_hash = image_fingerprint(&normalized);
     if clipboard.items.first().is_some_and(|item| {
         item.kind == ClipboardHistoryKind::Image

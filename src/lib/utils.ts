@@ -20,6 +20,11 @@ export function displayPathName(path: string | undefined | null) {
   return name.slice(0, dotIndex) || name
 }
 
+export function displayWindowsEntryName(name: string | undefined | null, path: string | undefined | null) {
+  const rawName = name?.trim() || displayPathName(path)
+  return rawName.replace(/\.(lnk|url|appref-ms)$/i, "") || rawName
+}
+
 export function pathFileName(path: string | undefined | null) {
   const value = path?.trim() ?? ""
   if (!value) return ""

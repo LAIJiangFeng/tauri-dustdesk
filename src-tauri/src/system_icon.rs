@@ -33,13 +33,13 @@ mod windows_icon {
         },
         Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, WIN32_FIND_DATAW},
         System::Com::{
-            CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+            CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_INPROC_SERVER,
             COINIT_APARTMENTTHREADED, STGM_READ,
         },
         UI::{
             Shell::{
                 ExtractIconExW, SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON,
-                SHGFI_USEFILEATTRIBUTES,
+                SHGFI_PIDL, SHGFI_USEFILEATTRIBUTES,
             },
             WindowsAndMessaging::{DestroyIcon, DrawIconEx, DI_NORMAL, HICON},
         },
@@ -61,6 +61,7 @@ mod windows_icon {
         let hicon = shortcut_icon_sources(path)
             .into_iter()
             .find_map(|source| icon_source_icon(&source))
+            .or_else(|| shortcut_namespace_icon(path))
             .or_else(|| {
                 if is_shortcut {
                     return None;
@@ -434,6 +435,96 @@ mod windows_icon {
         }
 
         rgba.and_then(|bytes| encode_png(&bytes, width as u32, height as u32))
+    }
+
+    fn shortcut_namespace_icon(path: &Path) -> Option<HICON> {
+        if !is_windows_shortcut(path) {
+            return None;
+        }
+
+        unsafe {
+            let init_result = CoInitializeEx(null_mut(), COINIT_APARTMENTTHREADED as u32);
+            let initialized = init_result == S_OK || init_result == S_FALSE;
+            let icon = if initialized || init_result == RPC_E_CHANGED_MODE {
+                read_shortcut_namespace_icon(path)
+            } else {
+                None
+            };
+            if initialized {
+                CoUninitialize();
+            }
+            icon
+        }
+    }
+
+    unsafe fn read_shortcut_namespace_icon(path: &Path) -> Option<HICON> {
+        let mut link_ptr = null_mut();
+        let create_result = unsafe {
+            CoCreateInstance(
+                &CLSID_SHELL_LINK,
+                null_mut(),
+                CLSCTX_INPROC_SERVER,
+                &IID_ISHELL_LINK_W,
+                &mut link_ptr,
+            )
+        };
+        if create_result < 0 || link_ptr.is_null() {
+            return None;
+        }
+
+        let link = link_ptr.cast::<IShellLinkW>();
+        let Some(persist) = query_persist_file(link) else {
+            unsafe {
+                release_interface(link.cast());
+            }
+            return None;
+        };
+        let link_path = wide_path(path);
+        let load_result =
+            unsafe { ((*(*persist).vtbl).load)(persist.cast(), link_path.as_ptr(), STGM_READ) };
+        let icon = if load_result >= 0 {
+            shortcut_id_list_icon(link)
+        } else {
+            None
+        };
+
+        unsafe {
+            release_interface(persist.cast());
+            release_interface(link.cast());
+        }
+        icon
+    }
+
+    unsafe fn shortcut_id_list_icon(link: *mut IShellLinkW) -> Option<HICON> {
+        let mut item_id_list = null_mut();
+        let result = unsafe { ((*(*link).vtbl).get_id_list)(link.cast(), &mut item_id_list) };
+        if result < 0 || item_id_list.is_null() {
+            return None;
+        }
+
+        let icon = shell_icon_from_id_list(item_id_list);
+        unsafe {
+            CoTaskMemFree(item_id_list.cast_const());
+        }
+        icon
+    }
+
+    fn shell_icon_from_id_list(item_id_list: *const c_void) -> Option<HICON> {
+        let mut info = SHFILEINFOW::default();
+        let result = unsafe {
+            SHGetFileInfoW(
+                item_id_list.cast(),
+                0,
+                &mut info,
+                std::mem::size_of::<SHFILEINFOW>() as u32,
+                SHGFI_ICON | SHGFI_LARGEICON | SHGFI_PIDL,
+            )
+        };
+        if result == 0 || info.hIcon.is_null() {
+            None
+        } else {
+            Some(info.hIcon)
+        }
     }
 
     fn restore_legacy_icon_alpha(rgba: &mut [u8]) {

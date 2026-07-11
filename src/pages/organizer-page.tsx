@@ -1,4 +1,4 @@
-import { useDeferredValue, useEffect, useState, type DragEvent as ReactDragEvent, type ReactNode } from "react"
+import { useDeferredValue, useEffect, useRef, useState, type DragEvent as ReactDragEvent, type ReactNode } from "react"
 import { Archive, ArrowsClockwise, CaretRight, CheckCircle, Columns, Desktop, FolderOpen, MagnifyingGlass, PencilSimple, Plus, RocketLaunch, Trash, X } from "@phosphor-icons/react"
 import { EmptyState } from "@/components/dustdesk/empty-state"
 import { FileIcon } from "@/components/dustdesk/file-icon"
@@ -18,7 +18,7 @@ import {
   writeDustDeskPathDrag,
 } from "@/lib/dustdesk-dnd"
 import { safeCurrentWebviewDragDropEvent, safeListen } from "@/lib/tauri-window"
-import { cn } from "@/lib/utils"
+import { cn, displayPathName } from "@/lib/utils"
 import { useDustDeskStore } from "@/stores/dustdesk-store"
 import type { DesktopItem, DesktopOperationEvent } from "@/types"
 
@@ -36,7 +36,9 @@ export function OrganizerPage() {
   const loadDesktopSnapshot = useDustDeskStore((state) => state.loadDesktopSnapshot)
   const startClassifyDesktopItemsTask = useDustDeskStore((state) => state.startClassifyDesktopItemsTask)
   const startRestoreAllToDesktopTask = useDustDeskStore((state) => state.startRestoreAllToDesktopTask)
+  const getDesktopOperationStatus = useDustDeskStore((state) => state.getDesktopOperationStatus)
   const addItemsToCategoryLight = useDustDeskStore((state) => state.addItemsToCategoryLight)
+  const restoreItemToDesktop = useDustDeskStore((state) => state.restoreItemToDesktop)
   const desktopFrames = useDustDeskStore((state) => state.desktopFrames)
   const refreshDesktopFrameVisibility = useDustDeskStore((state) => state.refreshDesktopFrameVisibility)
   const toggleDesktopOrganizerFrame = useDustDeskStore((state) => state.toggleDesktopOrganizerFrame)
@@ -46,6 +48,9 @@ export function OrganizerPage() {
   const [isClassifyingDesktop, setIsClassifyingDesktop] = useState(false)
   const [isRestoringDesktop, setIsRestoringDesktop] = useState(false)
   const [isMergingCategories, setIsMergingCategories] = useState(false)
+  const [dropOperationLabel, setDropOperationLabel] = useState("")
+  const desktopOperationRef = useRef<{ kind: DesktopOperationEvent["kind"] | null; done: boolean }>({ kind: null, done: true })
+  const desktopOperationTimeoutRef = useRef<number | null>(null)
   const deferredQuery = useDeferredValue(query.trim().toLowerCase())
   const desktopOperationLabel = isClassifyingDesktop
     ? (notice ?? "正在智能收纳桌面...")
@@ -53,13 +58,14 @@ export function OrganizerPage() {
       ? (notice ?? "正在还原桌面...")
       : isMergingCategories
         ? "正在合并分类..."
-        : ""
+        : dropOperationLabel
   const category = snapshot.categories[selectedCategory]
   const desktopItems = deferredQuery
     ? snapshot.desktop_items.filter((item) => `${item.name} ${item.path} ${item.extension}`.toLowerCase().includes(deferredQuery))
     : snapshot.desktop_items
   const handleClassifyDesktopItems = async () => {
     if (isClassifyingDesktop) return
+    beginDesktopOperation("classify")
     setIsClassifyingDesktop(true)
     setNotice("正在智能收纳桌面...")
     try {
@@ -74,6 +80,7 @@ export function OrganizerPage() {
     if (isRestoringDesktop) return
     if (!window.confirm("确认把所有收纳箱项目移回桌面吗？这会清空对应的收纳记录。")) return
 
+    beginDesktopOperation("restore")
     setIsRestoringDesktop(true)
     setNotice("正在还原桌面...")
     try {
@@ -110,6 +117,7 @@ export function OrganizerPage() {
     void safeListen<DesktopOperationEvent>("dustdesk://desktop-operation", (event) => {
       const payload = event.payload
       if (payload.status === "started") {
+        beginDesktopOperation(payload.kind)
         setNotice(payload.message)
         if (payload.kind === "classify") {
           setIsClassifyingDesktop(true)
@@ -119,7 +127,11 @@ export function OrganizerPage() {
         return
       }
       if (payload.status === "progress") {
+        beginDesktopOperation(payload.kind)
         setNotice(payload.message)
+        if (payload.kind === "classify") {
+          setIsClassifyingDesktop(true)
+        }
         if (payload.kind === "restore") {
           setIsRestoringDesktop(true)
         }
@@ -133,7 +145,11 @@ export function OrganizerPage() {
     }).then((value) => {
       unlisten = value
     })
-    return () => unlisten?.()
+    void syncDesktopOperationStatus()
+    return () => {
+      unlisten?.()
+      clearDesktopOperationTimeout()
+    }
   }, [loadDesktopSnapshot])
 
   useEffect(() => {
@@ -141,7 +157,9 @@ export function OrganizerPage() {
     void safeCurrentWebviewDragDropEvent((event) => {
       const payload = event.payload
       if (payload.type !== "drop") return
-      if (dropZoneFromPoint(payload.position.x, payload.position.y) !== organizerCategoryDropZone) return
+      if (dropZoneFromPoint(payload.position.x, payload.position.y) !== organizerCategoryDropZone) {
+        setNotice("已接收到桌面拖拽，正在收纳到当前分类")
+      }
       void addPathsToSelectedCategory(payload.paths)
     }).then((value) => {
       unlisten = value
@@ -152,35 +170,105 @@ export function OrganizerPage() {
   async function addPathsToSelectedCategory(paths: string[]) {
     if (paths.length === 0) return
     try {
+      setDropOperationLabel(`正在收纳 ${paths.length} 项到「${category?.name ?? "当前分类"}」...`)
       const added = await addItemsToCategoryLight(selectedCategory, paths)
       setNotice(countNotice("已收纳", added, paths.length, "没有新增收纳项目"))
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error))
+    } finally {
+      setDropOperationLabel("")
+    }
+  }
+
+  async function handleCategoryRestoreDragOut(categoryIndex: number, path: string, position: DesktopDropPosition) {
+    try {
+      setDropOperationLabel(`正在移回桌面：${displayPathName(path)}`)
+      await restoreItemToDesktop(categoryIndex, path, position)
+      setNotice(`已移回桌面：${displayPathName(path)}`)
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : String(error))
+    } finally {
+      setDropOperationLabel("")
     }
   }
 
   async function finishClassifyOperation(payload: DesktopOperationEvent) {
+    if (!completeDesktopOperation("classify")) return
     if (payload.status === "failed") {
       setNotice(payload.message || "智能收纳失败")
       setIsClassifyingDesktop(false)
       return
     }
 
-    await loadDesktopSnapshot({ force: true })
     setNotice(classifyResultNotice(classifyResultFromOperation(payload)))
     setIsClassifyingDesktop(false)
   }
 
   async function finishRestoreOperation(payload: DesktopOperationEvent) {
+    if (!completeDesktopOperation("restore")) return
     if (payload.status === "failed") {
       setNotice(payload.message || "还原桌面失败")
       setIsRestoringDesktop(false)
       return
     }
 
-    await loadDesktopSnapshot({ force: true })
     setNotice(payload.message || (payload.restored > 0 ? `已还原 ${payload.restored} 项到桌面` : "没有需要还原到桌面的收纳项目"))
     setIsRestoringDesktop(false)
+  }
+
+  function beginDesktopOperation(kind: DesktopOperationEvent["kind"]) {
+    clearDesktopOperationTimeout()
+    desktopOperationRef.current = { kind, done: false }
+    desktopOperationTimeoutRef.current = window.setTimeout(() => {
+      const current = desktopOperationRef.current
+      if (current.kind !== kind || current.done) return
+      desktopOperationTimeoutRef.current = null
+      void syncDesktopOperationStatus()
+    }, 10_000)
+  }
+
+  function completeDesktopOperation(kind: DesktopOperationEvent["kind"]) {
+    const current = desktopOperationRef.current
+    if (current.kind !== kind || current.done) return false
+    clearDesktopOperationTimeout()
+    desktopOperationRef.current = { kind, done: true }
+    return true
+  }
+
+  function clearDesktopOperationTimeout() {
+    if (desktopOperationTimeoutRef.current === null) return
+    window.clearTimeout(desktopOperationTimeoutRef.current)
+    desktopOperationTimeoutRef.current = null
+  }
+
+  async function syncDesktopOperationStatus() {
+    try {
+      const status = await getDesktopOperationStatus()
+      const payload = status.last
+      if (!status.running) {
+        if (!payload || payload.status === "finished" || payload.status === "failed") {
+          clearDesktopOperationTimeout()
+          desktopOperationRef.current = { kind: payload?.kind ?? null, done: true }
+          setIsClassifyingDesktop(false)
+          setIsRestoringDesktop(false)
+        }
+        return
+      }
+      if (payload?.kind === "classify") {
+        beginDesktopOperation("classify")
+        setIsClassifyingDesktop(true)
+        setNotice(payload.message || "正在智能收纳桌面...")
+      } else if (payload?.kind === "restore") {
+        beginDesktopOperation("restore")
+        setIsRestoringDesktop(true)
+        setNotice(payload.message || "正在还原桌面...")
+      }
+    } catch {
+      clearDesktopOperationTimeout()
+      desktopOperationRef.current = { kind: null, done: true }
+      setIsClassifyingDesktop(false)
+      setIsRestoringDesktop(false)
+    }
   }
 
   function handleCategoryDragOver(event: ReactDragEvent<HTMLElement>) {
@@ -313,7 +401,7 @@ export function OrganizerPage() {
             {category && category.item_details.length > 0 ? (
               <div className="grid grid-cols-[repeat(auto-fill,minmax(126px,1fr))] gap-3">
                 {category.item_details.map((item) => (
-                  <CategoryItemTile key={item.path} item={item} categoryIndex={selectedCategory} />
+                  <CategoryItemTile key={item.path} item={item} categoryIndex={selectedCategory} onRestoreDragOut={handleCategoryRestoreDragOut} />
                 ))}
               </div>
             ) : (
@@ -328,7 +416,7 @@ export function OrganizerPage() {
 
 function DesktopOperationOverlay({ label }: { label: string }) {
   return (
-    <div className="absolute inset-0 z-20 grid place-items-center bg-background/70 backdrop-blur-sm">
+    <div className="pointer-events-none absolute inset-0 z-20 grid place-items-center bg-background/70 backdrop-blur-sm">
       <div className="flex items-center gap-3 rounded-xl border bg-card/95 px-4 py-3 text-sm font-medium shadow-lg">
         <ArrowsClockwise className="size-5 animate-spin text-primary" weight="duotone" />
         <span>{label}</span>
@@ -419,7 +507,15 @@ function DesktopTile({ item }: { item: DesktopItem }) {
   )
 }
 
-function CategoryItemTile({ item, categoryIndex }: { item: DesktopItem; categoryIndex: number }) {
+function CategoryItemTile({
+  item,
+  categoryIndex,
+  onRestoreDragOut,
+}: {
+  item: DesktopItem
+  categoryIndex: number
+  onRestoreDragOut: (categoryIndex: number, path: string, position: DesktopDropPosition) => Promise<void>
+}) {
   const openPath = useDustDeskStore((state) => state.openPath)
   const restoreItemToDesktop = useDustDeskStore((state) => state.restoreItemToDesktop)
   const showPathInFolder = useDustDeskStore((state) => state.showPathInFolder)
@@ -429,7 +525,7 @@ function CategoryItemTile({ item, categoryIndex }: { item: DesktopItem; category
       title={item.path}
       dragPath={item.path}
       dragEffectAllowed="copyMove"
-      onDragEndOutside={(position) => restoreItemToDesktop(categoryIndex, item.path, position)}
+      onDragEndOutside={(position) => onRestoreDragOut(categoryIndex, item.path, position)}
       onOpen={() => void openPath(item.path)}
       actions={[
         { label: "打开", icon: "open", onSelect: () => openPath(item.path) },

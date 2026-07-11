@@ -29,6 +29,23 @@
 - 获取桌面路径优先使用 Windows Known Folder（包含重定向/OneDrive 桌面和公共桌面），不要只拼 `%USERPROFILE%\Desktop`。
 - 默认数据目录、收纳目录、快捷启动目录应创建在软件安装目录下，分别为 `Data`、`DesktopOrganizer`、`Launchers`。用户自定义目录路径可以继续写入 `%APPDATA%\DustDesk` 下的路径设置文件用于持久化。
 
+## 跨盘收纳迁移与崩溃恢复
+
+- 同卷迁移优先使用不覆盖目标的原子重命名；桌面与 `DesktopOrganizer` 不同盘时，不能把目录移动误认为廉价 rename。大目录包含大量小文件时，禁止在 UI 主链路中逐文件同步复制、逐文件内容/ADS 校验或同步递归删除，否则 Defender 会把尾部耗时放大到数分钟。
+- 跨盘目录迁移必须先在源目录同卷创建隐藏隔离区 `.dustdesk-source-transfer-*.tmp`，把源目录原子重命名进去，并在 `%APPDATA%\DustDesk\transfer-journals` 写入 `sync_all` 后的 UTF-16 路径日志，避免中文或非标准 Windows 路径乱码。
+- 大目录复制到目标预留 staging 时优先使用 `robocopy /MT`。参数必须通过 `Command::arg` 传递；只把退出码 `0..3` 视为成功，`4..7` 的 mismatch 和 `>=8` 的失败都不能提交目标。
+- 目标 staging 必须校验目录结构、文件数量、大小和修改时间，然后以不覆盖目标的方式原子提交。提交成功后必须先持久化 committed marker，之后才能删除隔离源；没有 committed marker 时不得自动删除源数据。
+- 目标已经原子提交并写入 committed marker 后，隔离源递归清理应放到后台，不能继续占用“正在收纳/正在还原”的前台进度。后台删除源之前必须再次做快速结构校验并持久化 cleanup-started marker；目标被外部改坏时保留隔离源，cleanup-started 后中断则在下次启动继续收尾。
+- 程序启动和每次桌面存储操作前必须串行恢复 transfer journal：未提交则还原源目录，已提交则继续清理隔离源。恢复、后台清理和新操作必须共用恢复锁，不能并发处理同一 journal。
+- `.dustdesk-transfer-*.tmp`、`.dustdesk-source-transfer-*.tmp` 和 transfer journal 都是内部事务数据，桌面扫描、分类、快捷启动、配置修复与还原候选列表必须统一过滤，不能显示成用户项目或写入配置。
+
+## 多窗口数据刷新
+
+- 每个 Tauri WebView 都有独立的前端 store，不能假设主界面、合并桌面框、独立分类卡片和快捷启动框会共享 Zustand 状态。桌面、分类或快捷启动操作完成后，后端必须广播 `dustdesk://desktop-cards-changed`，各窗口收到后主动加载适合自己的快照。
+- 主界面必须在 `dustdesk://desktop-cards-changed`、主窗口从托盘重新显示、窗口重新获得焦点以及切换进入功能页面时自动刷新，不能要求用户手动点击“刷新”才能看到其它窗口完成的操作。
+- 完整 `load_snapshot` 与轻量 `load_desktop_snapshot` 都要做前端并发合并和短时间去重。同一操作的命令返回刷新与事件广播刷新应复用一个进行中的 Promise；如果强制刷新发生在已有请求执行期间，必须在当前请求结束后补一次刷新，不能直接丢弃事件。
+- 快捷启动只有一个逻辑分组，快捷启动框的设置菜单不要显示“合并分类”“拆分分类”“新增/重命名/删除分类”等桌面收纳分类操作；只保留刷新、显示设置和隐藏当前框等快捷启动自身操作。
+
 ## Windows 剪贴板粘贴与历史
 
 - 剪贴板图片粘贴可能会比较慢，前端必须先渲染“正在准备图片/正在粘贴”的加载态，再调用后端粘贴命令；不要在 loading 还没 paint 前直接隐藏 overlay，否则用户会以为点击无效。

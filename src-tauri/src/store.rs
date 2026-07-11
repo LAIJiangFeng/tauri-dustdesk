@@ -1,12 +1,30 @@
 use std::{
     env, fs,
+    io::Write,
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex, OnceLock,
+    },
 };
 
 use anyhow::{Context, Result};
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::models::{AppConfig, ClipboardData, LaunchData, SearchHistoryData};
+
+static ATOMIC_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
+static STORAGE_MUTATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+pub fn with_storage_mutation<T>(
+    operation: impl FnOnce() -> std::result::Result<T, String>,
+) -> std::result::Result<T, String> {
+    let _guard = STORAGE_MUTATION_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "存储事务锁已损坏".to_owned())?;
+    operation()
+}
 
 #[derive(Debug, Clone)]
 pub struct AppStore {
@@ -16,6 +34,23 @@ pub struct AppStore {
 }
 
 impl AppStore {
+    pub fn from_runtime_dirs(
+        data_dir: PathBuf,
+        organizer_root: PathBuf,
+        launchers_root: PathBuf,
+    ) -> Self {
+        Self {
+            data_dir,
+            organizer_root,
+            launchers_root,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn for_test(data_dir: PathBuf, organizer_root: PathBuf, launchers_root: PathBuf) -> Self {
+        Self::from_runtime_dirs(data_dir, organizer_root, launchers_root)
+    }
+
     pub fn open() -> Result<Self> {
         let settings_root = app_settings_root()?;
         let install_root = app_install_root()?;
@@ -50,26 +85,62 @@ impl AppStore {
     }
 
     pub fn set_runtime_directory(target: &str, path: &Path) -> Result<Self> {
+        let current = Self::open()?;
+        let next = current.with_runtime_directory(target, path)?;
+        let normalized = match target {
+            "data" => path_to_config_text(&next.data_dir),
+            "organizer" => path_to_config_text(&next.organizer_root),
+            "launchers" => path_to_config_text(&next.launchers_root),
+            _ => anyhow::bail!("未知目录类型"),
+        };
+        let settings_root = app_settings_root()?;
+        fs::create_dir_all(&settings_root)
+            .with_context(|| format!("create {}", settings_root.display()))?;
+        atomic_write(
+            &settings_root.join(runtime_path_file_name(target)?),
+            normalized.as_bytes(),
+        )?;
+        Self::open()
+    }
+
+    pub fn save_runtime_migration_journal(bytes: &[u8]) -> Result<()> {
+        let path = runtime_migration_journal_path()?;
+        atomic_write(&path, bytes)
+    }
+
+    pub fn load_runtime_migration_journal() -> Result<Option<String>> {
+        let path = runtime_migration_journal_path()?;
+        match fs::read_to_string(&path) {
+            Ok(content) => Ok(Some(content)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
+        }
+    }
+
+    pub fn remove_runtime_migration_journal() -> Result<()> {
+        let path = runtime_migration_journal_path()?;
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
+        }
+    }
+
+    pub fn with_runtime_directory(&self, target: &str, path: &Path) -> Result<Self> {
         if path.as_os_str().is_empty() {
             anyhow::bail!("目录不能为空");
         }
 
         fs::create_dir_all(path).with_context(|| format!("create {}", path.display()))?;
-        let normalized =
-            path_to_config_text(&path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
-        let settings_root = app_settings_root()?;
-        fs::create_dir_all(&settings_root)
-            .with_context(|| format!("create {}", settings_root.display()))?;
-        let file_name = match target {
-            "data" => "data-path.txt",
-            "organizer" => "organizer-path.txt",
-            "launchers" => "launchers-path.txt",
+        let normalized = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let mut next = self.clone();
+        match target {
+            "data" => next.data_dir = normalized,
+            "organizer" => next.organizer_root = normalized,
+            "launchers" => next.launchers_root = normalized,
             _ => anyhow::bail!("未知目录类型"),
         };
-
-        fs::write(settings_root.join(file_name), normalized.as_bytes())
-            .with_context(|| format!("write {}", file_name))?;
-        Self::open()
+        Ok(next)
     }
 
     pub fn config_path(&self) -> PathBuf {
@@ -115,16 +186,32 @@ impl AppStore {
         self.load_json(self.config_path())
     }
 
+    pub fn load_config_strict(&self) -> Result<AppConfig> {
+        self.load_json_strict(self.config_path())
+    }
+
     pub fn load_launchers(&self) -> LaunchData {
         self.load_json(self.launch_path())
+    }
+
+    pub fn load_launchers_strict(&self) -> Result<LaunchData> {
+        self.load_json_strict(self.launch_path())
     }
 
     pub fn load_clipboard(&self) -> ClipboardData {
         self.load_json(self.clipboard_path())
     }
 
+    pub fn load_clipboard_strict(&self) -> Result<ClipboardData> {
+        self.load_json_strict(self.clipboard_path())
+    }
+
     pub fn load_search_history(&self) -> SearchHistoryData {
         self.load_json(self.search_history_path())
+    }
+
+    pub fn load_search_history_strict(&self) -> Result<SearchHistoryData> {
+        self.load_json_strict(self.search_history_path())
     }
 
     pub fn save_config(&self, config: &AppConfig) -> Result<()> {
@@ -154,6 +241,20 @@ impl AppStore {
         serde_json::from_str(&json).unwrap_or_default()
     }
 
+    fn load_json_strict<T>(&self, path: PathBuf) -> Result<T>
+    where
+        T: DeserializeOwned + Default,
+    {
+        let json = match fs::read_to_string(&path) {
+            Ok(json) => json,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(T::default()),
+            Err(error) => {
+                return Err(error).with_context(|| format!("read {}", path.display()));
+            }
+        };
+        serde_json::from_str(&json).with_context(|| format!("parse {}", path.display()))
+    }
+
     fn save_json<T>(&self, path: PathBuf, value: &T) -> Result<()>
     where
         T: Serialize,
@@ -161,7 +262,7 @@ impl AppStore {
         fs::create_dir_all(&self.data_dir)
             .with_context(|| format!("create {}", self.data_dir.display()))?;
         let json = serde_json::to_string_pretty(value)?;
-        fs::write(path, json)?;
+        atomic_write(&path, json.as_bytes())?;
         Ok(())
     }
 }
@@ -169,6 +270,10 @@ impl AppStore {
 fn app_settings_root() -> Result<PathBuf> {
     let appdata = env::var_os("APPDATA").context("APPDATA environment variable is missing")?;
     Ok(PathBuf::from(appdata).join("DustDesk"))
+}
+
+fn runtime_migration_journal_path() -> Result<PathBuf> {
+    Ok(app_settings_root()?.join("runtime-migration.json"))
 }
 
 fn app_install_root() -> Result<PathBuf> {
@@ -183,7 +288,7 @@ fn configured_path(
     settings_root: &Path,
     file_name: &str,
     default_dir: PathBuf,
-    legacy_defaults: &[PathBuf],
+    _legacy_defaults: &[PathBuf],
 ) -> Result<PathBuf> {
     let path_file = settings_root.join(file_name);
     if path_file.exists() {
@@ -194,38 +299,99 @@ fn configured_path(
         if !configured.is_empty() {
             let normalized = normalize_configured_path_text(&configured);
             let configured_path = PathBuf::from(&normalized);
-            if legacy_defaults
-                .iter()
-                .any(|legacy| same_path_for_config(&configured_path, legacy))
-            {
-                fs::write(&path_file, path_to_config_text(&default_dir).as_bytes())
-                    .with_context(|| format!("write {}", path_file.display()))?;
-                return Ok(default_dir);
-            }
-
-            if normalized != configured {
-                fs::write(&path_file, normalized.as_bytes())
-                    .with_context(|| format!("write {}", path_file.display()))?;
-            }
             return Ok(configured_path);
         }
     } else {
-        fs::write(&path_file, path_to_config_text(&default_dir).as_bytes())
+        atomic_write(&path_file, path_to_config_text(&default_dir).as_bytes())
             .with_context(|| format!("write {}", path_file.display()))?;
     }
 
     Ok(default_dir)
 }
 
-fn same_path_for_config(left: &Path, right: &Path) -> bool {
-    normalize_path_for_config(left) == normalize_path_for_config(right)
+fn runtime_path_file_name(target: &str) -> Result<&'static str> {
+    match target {
+        "data" => Ok("data-path.txt"),
+        "organizer" => Ok("organizer-path.txt"),
+        "launchers" => Ok("launchers-path.txt"),
+        _ => anyhow::bail!("未知目录类型"),
+    }
 }
 
-fn normalize_path_for_config(path: &Path) -> String {
-    path_to_config_text(path)
-        .replace('/', "\\")
-        .trim_end_matches('\\')
-        .to_ascii_lowercase()
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("missing parent for {}", path.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("dustdesk-data");
+
+    for _ in 0..1000 {
+        let sequence = ATOMIC_WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temporary = parent.join(format!(
+            ".{file_name}.{}.{}.tmp",
+            std::process::id(),
+            sequence
+        ));
+        let mut file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        };
+
+        let result = (|| -> Result<()> {
+            file.write_all(bytes)?;
+            drop(file);
+            replace_file_atomically(&temporary, path)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        return result;
+    }
+
+    anyhow::bail!("unable to reserve temporary file for {}", path.display())
+}
+
+#[cfg(windows)]
+fn replace_file_atomically(source: &Path, destination: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING};
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    if unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_file_atomically(source: &Path, destination: &Path) -> Result<()> {
+    fs::rename(source, destination)?;
+    Ok(())
 }
 
 fn path_to_config_text(path: &Path) -> String {
@@ -240,5 +406,45 @@ fn normalize_configured_path_text(path: &str) -> String {
         rest.to_owned()
     } else {
         trimmed.to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn atomic_write_replaces_complete_file_without_leaving_temporary_files() {
+        let root = std::env::temp_dir().join(format!(
+            "dustdesk-store-atomic-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create test root");
+        let path = root.join("config.json");
+        fs::write(&path, b"old-config").expect("write old config");
+
+        atomic_write(&path, b"new-complete-config").expect("replace config atomically");
+
+        assert_eq!(
+            fs::read(&path).expect("read replaced config"),
+            b"new-complete-config"
+        );
+        assert!(
+            fs::read_dir(&root)
+                .expect("read test root")
+                .all(|entry| !entry
+                    .expect("read entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp")),
+            "successful atomic writes must not leave staging files"
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 }

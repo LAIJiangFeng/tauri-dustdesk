@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "DustDesk",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "identifier": "com.dustdesk.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -38,10 +38,14 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
+    "targets": [
+      "nsis"
+    ],
     "publisher": "DustDesk",
     "category": "Productivity",
-    "icon": ["icons/icon.ico"],
+    "icon": [
+      "icons/icon.ico"
+    ],
     "windows": {
       "webviewInstallMode": {
         "type": "downloadBootstrapper",
@@ -49,7 +53,10 @@
       },
       "nsis": {
         "installMode": "currentUser",
-        "languages": ["SimpChinese", "English"],
+        "languages": [
+          "SimpChinese",
+          "English"
+        ],
         "displayLanguageSelector": true,
         "installerIcon": "icons/icon.ico",
         "uninstallerIcon": "icons/icon.ico",

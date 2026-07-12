@@ -744,12 +744,26 @@ function demoSearchOverlay(): SearchOverlayData {
       open_count: index + 1,
       last_opened_at: "",
     }))
+  const directoryItems = snapshot.desktop_items
+    .filter((item) => item.is_dir)
+    .map((item, index): SearchItem => ({
+      id: `demo-directory-${index}`,
+      name: item.name,
+      path: item.path,
+      kind: "Directory",
+      extension: "",
+      is_dir: true,
+      source: "最近目录",
+      icon_data_url: item.icon_data_url,
+      open_count: index + 2,
+      last_opened_at: "",
+    }))
 
   return {
     settings: snapshot.settings,
     paths: [snapshot.organizer_root],
-    recent: [...launcherItems, ...fileItems].slice(0, 30),
-    frequent: [...launcherItems, ...fileItems].sort((left, right) => right.open_count - left.open_count).slice(0, 30),
+    recent: [...launcherItems, ...directoryItems, ...fileItems].slice(0, 30),
+    frequent: [...launcherItems, ...directoryItems, ...fileItems].sort((left, right) => right.open_count - left.open_count).slice(0, 30),
   }
 }
 

@@ -1967,8 +1967,8 @@ async fn open_search_item(app: tauri::AppHandle, item: SearchItem) -> Result<(),
             open_path_impl(Path::new(path))?;
         } else {
             open_with_shell(path)?;
-            record_search_open(&item)?;
         }
+        record_search_open(&item)?;
 
         with_lazy_window_operation(|| {
             hide_search_overlay_impl(&app);
@@ -6863,50 +6863,54 @@ fn search_history_items(history: &SearchHistoryData) -> Vec<SearchItem> {
     history
         .items
         .iter()
-        .filter(|item| item.kind != SearchItemKind::Directory && !item.path.trim().is_empty())
+        .filter(|item| !item.path.trim().is_empty())
         .map(search_item_from_history)
         .collect()
 }
 
 fn record_search_open(item: &SearchItem) -> Result<(), String> {
-    if item.kind == SearchItemKind::Directory || item.is_dir {
-        return Ok(());
-    }
-
     store::with_storage_mutation(|| {
         let store = AppStore::open().map_err(to_message)?;
         let mut history = store.load_search_history_strict().map_err(to_message)?;
-        let key = item.path.to_lowercase();
         let now = now_local_string();
-
-        if let Some(record) = history
-            .items
-            .iter_mut()
-            .find(|record| record.path.to_lowercase() == key)
-        {
-            record.name = item.name.clone();
-            record.kind = item.kind;
-            record.extension = item.extension.clone();
-            record.open_count = record.open_count.saturating_add(1);
-            record.last_opened_at = now;
-        } else {
-            history.items.push(SearchHistoryItem {
-                id: now_id(),
-                name: item.name.clone(),
-                path: item.path.clone(),
-                kind: item.kind,
-                extension: item.extension.clone(),
-                open_count: 1,
-                last_opened_at: now,
-            });
-        }
-
-        history
-            .items
-            .sort_by(|left, right| right.last_opened_at.cmp(&left.last_opened_at));
-        history.items.truncate(SEARCH_HISTORY_LIMIT);
+        upsert_search_history_open(&mut history, item, now, now_id());
         store.save_search_history(&history).map_err(to_message)
     })
+}
+
+fn upsert_search_history_open(
+    history: &mut SearchHistoryData,
+    item: &SearchItem,
+    now: String,
+    new_id: String,
+) {
+    let key = item.path.to_lowercase();
+    if let Some(record) = history
+        .items
+        .iter_mut()
+        .find(|record| record.path.to_lowercase() == key)
+    {
+        record.name = item.name.clone();
+        record.kind = item.kind;
+        record.extension = item.extension.clone();
+        record.open_count = record.open_count.saturating_add(1);
+        record.last_opened_at = now;
+    } else {
+        history.items.push(SearchHistoryItem {
+            id: new_id,
+            name: item.name.clone(),
+            path: item.path.clone(),
+            kind: item.kind,
+            extension: item.extension.clone(),
+            open_count: 1,
+            last_opened_at: now,
+        });
+    }
+
+    history
+        .items
+        .sort_by(|left, right| right.last_opened_at.cmp(&left.last_opened_at));
+    history.items.truncate(SEARCH_HISTORY_LIMIT);
 }
 
 fn launcher_search_item(launcher: &LaunchItem, name: String) -> SearchItem {
@@ -7223,6 +7227,64 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn search_history_items_include_opened_directories() {
+        let history = SearchHistoryData {
+            items: vec![SearchHistoryItem {
+                id: "dir-1".to_owned(),
+                name: "Projects".to_owned(),
+                path: r"C:\Users\15407\Projects".to_owned(),
+                kind: SearchItemKind::Directory,
+                extension: String::new(),
+                open_count: 2,
+                last_opened_at: "2026-07-12T18:00:00.000".to_owned(),
+            }],
+        };
+
+        let items = search_history_items(&history);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, SearchItemKind::Directory);
+        assert!(items[0].is_dir);
+        assert_eq!(items[0].open_count, 2);
+    }
+
+    #[test]
+    fn search_history_upsert_counts_directory_opens() {
+        let mut history = SearchHistoryData::default();
+        let item = SearchItem {
+            id: "path:c:\\users\\15407\\projects".to_owned(),
+            name: "Projects".to_owned(),
+            path: r"C:\Users\15407\Projects".to_owned(),
+            kind: SearchItemKind::Directory,
+            extension: String::new(),
+            is_dir: true,
+            source: "目录".to_owned(),
+            icon_data_url: None,
+            open_count: 0,
+            last_opened_at: String::new(),
+        };
+
+        upsert_search_history_open(
+            &mut history,
+            &item,
+            "2026-07-12T18:00:00.000".to_owned(),
+            "dir-1".to_owned(),
+        );
+        upsert_search_history_open(
+            &mut history,
+            &item,
+            "2026-07-12T18:05:00.000".to_owned(),
+            "dir-2".to_owned(),
+        );
+
+        assert_eq!(history.items.len(), 1);
+        assert_eq!(history.items[0].id, "dir-1");
+        assert_eq!(history.items[0].kind, SearchItemKind::Directory);
+        assert_eq!(history.items[0].open_count, 2);
+        assert_eq!(history.items[0].last_opened_at, "2026-07-12T18:05:00.000");
     }
 
     #[test]

@@ -142,14 +142,10 @@ export function ClipboardOverlayPage() {
   }, [])
 
   useEffect(() => {
-    void refreshOverlay()
-  }, [refreshOverlay])
-
-  useEffect(() => {
     let unlisten: (() => void) | undefined
     let disposed = false
 
-    void safeListen("dustdesk://clipboard-shortcut", () => {
+    const handleShortcut = () => {
       const now = performance.now()
       if (now - lastShortcutEventAtRef.current < SHORTCUT_EVENT_GUARD_MS) return
       lastShortcutEventAtRef.current = now
@@ -166,14 +162,28 @@ export function ClipboardOverlayPage() {
       void refreshOverlay().finally(() => {
         openingRef.current = false
       })
-    }).then((dispose) => {
+    }
+
+    void (async () => {
+      const dispose = await safeListen("dustdesk://clipboard-shortcut", handleShortcut)
       if (disposed) {
         dispose?.()
         return
       }
 
       unlisten = dispose
-    })
+      const currentWindow = safeCurrentWindow()
+      if (!currentWindow) {
+        handleShortcut()
+        return
+      }
+
+      try {
+        if (await currentWindow.isVisible() && !disposed) handleShortcut()
+      } catch {
+        if (!disposed) handleShortcut()
+      }
+    })()
 
     return () => {
       disposed = true

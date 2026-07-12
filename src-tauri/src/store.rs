@@ -126,6 +126,29 @@ impl AppStore {
         }
     }
 
+    pub fn save_desktop_organization_restart(bytes: &[u8]) -> Result<()> {
+        let path = desktop_organization_restart_path()?;
+        atomic_write(&path, bytes)
+    }
+
+    pub fn load_desktop_organization_restart() -> Result<Option<String>> {
+        let path = desktop_organization_restart_path()?;
+        match fs::read_to_string(&path) {
+            Ok(content) => Ok(Some(content)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
+        }
+    }
+
+    pub fn remove_desktop_organization_restart() -> Result<()> {
+        let path = desktop_organization_restart_path()?;
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
+        }
+    }
+
     pub fn with_runtime_directory(&self, target: &str, path: &Path) -> Result<Self> {
         if path.as_os_str().is_empty() {
             anyhow::bail!("目录不能为空");
@@ -276,6 +299,10 @@ fn runtime_migration_journal_path() -> Result<PathBuf> {
     Ok(app_settings_root()?.join("runtime-migration.json"))
 }
 
+fn desktop_organization_restart_path() -> Result<PathBuf> {
+    Ok(app_settings_root()?.join("desktop-organization-restart.json"))
+}
+
 fn app_install_root() -> Result<PathBuf> {
     let executable = env::current_exe().context("current executable path is unavailable")?;
     executable
@@ -347,6 +374,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 
         let result = (|| -> Result<()> {
             file.write_all(bytes)?;
+            file.sync_all()?;
             drop(file);
             replace_file_atomically(&temporary, path)?;
             Ok(())
@@ -363,7 +391,9 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(windows)]
 fn replace_file_atomically(source: &Path, destination: &Path) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING};
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
 
     let source = source
         .as_os_str()
@@ -379,7 +409,7 @@ fn replace_file_atomically(source: &Path, destination: &Path) -> Result<()> {
         MoveFileExW(
             source.as_ptr(),
             destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING,
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
         )
     } == 0
     {

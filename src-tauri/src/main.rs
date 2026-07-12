@@ -6,6 +6,7 @@ mod store;
 mod system_icon;
 
 use std::{
+    cmp::Ordering as CmpOrdering,
     collections::{BTreeMap, VecDeque},
     env,
     ffi::OsString,
@@ -14,8 +15,8 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc, Arc, Condvar, Mutex, OnceLock,
     },
     time::{Duration, Instant, SystemTime},
 };
@@ -54,14 +55,26 @@ const MAX_LOCKED_TRANSFER_TREE_ENTRIES: usize = 256;
 const TRAY_MENU_SHOW_MAIN: &str = "show-main-window";
 const TRAY_MENU_QUIT: &str = "quit-app";
 const DESKTOP_OPERATION_EVENT: &str = "dustdesk://desktop-operation";
+const DESKTOP_ORGANIZATION_RESTART_SCHEMA_VERSION: u32 = 1;
+const UPDATE_RELEASE_API_URL: &str =
+    "https://api.github.com/repos/LAIJiangFeng/tauri-dustdesk/releases/latest";
+const UPDATE_RELEASES_URL_PREFIX: &str = "https://github.com/LAIJiangFeng/tauri-dustdesk/releases";
+const UPDATE_LATEST_INSTALLER_URL: &str = "https://github.com/LAIJiangFeng/tauri-dustdesk/releases/latest/download/DustDesk-latest-windows-x64-setup.exe";
 
 static CONFIG_MUTATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static LAUNCHER_MUTATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static RUNTIME_DIRECTORY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static TRANSFER_RECOVERY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static LAZY_WINDOW_OPERATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static WEBVIEW_WINDOW_CREATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static ICON_DATA_URL_CACHE: OnceLock<Mutex<BTreeMap<String, Option<String>>>> = OnceLock::new();
+static STARTUP_RECOVERY_STATE: OnceLock<(Mutex<Option<Result<(), String>>>, Condvar)> =
+    OnceLock::new();
 static REAL_EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+static EXIT_RESTORE_COMPLETED: AtomicBool = AtomicBool::new(false);
 static DESKTOP_OPERATION_RUNNING: AtomicBool = AtomicBool::new(false);
+static DESKTOP_WINDOW_SETTLE_SCHEDULED: AtomicBool = AtomicBool::new(false);
+static DESKTOP_WINDOW_SETTLE_GENERATION: AtomicU64 = AtomicU64::new(0);
 static DESKTOP_OPERATION_LAST: OnceLock<Mutex<Option<DesktopOperationPayload>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -74,6 +87,7 @@ struct DesktopFrameVisibility {
 #[derive(Debug, Clone, Serialize)]
 struct DesktopOperationPayload {
     kind: &'static str,
+    scope: &'static str,
     status: &'static str,
     message: String,
     moved: usize,
@@ -88,6 +102,35 @@ struct DesktopOperationPayload {
 struct DesktopOperationStatus {
     running: bool,
     last: Option<DesktopOperationPayload>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AppUpdateInfo {
+    current_version: String,
+    latest_version: String,
+    update_available: bool,
+    release_name: String,
+    release_url: String,
+    download_url: String,
+    asset_name: String,
+    published_at: String,
+    body: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubRelease {
+    tag_name: String,
+    name: Option<String>,
+    html_url: String,
+    published_at: Option<String>,
+    body: Option<String>,
+    assets: Vec<GitHubReleaseAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubReleaseAsset {
+    name: String,
+    browser_download_url: String,
 }
 
 #[derive(Debug, Clone)]
@@ -127,12 +170,135 @@ struct RuntimeMigrationJournal {
     new_launchers_root: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct DesktopOrganizationRestartMarker {
+    schema_version: u32,
+    categories: Vec<RestartCategoryMarker>,
+}
+
+impl DesktopOrganizationRestartMarker {
+    fn empty() -> Self {
+        Self {
+            schema_version: DESKTOP_ORGANIZATION_RESTART_SCHEMA_VERSION,
+            categories: Vec::new(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.categories
+            .iter()
+            .all(|category| category.items.is_empty())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct RestartCategoryMarker {
+    category_name: String,
+    #[serde(default)]
+    category_index: Option<usize>,
+    items: Vec<RestartItemMarker>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct RestartItemMarker {
+    source_path: String,
+    desktop_path: Option<String>,
+}
+
+trait DesktopOrganizationRestartPersistence {
+    fn load(&self) -> Result<Option<DesktopOrganizationRestartMarker>, String>;
+    fn save(&self, marker: &DesktopOrganizationRestartMarker) -> Result<(), String>;
+    fn remove(&self) -> Result<(), String>;
+}
+
+struct AppDesktopOrganizationRestartPersistence;
+
+impl DesktopOrganizationRestartPersistence for AppDesktopOrganizationRestartPersistence {
+    fn load(&self) -> Result<Option<DesktopOrganizationRestartMarker>, String> {
+        let Some(content) = AppStore::load_desktop_organization_restart().map_err(to_message)?
+        else {
+            return Ok(None);
+        };
+        serde_json::from_str(&content).map(Some).map_err(to_message)
+    }
+
+    fn save(&self, marker: &DesktopOrganizationRestartMarker) -> Result<(), String> {
+        let bytes = serde_json::to_vec_pretty(marker).map_err(to_message)?;
+        AppStore::save_desktop_organization_restart(&bytes).map_err(to_message)
+    }
+
+    fn remove(&self) -> Result<(), String> {
+        AppStore::remove_desktop_organization_restart().map_err(to_message)
+    }
+}
+
+fn clear_desktop_organization_restart_marker(
+    persistence: &impl DesktopOrganizationRestartPersistence,
+) -> Result<(), String> {
+    // Persist a tombstone before deletion. If power is lost before the directory entry deletion is
+    // durable, startup can only observe this empty marker, never the previous recollection intent.
+    persistence.save(&DesktopOrganizationRestartMarker::empty())?;
+    persistence.remove()
+}
+
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DesktopDropPosition {
     screen_x: f64,
     screen_y: f64,
     scale_factor: Option<f64>,
+}
+
+fn wait_for_startup_recovery() -> Result<(), String> {
+    let (state, ready) = STARTUP_RECOVERY_STATE.get_or_init(|| (Mutex::new(None), Condvar::new()));
+    let mut result = state
+        .lock()
+        .map_err(|_| "启动恢复状态锁已损坏".to_owned())?;
+    while result.is_none() {
+        result = ready
+            .wait(result)
+            .map_err(|_| "启动恢复状态锁已损坏".to_owned())?;
+    }
+    result
+        .as_ref()
+        .expect("startup recovery result checked")
+        .clone()
+}
+
+fn mark_startup_recovery_complete(result: Result<(), String>) {
+    let (state, ready) = STARTUP_RECOVERY_STATE.get_or_init(|| (Mutex::new(None), Condvar::new()));
+    if let Ok(mut stored_result) = state.lock() {
+        *stored_result = Some(result);
+        ready.notify_all();
+    }
+}
+
+struct StartupRecoveryCompletionGuard {
+    completed: bool,
+}
+
+impl StartupRecoveryCompletionGuard {
+    fn new() -> Self {
+        Self { completed: false }
+    }
+
+    fn complete(&mut self, result: Result<(), String>) {
+        mark_startup_recovery_complete(result);
+        self.completed = true;
+    }
+}
+
+impl Drop for StartupRecoveryCompletionGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            mark_startup_recovery_complete(Err(
+                "启动恢复任务意外中断，请重新启动 DustDesk".to_owned()
+            ));
+        }
+    }
 }
 
 #[tauri::command]
@@ -143,6 +309,7 @@ async fn load_snapshot() -> Result<AppSnapshot, String> {
 }
 
 fn load_snapshot_impl() -> Result<AppSnapshot, String> {
+    wait_for_startup_recovery()?;
     let store = AppStore::open().map_err(to_message)?;
     store.ensure_runtime_dirs().map_err(to_message)?;
     let config = with_config_mutation(|| {
@@ -186,6 +353,7 @@ async fn load_desktop_snapshot() -> Result<AppSnapshot, String> {
 }
 
 fn load_desktop_snapshot_impl() -> Result<AppSnapshot, String> {
+    wait_for_startup_recovery()?;
     let store = AppStore::open().map_err(to_message)?;
     store.ensure_runtime_dirs().map_err(to_message)?;
     let config = with_config_mutation(|| {
@@ -316,7 +484,14 @@ fn add_items_to_category_impl(index: usize, paths: Vec<String>) -> Result<usize,
     with_config_mutation(|| {
         let store = AppStore::open().map_err(to_message)?;
         store.ensure_runtime_dirs().map_err(to_message)?;
-        cleanup_startup_transfer_staging_dirs(&store);
+        let paths = paths
+            .into_iter()
+            .map(|path| normalize_path_input(&path))
+            .collect::<Result<Vec<_>, _>>()?;
+        recover_transfer_quarantine_journals_strict(true)?;
+        recover_related_transfer_quarantine_journals_strict(
+            &paths.iter().map(PathBuf::from).collect::<Vec<_>>(),
+        )?;
         let mut config = store.load_config_strict().map_err(to_message)?;
         repair_category_item_paths(&store, &mut config)?;
         config
@@ -327,7 +502,6 @@ fn add_items_to_category_impl(index: usize, paths: Vec<String>) -> Result<usize,
         let mut added = 0usize;
 
         for path in paths {
-            let path = normalize_path_input(&path)?;
             if path.trim().is_empty() || !Path::new(&path).exists() {
                 continue;
             }
@@ -395,6 +569,9 @@ fn restore_item_to_desktop_impl(
     let restored_path = with_config_mutation(|| {
         let path = normalize_path_input(&path)?;
         let store = AppStore::open().map_err(to_message)?;
+        clear_desktop_organization_restart_marker(&AppDesktopOrganizationRestartPersistence)?;
+        recover_transfer_quarantine_journals_strict(true)?;
+        recover_related_transfer_quarantine_journals_strict(&[PathBuf::from(&path)])?;
         let mut config = store.load_config_strict().map_err(to_message)?;
         let desktop = user_desktop().ok_or_else(|| "没有找到桌面路径".to_owned())?;
         fs::create_dir_all(&desktop).map_err(to_message)?;
@@ -435,6 +612,7 @@ fn start_restore_background_operation(app: tauri::AppHandle) -> Result<(), Strin
                     &progress_app,
                     DesktopOperationPayload {
                         kind: "restore",
+                        scope: "manual",
                         status: "progress",
                         message: restore_progress_message(current, total, path),
                         moved: 0,
@@ -448,6 +626,7 @@ fn start_restore_background_operation(app: tauri::AppHandle) -> Result<(), Strin
             })?;
         Ok(DesktopOperationPayload {
             kind: "restore",
+            scope: "manual",
             status: "finished",
             message: if restored > 0 {
                 format!("已还原 {restored} 项到桌面")
@@ -583,6 +762,7 @@ async fn start_classify_desktop_items_task(app: tauri::AppHandle) -> Result<(), 
                     &progress_app,
                     DesktopOperationPayload {
                         kind: "classify",
+                        scope: "manual",
                         status: "progress",
                         message: classify_progress_message(current, total, path),
                         moved,
@@ -602,6 +782,7 @@ async fn start_classify_desktop_items_task(app: tauri::AppHandle) -> Result<(), 
             .join("、");
         Ok(DesktopOperationPayload {
             kind: "classify",
+            scope: "manual",
             status: "finished",
             message: format!(
                 "已智能收纳 {} 项{}{}{}",
@@ -635,6 +816,7 @@ fn classify_desktop_items_with_progress(
         let overall_started = Instant::now();
         let store = AppStore::open().map_err(to_message)?;
         store.ensure_runtime_dirs().map_err(to_message)?;
+        recover_transfer_quarantine_journals_strict(true)?;
         let mut config = store.load_config_strict().map_err(to_message)?;
         repair_category_item_paths(&store, &mut config)?;
         if config.desktop_categories.is_empty() {
@@ -673,6 +855,12 @@ fn classify_desktop_items_with_progress(
                 work_estimate,
             });
         }
+
+        let candidate_paths = candidates
+            .iter()
+            .map(|candidate| PathBuf::from(&candidate.original_path))
+            .collect::<Vec<_>>();
+        recover_related_transfer_quarantine_journals_strict(&candidate_paths)?;
 
         let total = candidates.len();
         let mut directory_candidates = Vec::new();
@@ -967,6 +1155,138 @@ fn open_special(target: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn check_for_updates() -> Result<AppUpdateInfo, String> {
+    tauri::async_runtime::spawn_blocking(check_for_updates_impl)
+        .await
+        .map_err(to_message)?
+}
+
+#[tauri::command]
+async fn open_update_download(download_url: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let trimmed = download_url.trim();
+        if !is_trusted_update_url(trimmed) {
+            return Err("更新下载地址不可信".to_owned());
+        }
+        open_with_shell(trimmed)
+    })
+    .await
+    .map_err(to_message)?
+}
+
+fn check_for_updates_impl() -> Result<AppUpdateInfo, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(to_message)?;
+    let response = client
+        .get(UPDATE_RELEASE_API_URL)
+        .header(reqwest::header::USER_AGENT, "DustDesk updater")
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .send()
+        .map_err(|error| format!("检查更新失败：{error}"))?;
+
+    if !response.status().is_success() {
+        return Err(format!("检查更新失败：GitHub 返回 {}", response.status()));
+    }
+
+    let release = response
+        .json::<GitHubRelease>()
+        .map_err(|error| format!("读取更新信息失败：{error}"))?;
+    let latest_version = release_version_from_tag(&release.tag_name)
+        .ok_or_else(|| format!("无法识别最新版本号：{}", release.tag_name))?;
+    let current_version = env!("CARGO_PKG_VERSION").to_owned();
+    let update_available = compare_semver_like(&latest_version, &current_version).is_gt();
+    let asset = release
+        .assets
+        .iter()
+        .find(|asset| {
+            asset
+                .name
+                .eq_ignore_ascii_case("DustDesk-latest-windows-x64-setup.exe")
+        })
+        .or_else(|| {
+            release.assets.iter().find(|asset| {
+                let name = asset.name.to_ascii_lowercase();
+                name.ends_with(".exe") && name.contains("setup")
+            })
+        });
+    let download_url = asset
+        .map(|asset| asset.browser_download_url.clone())
+        .unwrap_or_else(|| UPDATE_LATEST_INSTALLER_URL.to_owned());
+    let asset_name = asset.map(|asset| asset.name.clone()).unwrap_or_default();
+
+    Ok(AppUpdateInfo {
+        current_version,
+        latest_version,
+        update_available,
+        release_name: release
+            .name
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| release.tag_name),
+        release_url: release.html_url,
+        download_url,
+        asset_name,
+        published_at: release.published_at.unwrap_or_default(),
+        body: release.body.unwrap_or_default(),
+    })
+}
+
+fn is_trusted_update_url(url: &str) -> bool {
+    if !url.starts_with(UPDATE_RELEASES_URL_PREFIX) {
+        return false;
+    }
+    url.starts_with("https://")
+}
+
+fn release_version_from_tag(tag: &str) -> Option<String> {
+    let trimmed = tag.trim().trim_start_matches('v').trim_start_matches('V');
+    let version = trimmed
+        .split(|character: char| !(character.is_ascii_digit() || character == '.'))
+        .next()
+        .unwrap_or_default()
+        .trim_matches('.');
+    if version.is_empty() {
+        return None;
+    }
+    let parts: Vec<_> = version.split('.').collect();
+    if parts.len() < 3
+        || !parts.iter().all(|part| {
+            !part.is_empty() && part.chars().all(|character| character.is_ascii_digit())
+        })
+    {
+        return None;
+    }
+    Some(parts[..3].join("."))
+}
+
+fn compare_semver_like(left: &str, right: &str) -> CmpOrdering {
+    let left = parse_semver_like(left);
+    let right = parse_semver_like(right);
+    left.cmp(&right)
+}
+
+fn parse_semver_like(version: &str) -> [u64; 3] {
+    let mut output = [0, 0, 0];
+    for (index, part) in version
+        .trim()
+        .trim_start_matches('v')
+        .trim_start_matches('V')
+        .split('.')
+        .take(3)
+        .enumerate()
+    {
+        output[index] = part
+            .chars()
+            .take_while(|character| character.is_ascii_digit())
+            .collect::<String>()
+            .parse::<u64>()
+            .unwrap_or(0);
+    }
+    output
+}
+
+#[tauri::command]
 async fn update_runtime_directory(target: String, path: String) -> Result<AppSnapshot, String> {
     tauri::async_runtime::spawn_blocking(move || update_runtime_directory_impl(target, path))
         .await
@@ -1200,23 +1520,37 @@ fn runtime_migration_copy_pairs(journal: &RuntimeMigrationJournal) -> Vec<(PathB
 }
 
 #[tauri::command]
-fn open_path(path: String) -> Result<(), String> {
-    open_path_impl(Path::new(&path))
+async fn open_path(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        open_path_impl(Path::new(&path))?;
+        settle_desktop_windows_after_launch(&app);
+        Ok(())
+    })
+    .await
+    .map_err(to_message)?
 }
 
 #[tauri::command]
-fn start_all_launchers() -> Result<usize, String> {
-    let store = AppStore::open().map_err(to_message)?;
-    let launchers = store.load_launchers();
-    let mut count = 0usize;
-    for launcher in launchers.items {
-        if launcher.path.trim().is_empty() {
-            continue;
+async fn start_all_launchers(app: tauri::AppHandle) -> Result<usize, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = AppStore::open().map_err(to_message)?;
+        let launchers = store.load_launchers();
+        let mut count = 0usize;
+        for launcher in launchers.items {
+            if launcher.path.trim().is_empty() {
+                continue;
+            }
+            open_with_shell(&launcher.path)?;
+            keep_desktop_windows_behind_apps(&app);
+            count += 1;
         }
-        open_with_shell(&launcher.path)?;
-        count += 1;
-    }
-    Ok(count)
+        if count > 0 {
+            settle_desktop_windows_after_launch(&app);
+        }
+        Ok(count)
+    })
+    .await
+    .map_err(to_message)?
 }
 
 #[tauri::command]
@@ -1617,80 +1951,117 @@ fn search_items(query: String) -> Result<Vec<SearchItem>, String> {
 }
 
 #[tauri::command]
-fn open_search_item(app: tauri::AppHandle, item: SearchItem) -> Result<(), String> {
-    let path = item.path.trim();
-    if path.is_empty() {
-        return Err("路径为空".to_owned());
-    }
-
-    if item.kind == SearchItemKind::Directory || item.is_dir {
-        open_path_impl(Path::new(path))?;
-    } else {
-        open_with_shell(path)?;
-        record_search_open(&item)?;
-    }
-
-    hide_search_overlay_impl(&app);
-    Ok(())
-}
-
-#[tauri::command]
-fn hide_search_overlay(app: tauri::AppHandle) -> Result<(), String> {
-    hide_search_overlay_impl(&app);
-    Ok(())
-}
-
-#[tauri::command]
-fn hide_current_window(window: WebviewWindow) -> Result<(), String> {
-    window.hide().map_err(to_message)
-}
-
-#[tauri::command]
-async fn hide_main_window_to_tray(app: tauri::AppHandle) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || hide_main_window_impl(&app))
-        .await
-        .map_err(to_message)?
-}
-
-#[tauri::command]
-fn cleanup_desktop_card_windows(app: tauri::AppHandle) -> Result<(), String> {
-    cleanup_desktop_card_windows_impl(&app);
-    Ok(())
-}
-
-#[tauri::command]
-fn repaint_current_window(window: WebviewWindow) -> Result<(), String> {
-    let size = window.inner_size().map_err(to_message)?;
-    let width = size.width;
-    let height = size.height;
-    if width == 0 || height == 0 {
-        return Ok(());
-    }
-
-    window
-        .set_size(Size::Physical(PhysicalSize::new(
-            width.saturating_add(1),
-            height,
-        )))
-        .map_err(to_message)?;
-    window
-        .set_size(Size::Physical(PhysicalSize::new(width, height)))
-        .map_err(to_message)
-}
-
-#[tauri::command]
-async fn paste_clipboard_item(app: tauri::AppHandle, id: String) -> Result<(), String> {
+async fn open_search_item(app: tauri::AppHandle, item: SearchItem) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        clipboard_bridge::paste_history_item(&id, || hide_clipboard_overlay_impl(&app))
+        let path = item.path.trim();
+        if path.is_empty() {
+            return Err("路径为空".to_owned());
+        }
+
+        if item.kind == SearchItemKind::Directory || item.is_dir {
+            open_path_impl(Path::new(path))?;
+        } else {
+            open_with_shell(path)?;
+            record_search_open(&item)?;
+        }
+
+        with_lazy_window_operation(|| {
+            hide_search_overlay_impl(&app);
+            Ok(())
+        })?;
+        settle_desktop_windows_after_launch(&app);
+        Ok(())
     })
     .await
     .map_err(to_message)?
 }
 
 #[tauri::command]
-fn hide_clipboard_overlay(app: tauri::AppHandle) -> Result<(), String> {
-    hide_clipboard_overlay_impl(&app);
-    Ok(())
+async fn hide_search_overlay(app: tauri::AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        with_lazy_window_operation(|| {
+            hide_search_overlay_impl(&app);
+            Ok(())
+        })
+    })
+    .await
+    .map_err(to_message)?
+}
+
+#[tauri::command]
+async fn hide_current_window(window: WebviewWindow) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || window.hide().map_err(to_message))
+        .await
+        .map_err(to_message)?
+}
+
+#[tauri::command]
+async fn hide_main_window_to_tray(app: tauri::AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        with_lazy_window_operation(|| hide_main_window_impl(&app))
+    })
+    .await
+    .map_err(to_message)?
+}
+
+#[tauri::command]
+async fn cleanup_desktop_card_windows(app: tauri::AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        cleanup_desktop_card_windows_impl(&app);
+        Ok(())
+    })
+    .await
+    .map_err(to_message)?
+}
+
+#[tauri::command]
+async fn repaint_current_window(window: WebviewWindow) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let size = window.inner_size().map_err(to_message)?;
+        let width = size.width;
+        let height = size.height;
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+
+        window
+            .set_size(Size::Physical(PhysicalSize::new(
+                width.saturating_add(1),
+                height,
+            )))
+            .map_err(to_message)?;
+        window
+            .set_size(Size::Physical(PhysicalSize::new(width, height)))
+            .map_err(to_message)
+    })
+    .await
+    .map_err(to_message)?
+}
+
+#[tauri::command]
+async fn paste_clipboard_item(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        clipboard_bridge::paste_history_item(&id, || {
+            let _ = with_lazy_window_operation(|| {
+                hide_clipboard_overlay_impl(&app);
+                Ok(())
+            });
+        })
+    })
+    .await
+    .map_err(to_message)?
+}
+
+#[tauri::command]
+async fn hide_clipboard_overlay(app: tauri::AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        with_lazy_window_operation(|| {
+            hide_clipboard_overlay_impl(&app);
+            Ok(())
+        })
+    })
+    .await
+    .map_err(to_message)?
 }
 
 #[tauri::command]
@@ -1838,6 +2209,569 @@ fn remove_category_path_from_config(
     Ok(())
 }
 
+fn restore_desktop_organization_for_exit() -> Result<usize, String> {
+    restore_desktop_organization_for_exit_with_progress(|_, _, _| {})
+}
+
+fn restore_desktop_organization_for_exit_with_progress(
+    mut on_progress: impl FnMut(usize, usize, &Path),
+) -> Result<usize, String> {
+    with_config_mutation(|| {
+        let store = AppStore::open().map_err(to_message)?;
+        store.ensure_runtime_dirs().map_err(to_message)?;
+        recover_transfer_quarantine_journals_strict(false)?;
+        let desktop = user_desktop().ok_or_else(|| "没有找到桌面路径".to_owned())?;
+        let persistence = AppDesktopOrganizationRestartPersistence;
+        let result = restore_desktop_organization_for_exit_core_with_progress(
+            &store,
+            &desktop,
+            &persistence,
+            &mut on_progress,
+        );
+
+        // Cross-volume directory moves commit before their quarantine cleanup. Do not let the
+        // process exit while a newly restored desktop destination still has an active journal.
+        let recovery_result = recover_transfer_quarantine_journals_strict(false);
+        match (result, recovery_result) {
+            (Ok(restored), Ok(())) => Ok(restored),
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+            (Err(error), Err(recovery_error)) => {
+                Err(format!("{error}；退出迁移日志收尾失败：{recovery_error}"))
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+fn restore_desktop_organization_for_exit_core(
+    store: &AppStore,
+    desktop: &Path,
+    persistence: &impl DesktopOrganizationRestartPersistence,
+) -> Result<usize, String> {
+    restore_desktop_organization_for_exit_core_with_progress(
+        store,
+        desktop,
+        persistence,
+        &mut |_, _, _| {},
+    )
+}
+
+fn restore_desktop_organization_for_exit_core_with_progress(
+    store: &AppStore,
+    desktop: &Path,
+    persistence: &impl DesktopOrganizationRestartPersistence,
+    on_progress: &mut impl FnMut(usize, usize, &Path),
+) -> Result<usize, String> {
+    store.ensure_runtime_dirs().map_err(to_message)?;
+    fs::create_dir_all(desktop).map_err(to_message)?;
+    let mut config = store.load_config_strict().map_err(to_message)?;
+    repair_category_item_paths_for_desktop(store, &mut config, desktop)?;
+
+    let existing_marker = persistence.load()?;
+    let mut marker =
+        prepare_exit_restart_marker(&config, &store.organizer_root(), desktop, existing_marker)?;
+    if marker.is_empty() {
+        clear_desktop_organization_restart_marker(persistence)?;
+        store.save_config(&config).map_err(to_message)?;
+        return Ok(0);
+    }
+
+    // The complete intent is durable before the first physical move.
+    persistence.save(&marker)?;
+    let organizer_root = store.organizer_root();
+    let mut restored_sources = Vec::<String>::new();
+    let mut restore_errors = Vec::<String>::new();
+    let mut restored = 0usize;
+    let total = marker
+        .categories
+        .iter()
+        .flat_map(|category| &category.items)
+        .filter(|item| {
+            valid_restart_source_path(Path::new(&item.source_path), &organizer_root)
+                && !item
+                    .desktop_path
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .is_some_and(|path| valid_restart_desktop_path(&path, desktop))
+        })
+        .count();
+
+    for category_index in 0..marker.categories.len() {
+        for item_index in 0..marker.categories[category_index].items.len() {
+            let source = PathBuf::from(
+                marker.categories[category_index].items[item_index]
+                    .source_path
+                    .clone(),
+            );
+            if !valid_restart_source_path(&source, &organizer_root) {
+                continue;
+            }
+            if marker.categories[category_index].items[item_index]
+                .desktop_path
+                .as_deref()
+                .map(PathBuf::from)
+                .is_some_and(|path| valid_restart_desktop_path(&path, desktop))
+            {
+                // Both copies exist and paths alone cannot prove which one owns the marker. Keep
+                // the ambiguity durable instead of moving or deleting either copy automatically.
+                eprintln!(
+                    "keeping ambiguous restart marker because organizer and desktop copies both exist: {}",
+                    source.display()
+                );
+                continue;
+            }
+
+            let mut moved = false;
+            let error_count_before_move = restore_errors.len();
+            for _ in 0..1000 {
+                let destination = unique_destination(desktop, &source);
+                marker.categories[category_index].items[item_index].desktop_path =
+                    Some(destination.display().to_string());
+                // Persist the exact no-overwrite target before moving this item.
+                persistence.save(&marker)?;
+
+                match move_path(&source, &destination) {
+                    Ok(()) => {
+                        notify_shell_path_moved(&source, &destination);
+                        restored_sources.push(source.display().to_string());
+                        restored += 1;
+                        on_progress(restored, total, &destination);
+                        moved = true;
+                        break;
+                    }
+                    Err(error)
+                        if source.exists()
+                            && destination.exists()
+                            && error.contains("目标项目已存在") =>
+                    {
+                        // An external process won the destination race. Never leave that unrelated
+                        // desktop path marked as ours; choose and persist a fresh target.
+                        marker.categories[category_index].items[item_index].desktop_path = None;
+                        persistence.save(&marker)?;
+                    }
+                    Err(error) => {
+                        if source.exists() && !destination.exists() {
+                            marker.categories[category_index].items[item_index].desktop_path = None;
+                            persistence.save(&marker)?;
+                        }
+                        eprintln!(
+                            "failed to restore desktop item {}: {error}",
+                            source.display()
+                        );
+                        restore_errors.push(format!("{}: {error}", source.display()));
+                        break;
+                    }
+                }
+            }
+
+            if !moved {
+                if restore_errors.len() == error_count_before_move {
+                    restore_errors.push(format!(
+                        "{}: 无法生成无冲突的桌面目标路径",
+                        source.display()
+                    ));
+                }
+                continue;
+            }
+        }
+    }
+
+    for category in &mut config.desktop_categories {
+        category.item_paths.retain(|item_path| {
+            !restored_sources
+                .iter()
+                .any(|source| same_path_text(source, item_path))
+        });
+    }
+    store.save_config(&config).map_err(to_message)?;
+    cleanup_empty_organizer_dirs(&organizer_root);
+    if restore_errors.is_empty() {
+        Ok(restored)
+    } else {
+        Err(format!(
+            "有 {} 个收纳项目未能还原到桌面：{}",
+            restore_errors.len(),
+            restore_errors.join("；")
+        ))
+    }
+}
+
+fn recollect_desktop_organization_from_restart_marker_with_progress(
+    mut on_progress: impl FnMut(usize, usize, &Path),
+) -> Result<usize, String> {
+    with_config_mutation(|| {
+        let store = AppStore::open().map_err(to_message)?;
+        store.ensure_runtime_dirs().map_err(to_message)?;
+        let desktop = user_desktop().ok_or_else(|| "没有找到桌面路径".to_owned())?;
+        let persistence = AppDesktopOrganizationRestartPersistence;
+        // Always recover uncommitted transfers before reading or parsing lifecycle metadata.
+        recover_transfer_quarantine_journals_strict(true)?;
+        let marker_content = AppStore::load_desktop_organization_restart().map_err(to_message)?;
+
+        let marker = marker_content
+            .map(|content| serde_json::from_str(&content).map_err(to_message))
+            .transpose()?;
+        // A marked destination must remain in place until committed quarantine records that refer
+        // to it are cleaned. Unrelated committed cleanup stays deferred so a large old transfer
+        // cannot delay normal startup.
+        if let Some(marker) = &marker {
+            let related_paths = restart_marker_paths(marker);
+            recover_related_transfer_quarantine_journals_strict(&related_paths)?;
+        }
+        recollect_desktop_organization_from_restart_marker_core_with_progress(
+            &store,
+            &desktop,
+            marker,
+            &persistence,
+            &mut on_progress,
+        )
+    })
+}
+
+#[cfg(test)]
+fn recollect_desktop_organization_from_restart_marker_core(
+    store: &AppStore,
+    desktop: &Path,
+    marker: Option<DesktopOrganizationRestartMarker>,
+    persistence: &impl DesktopOrganizationRestartPersistence,
+) -> Result<usize, String> {
+    recollect_desktop_organization_from_restart_marker_core_with_progress(
+        store,
+        desktop,
+        marker,
+        persistence,
+        &mut |_, _, _| {},
+    )
+}
+
+fn recollect_desktop_organization_from_restart_marker_core_with_progress(
+    store: &AppStore,
+    desktop: &Path,
+    marker: Option<DesktopOrganizationRestartMarker>,
+    persistence: &impl DesktopOrganizationRestartPersistence,
+    on_progress: &mut impl FnMut(usize, usize, &Path),
+) -> Result<usize, String> {
+    if let Some(marker) = &marker {
+        validate_restart_marker(marker)?;
+    }
+
+    store.ensure_runtime_dirs().map_err(to_message)?;
+    let mut config = store.load_config_strict().map_err(to_message)?;
+    repair_category_item_paths_for_desktop(store, &mut config, desktop)?;
+    let Some(marker) = marker else {
+        store.save_config(&config).map_err(to_message)?;
+        return Ok(0);
+    };
+
+    let organizer_root = store.organizer_root();
+    let mut remaining = DesktopOrganizationRestartMarker::empty();
+    let mut recollected = 0usize;
+    let total = marker
+        .categories
+        .iter()
+        .map(|category| category.items.len())
+        .sum();
+    let mut processed = 0usize;
+    let mut claimed_category_indices = Vec::new();
+
+    for category_marker in marker.categories {
+        let target_category_index =
+            restart_category_index(&mut config, &category_marker, &mut claimed_category_indices);
+        let mut failed_items = Vec::new();
+
+        for item in category_marker.items {
+            processed += 1;
+            let source = PathBuf::from(&item.source_path);
+            let desktop_path = item.desktop_path.as_deref().map(PathBuf::from);
+            let source_exists = valid_restart_source_path(&source, &organizer_root);
+            let desktop_source = desktop_path
+                .as_ref()
+                .filter(|path| valid_restart_desktop_path(path, desktop));
+
+            if source_exists && desktop_source.is_some() {
+                // Paths alone cannot distinguish a destination race from an externally recreated
+                // organizer source. Preserve both and retry rather than collecting the wrong item.
+                on_progress(
+                    processed,
+                    total,
+                    desktop_source.expect("desktop source checked"),
+                );
+                failed_items.push(item);
+                continue;
+            }
+
+            if source_exists {
+                remove_restart_item_paths_from_config(
+                    &mut config,
+                    &item.source_path,
+                    item.desktop_path.as_deref(),
+                );
+                push_unique_text_path(
+                    &mut config.desktop_categories[target_category_index].item_paths,
+                    source.display().to_string(),
+                );
+                recollected += 1;
+                on_progress(processed, total, &source);
+                continue;
+            }
+
+            if let Some(desktop_source) = desktop_source {
+                match recollect_marked_desktop_item(store, &source, desktop_source) {
+                    Ok(archived_path) => {
+                        let archived_path_buf = PathBuf::from(&archived_path);
+                        remove_restart_item_paths_from_config(
+                            &mut config,
+                            &item.source_path,
+                            item.desktop_path.as_deref(),
+                        );
+                        push_unique_text_path(
+                            &mut config.desktop_categories[target_category_index].item_paths,
+                            archived_path,
+                        );
+                        recollected += 1;
+                        on_progress(processed, total, &archived_path_buf);
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "failed to recollect desktop item {}: {error}",
+                            desktop_source.display()
+                        );
+                        on_progress(processed, total, desktop_source);
+                        failed_items.push(item);
+                    }
+                }
+                continue;
+            }
+
+            let desktop_path_still_exists = desktop_path.as_ref().is_some_and(|path| path.exists());
+            if source.exists() || desktop_path_still_exists {
+                // Existing but invalid paths are never moved automatically; retain them for a
+                // future retry instead of losing the user's restart intent.
+                failed_items.push(item);
+            }
+            on_progress(processed, total, &source);
+        }
+
+        if !failed_items.is_empty() {
+            remaining.categories.push(RestartCategoryMarker {
+                category_name: category_marker.category_name,
+                category_index: category_marker.category_index,
+                items: failed_items,
+            });
+        }
+    }
+
+    store.save_config(&config).map_err(to_message)?;
+    if remaining.is_empty() {
+        clear_desktop_organization_restart_marker(persistence)?;
+    } else {
+        persistence.save(&remaining)?;
+    }
+    Ok(recollected)
+}
+
+fn prepare_exit_restart_marker(
+    config: &AppConfig,
+    organizer_root: &Path,
+    desktop: &Path,
+    existing: Option<DesktopOrganizationRestartMarker>,
+) -> Result<DesktopOrganizationRestartMarker, String> {
+    let mut marker = existing.unwrap_or_else(DesktopOrganizationRestartMarker::empty);
+    validate_restart_marker(&marker)?;
+
+    for category in &mut marker.categories {
+        category.items.retain(|item| {
+            let source = PathBuf::from(&item.source_path);
+            let source_exists = valid_restart_source_path(&source, organizer_root);
+            let desktop_exists = item
+                .desktop_path
+                .as_deref()
+                .map(PathBuf::from)
+                .is_some_and(|path| valid_restart_desktop_path(&path, desktop));
+            source_exists || desktop_exists
+        });
+    }
+    marker
+        .categories
+        .retain(|category| !category.items.is_empty());
+
+    for (category_index, category) in config.desktop_categories.iter().enumerate() {
+        for item_path in &category.item_paths {
+            let source = recover_existing_path_from_corrupted_text(item_path)
+                .unwrap_or_else(|| PathBuf::from(item_path));
+            if !valid_restart_source_path(&source, organizer_root) {
+                continue;
+            }
+            let existing_item = take_restart_marker_item(&mut marker, &source);
+
+            let marker_category_index = marker
+                .categories
+                .iter()
+                .position(|candidate| {
+                    candidate.category_index == Some(category_index)
+                        && candidate.category_name == category.name
+                })
+                .or_else(|| {
+                    marker.categories.iter().position(|candidate| {
+                        candidate.category_index.is_none()
+                            && candidate.category_name == category.name
+                    })
+                })
+                .unwrap_or_else(|| {
+                    marker.categories.push(RestartCategoryMarker {
+                        category_name: category.name.clone(),
+                        category_index: Some(category_index),
+                        items: Vec::new(),
+                    });
+                    marker.categories.len() - 1
+                });
+            marker.categories[marker_category_index]
+                .items
+                .push(existing_item.unwrap_or_else(|| RestartItemMarker {
+                    source_path: source.display().to_string(),
+                    desktop_path: None,
+                }));
+        }
+    }
+
+    marker
+        .categories
+        .retain(|category| !category.items.is_empty());
+
+    Ok(marker)
+}
+
+fn validate_restart_marker(marker: &DesktopOrganizationRestartMarker) -> Result<(), String> {
+    if marker.schema_version != DESKTOP_ORGANIZATION_RESTART_SCHEMA_VERSION {
+        return Err(format!(
+            "不支持的桌面收纳重启标记版本：{}",
+            marker.schema_version
+        ));
+    }
+    Ok(())
+}
+
+fn restart_marker_paths(marker: &DesktopOrganizationRestartMarker) -> Vec<PathBuf> {
+    marker
+        .categories
+        .iter()
+        .flat_map(|category| &category.items)
+        .flat_map(|item| {
+            std::iter::once(PathBuf::from(&item.source_path))
+                .chain(item.desktop_path.as_deref().map(PathBuf::from))
+        })
+        .collect()
+}
+
+fn valid_restart_source_path(path: &Path, organizer_root: &Path) -> bool {
+    path.exists()
+        && !same_path_for_move(path, organizer_root)
+        && is_path_within(path, organizer_root)
+        && !is_internal_transfer_path(path)
+        && !is_desktop_ini_path(path)
+}
+
+fn valid_restart_desktop_path(path: &Path, desktop: &Path) -> bool {
+    path.exists()
+        && !same_path_for_move(path, desktop)
+        && is_path_within(path, desktop)
+        && !is_internal_transfer_path(path)
+        && !is_desktop_ini_path(path)
+}
+
+fn take_restart_marker_item(
+    marker: &mut DesktopOrganizationRestartMarker,
+    source: &Path,
+) -> Option<RestartItemMarker> {
+    for category in &mut marker.categories {
+        if let Some(index) = category
+            .items
+            .iter()
+            .position(|item| same_path_text(&item.source_path, &source.display().to_string()))
+        {
+            return Some(category.items.remove(index));
+        }
+    }
+    None
+}
+
+fn restart_category_index(
+    config: &mut AppConfig,
+    marker: &RestartCategoryMarker,
+    claimed_indices: &mut Vec<usize>,
+) -> usize {
+    if let Some(index) = marker.category_index {
+        if config
+            .desktop_categories
+            .get(index)
+            .is_some_and(|category| category.name == marker.category_name)
+            && !claimed_indices.contains(&index)
+        {
+            claimed_indices.push(index);
+            return index;
+        }
+    }
+    if let Some(index) =
+        config
+            .desktop_categories
+            .iter()
+            .enumerate()
+            .find_map(|(index, category)| {
+                (category.name == marker.category_name && !claimed_indices.contains(&index))
+                    .then_some(index)
+            })
+    {
+        claimed_indices.push(index);
+        return index;
+    }
+
+    config.desktop_categories.push(DeskCategory {
+        name: normalize_name(&marker.category_name, config.desktop_categories.len() + 1),
+        ..DeskCategory::default()
+    });
+    let index = config.desktop_categories.len() - 1;
+    claimed_indices.push(index);
+    index
+}
+
+fn recollect_marked_desktop_item(
+    store: &AppStore,
+    original_source: &Path,
+    desktop_source: &Path,
+) -> Result<String, String> {
+    let organizer_root = store.organizer_root();
+    if same_path_for_move(original_source, &organizer_root)
+        || !is_path_within(original_source, &organizer_root)
+        || is_internal_transfer_path(original_source)
+        || is_desktop_ini_path(original_source)
+    {
+        return Err(format!(
+            "重启标记中的收纳目标无效：{}",
+            original_source.display()
+        ));
+    }
+    let parent = original_source
+        .parent()
+        .ok_or_else(|| "无法识别原收纳分类目录".to_owned())?;
+    fs::create_dir_all(parent).map_err(to_message)?;
+    move_path(desktop_source, original_source)?;
+    notify_shell_path_moved(desktop_source, original_source);
+    Ok(original_source.display().to_string())
+}
+
+fn remove_restart_item_paths_from_config(
+    config: &mut AppConfig,
+    source_path: &str,
+    desktop_path: Option<&str>,
+) {
+    for category in &mut config.desktop_categories {
+        category.item_paths.retain(|item_path| {
+            !same_path_text(item_path, source_path)
+                && desktop_path.is_none_or(|path| !same_path_text(item_path, path))
+        });
+    }
+}
+
 fn restore_all_organized_items_to_desktop_and_clear_markers() -> Result<usize, String> {
     restore_all_organized_items_to_desktop_with_progress(|_, _, _| {})
 }
@@ -1853,8 +2787,9 @@ fn restore_all_organized_items_to_desktop_impl(
 ) -> Result<usize, String> {
     let (restored, desktop, organizer_root) = with_config_mutation(|| {
         let store = AppStore::open().map_err(to_message)?;
+        clear_desktop_organization_restart_marker(&AppDesktopOrganizationRestartPersistence)?;
         store.ensure_runtime_dirs().map_err(to_message)?;
-        cleanup_startup_transfer_staging_dirs(&store);
+        recover_transfer_quarantine_journals_strict(false)?;
         let desktop = user_desktop().ok_or_else(|| "没有找到桌面路径".to_owned())?;
         fs::create_dir_all(&desktop).map_err(to_message)?;
         let organizer_root = store.organizer_root();
@@ -3694,14 +4629,29 @@ fn archive_destination(category_dir: &Path, source: &Path) -> Result<PathBuf, St
 }
 
 fn repair_category_item_paths(store: &AppStore, config: &mut AppConfig) -> Result<(), String> {
+    repair_category_item_paths_with_desktop_roots(store, config, &desktop_roots())
+}
+
+fn repair_category_item_paths_for_desktop(
+    store: &AppStore,
+    config: &mut AppConfig,
+    desktop: &Path,
+) -> Result<(), String> {
+    repair_category_item_paths_with_desktop_roots(store, config, &[desktop.to_path_buf()])
+}
+
+fn repair_category_item_paths_with_desktop_roots(
+    store: &AppStore,
+    config: &mut AppConfig,
+    desktop_roots: &[PathBuf],
+) -> Result<(), String> {
     let organizer_root = store.organizer_root();
-    let mut changed = false;
+    let mut changed = recover_missing_categories_from_organizer(&organizer_root, config);
     let mut seen_paths = Vec::<String>::new();
 
     for category in &mut config.desktop_categories {
         let old_paths = std::mem::take(&mut category.item_paths);
         let mut repaired_paths = Vec::with_capacity(old_paths.len());
-        let category_name = category.name.clone();
 
         for item_path in old_paths {
             let source = recover_existing_path_from_corrupted_text(&item_path)
@@ -3718,12 +4668,17 @@ fn repair_category_item_paths(store: &AppStore, config: &mut AppConfig) -> Resul
                 changed = true;
             }
 
-            let repaired_text =
-                if is_desktop_child(&source) && !is_path_within(&source, &organizer_root) {
-                    archive_item_path(store, &category_name, &source.display().to_string())?
-                } else {
-                    source.display().to_string()
-                };
+            if desktop_roots
+                .iter()
+                .any(|desktop| is_path_within(&source, desktop))
+                && !is_path_within(&source, &organizer_root)
+            {
+                // Desktop paths are not organization markers. Only the independent restart marker
+                // may recollect an item after launch; stale config references are removed here.
+                changed = true;
+                continue;
+            }
+            let repaired_text = source.display().to_string();
 
             if !same_path_text(&source.display().to_string(), &repaired_text) {
                 changed = true;
@@ -3742,8 +4697,21 @@ fn repair_category_item_paths(store: &AppStore, config: &mut AppConfig) -> Resul
         category.item_paths = repaired_paths;
     }
 
-    for category in &mut config.desktop_categories {
-        let category_dir = organizer_root.join(safe_windows_file_name(&category.name));
+    let category_dirs = fs::read_dir(&organizer_root)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.flatten())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir() && !is_internal_transfer_path(path))
+        .collect::<Vec<_>>();
+    for category_dir in category_dirs {
+        let Some(category_index) = category_index_for_organizer_dir(
+            &organizer_root,
+            &config.desktop_categories,
+            &category_dir,
+        ) else {
+            continue;
+        };
         let Ok(entries) = fs::read_dir(&category_dir) else {
             continue;
         };
@@ -3763,7 +4731,9 @@ fn repair_category_item_paths(store: &AppStore, config: &mut AppConfig) -> Resul
             }
 
             seen_paths.push(path_text.clone());
-            category.item_paths.push(path_text);
+            config.desktop_categories[category_index]
+                .item_paths
+                .push(path_text);
             changed = true;
         }
     }
@@ -3773,6 +4743,69 @@ fn repair_category_item_paths(store: &AppStore, config: &mut AppConfig) -> Resul
     }
 
     Ok(())
+}
+
+fn recover_missing_categories_from_organizer(
+    organizer_root: &Path,
+    config: &mut AppConfig,
+) -> bool {
+    let Ok(entries) = fs::read_dir(organizer_root) else {
+        return false;
+    };
+    let mut changed = false;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() || is_internal_transfer_path(&path) {
+            continue;
+        }
+        let has_user_items = fs::read_dir(&path)
+            .ok()
+            .into_iter()
+            .flat_map(|items| items.flatten())
+            .any(|item| {
+                let item_path = item.path();
+                !is_internal_transfer_path(&item_path) && !is_desktop_ini_path(&item_path)
+            });
+        if !has_user_items {
+            continue;
+        }
+        if category_index_for_organizer_dir(organizer_root, &config.desktop_categories, &path)
+            .is_some()
+        {
+            continue;
+        }
+        let Some(name) = path
+            .file_name()
+            .map(|name| name.to_string_lossy().trim().to_owned())
+            .filter(|name| !name.is_empty())
+        else {
+            continue;
+        };
+        config.desktop_categories.push(DeskCategory {
+            name,
+            ..DeskCategory::default()
+        });
+        changed = true;
+    }
+
+    changed
+}
+
+fn category_index_for_organizer_dir(
+    organizer_root: &Path,
+    categories: &[DeskCategory],
+    category_dir: &Path,
+) -> Option<usize> {
+    categories.iter().position(|category| {
+        same_path_for_move(
+            &organizer_root.join(safe_windows_file_name(&category.name)),
+            category_dir,
+        ) || category
+            .item_paths
+            .iter()
+            .any(|item_path| is_path_within(Path::new(item_path), category_dir))
+    })
 }
 
 fn push_unique_text_path(paths: &mut Vec<String>, path: String) -> bool {
@@ -3806,12 +4839,6 @@ fn recover_existing_path_from_corrupted_text(path_text: &str) -> Option<PathBuf>
     }
 
     None
-}
-
-fn is_desktop_child(path: &Path) -> bool {
-    desktop_roots()
-        .iter()
-        .any(|root| is_path_within(path, root))
 }
 
 fn is_path_within(path: &Path, root: &Path) -> bool {
@@ -4465,16 +5492,45 @@ fn cleanup_stale_transfer_staging_dirs(root: &Path, minimum_age: Duration) -> us
 }
 
 fn recover_transfer_quarantine_journals() {
-    let Ok(_guard) = TRANSFER_RECOVERY_LOCK.get_or_init(|| Mutex::new(())).lock() else {
-        eprintln!("failed to lock transfer quarantine recovery");
-        return;
+    recover_transfer_quarantine_journals_with_mode(false);
+}
+
+fn recover_transfer_quarantine_journals_with_mode(defer_committed_cleanup: bool) {
+    if let Err(error) = recover_transfer_quarantine_journals_strict(defer_committed_cleanup) {
+        eprintln!("failed to recover transfer quarantine journals: {error}");
+    }
+}
+
+fn recover_transfer_quarantine_journals_strict(
+    defer_committed_cleanup: bool,
+) -> Result<(), String> {
+    recover_transfer_quarantine_journals_filtered_strict(defer_committed_cleanup, None)
+}
+
+fn recover_related_transfer_quarantine_journals_strict(
+    related_paths: &[PathBuf],
+) -> Result<(), String> {
+    if related_paths.is_empty() {
+        return Ok(());
+    }
+    recover_transfer_quarantine_journals_filtered_strict(false, Some(related_paths))
+}
+
+fn recover_transfer_quarantine_journals_filtered_strict(
+    defer_committed_cleanup: bool,
+    related_paths: Option<&[PathBuf]>,
+) -> Result<(), String> {
+    let _guard = TRANSFER_RECOVERY_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "迁移隔离恢复锁已损坏".to_owned())?;
+    let journal_root = transfer_quarantine_journal_root()?;
+    let entries = match fs::read_dir(&journal_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(to_message(error)),
     };
-    let Ok(journal_root) = transfer_quarantine_journal_root() else {
-        return;
-    };
-    let Ok(entries) = fs::read_dir(&journal_root) else {
-        return;
-    };
+    let mut errors = Vec::new();
 
     for entry in entries.flatten() {
         let journal_path = entry.path();
@@ -4485,13 +5541,47 @@ fn recover_transfer_quarantine_journals() {
         if !is_journal {
             continue;
         }
-        if let Err(error) = recover_transfer_quarantine_journal(&journal_path) {
-            eprintln!(
-                "failed to recover transfer quarantine {}: {error}",
-                journal_path.display()
-            );
+        if let Some(related_paths) = related_paths {
+            match transfer_quarantine_journal_matches_paths(&journal_path, related_paths) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    errors.push(format!("{}: {error}", journal_path.display()));
+                    continue;
+                }
+            }
+        }
+        if let Err(error) =
+            recover_transfer_quarantine_journal_with_mode(&journal_path, defer_committed_cleanup)
+        {
+            errors.push(format!("{}: {error}", journal_path.display()));
         }
     }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("；"))
+    }
+}
+
+fn transfer_quarantine_journal_matches_paths(
+    journal_path: &Path,
+    related_paths: &[PathBuf],
+) -> Result<bool, String> {
+    let bytes = fs::read(journal_path).map_err(to_message)?;
+    let journal =
+        serde_json::from_slice::<TransferQuarantineJournal>(&bytes).map_err(to_message)?;
+    let original = path_from_utf16(&journal.original_path_utf16)?;
+    let destination = path_from_utf16(&journal.destination_path_utf16)?;
+    Ok(related_paths.iter().any(|path| {
+        paths_overlap_for_transfer_recovery(path, &original)
+            || paths_overlap_for_transfer_recovery(path, &destination)
+    }))
+}
+
+fn paths_overlap_for_transfer_recovery(first: &Path, second: &Path) -> bool {
+    is_path_within(first, second) || is_path_within(second, first)
 }
 
 #[cfg(not(test))]
@@ -4507,6 +5597,13 @@ fn recover_transfer_quarantine_journal_serialized(journal_path: &Path) -> Result
 }
 
 fn recover_transfer_quarantine_journal(journal_path: &Path) -> Result<(), String> {
+    recover_transfer_quarantine_journal_with_mode(journal_path, false)
+}
+
+fn recover_transfer_quarantine_journal_with_mode(
+    journal_path: &Path,
+    defer_committed_cleanup: bool,
+) -> Result<(), String> {
     let bytes = fs::read(journal_path).map_err(to_message)?;
     let journal =
         serde_json::from_slice::<TransferQuarantineJournal>(&bytes).map_err(to_message)?;
@@ -4525,6 +5622,9 @@ fn recover_transfer_quarantine_journal(journal_path: &Path) -> Result<(), String
                 ));
             }
             return quarantine.restore();
+        }
+        if defer_committed_cleanup {
+            return Ok(());
         }
         if quarantine.payload.exists() {
             if !cleanup_started {
@@ -4559,6 +5659,9 @@ fn recover_transfer_quarantine_journal(journal_path: &Path) -> Result<(), String
     {
         quarantine.mark_committed()?;
         quarantine.destination_committed = true;
+        if defer_committed_cleanup {
+            return Ok(());
+        }
         quarantine.mark_cleanup_started()?;
         delete_transfer_quarantine_payload(&quarantine.payload)?;
         quarantine.source_deleted = true;
@@ -4573,18 +5676,16 @@ fn delete_transfer_quarantine_payload(path: &Path) -> Result<(), String> {
     delete_locked_source_tree(locked)
 }
 
-fn cleanup_startup_transfer_staging_dirs(store: &AppStore) {
-    recover_transfer_quarantine_journals();
-
+fn cleanup_transfer_staging_dirs(store: &AppStore, minimum_age: Duration) {
     for root in desktop_roots() {
-        let removed = cleanup_stale_transfer_staging_dirs(&root, Duration::ZERO);
+        let removed = cleanup_stale_transfer_staging_dirs(&root, minimum_age);
         if removed > 0 {
             notify_shell_directory_updated(&root);
         }
     }
 
     let organizer_root = store.organizer_root();
-    let removed = cleanup_stale_transfer_staging_dirs(&organizer_root, Duration::ZERO);
+    let removed = cleanup_stale_transfer_staging_dirs(&organizer_root, minimum_age);
     if removed > 0 {
         notify_shell_directory_updated(&organizer_root);
     }
@@ -4595,12 +5696,22 @@ fn cleanup_startup_transfer_staging_dirs(store: &AppStore) {
             if !path.is_dir() {
                 continue;
             }
-            let removed = cleanup_stale_transfer_staging_dirs(&path, Duration::ZERO);
+            let removed = cleanup_stale_transfer_staging_dirs(&path, minimum_age);
             if removed > 0 {
                 notify_shell_directory_updated(&path);
             }
         }
     }
+}
+
+fn schedule_stale_transfer_staging_cleanup() {
+    tauri::async_runtime::spawn_blocking(|| {
+        let Ok(store) = AppStore::open() else {
+            return;
+        };
+        recover_transfer_quarantine_journals();
+        cleanup_transfer_staging_dirs(&store, Duration::from_secs(10 * 60));
+    });
 }
 
 #[cfg(windows)]
@@ -5831,7 +6942,26 @@ fn is_noise_search_dir(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::DesktopLayout;
+    use std::cell::{Cell, RefCell};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn release_version_parsing_accepts_standard_tags() {
+        assert_eq!(release_version_from_tag("v0.1.2"), Some("0.1.2".to_owned()));
+        assert_eq!(
+            release_version_from_tag("v0.1.2-15"),
+            Some("0.1.2".to_owned())
+        );
+        assert_eq!(release_version_from_tag("build"), None);
+    }
+
+    #[test]
+    fn semver_like_compare_orders_patch_versions() {
+        assert_eq!(compare_semver_like("0.1.2", "0.1.1"), CmpOrdering::Greater);
+        assert_eq!(compare_semver_like("0.1.1", "0.1.1"), CmpOrdering::Equal);
+        assert_eq!(compare_semver_like("0.1.0", "0.1.1"), CmpOrdering::Less);
+    }
 
     #[test]
     fn recursive_search_finds_nested_shortcut_before_noisy_dirs() {
@@ -5915,6 +7045,725 @@ mod tests {
             b"important data"
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn organized_item_marker_survives_store_reopen_and_snapshot_repair() {
+        let root = unique_test_dir("dustdesk-organized-marker-restart");
+        let data = root.join("data");
+        let organizer = root.join("organizer");
+        let launchers = root.join("launchers");
+        let category_dir = organizer.join("documents");
+        fs::create_dir_all(&category_dir).expect("create category directory");
+        let organized_item = category_dir.join("important.txt");
+        fs::write(&organized_item, b"important data").expect("write organized item");
+
+        let store = AppStore::for_test(data.clone(), organizer.clone(), launchers.clone());
+        let marker = organized_item.display().to_string();
+        let config = AppConfig {
+            desktop_categories: vec![DeskCategory {
+                name: "documents".to_owned(),
+                item_paths: vec![marker.clone()],
+                ..DeskCategory::default()
+            }],
+            desktop_layout: DesktopLayout {
+                split_category_indices: vec![0],
+                ..DesktopLayout::default()
+            },
+            ..AppConfig::default()
+        };
+        store
+            .save_config(&config)
+            .expect("persist organized marker");
+        drop(store);
+
+        let reopened = AppStore::for_test(data, organizer, launchers);
+        let mut reloaded = reopened.load_config_strict().expect("reload config");
+        repair_category_item_paths(&reopened, &mut reloaded).expect("repair reopened snapshot");
+
+        assert_eq!(reloaded.desktop_categories[0].item_paths, vec![marker]);
+        assert_eq!(reloaded.desktop_layout.split_category_indices, vec![0]);
+        assert_eq!(
+            fs::read(&organized_item).expect("organized item remains stored"),
+            b"important data"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn snapshot_repair_rebuilds_missing_marker_from_organizer_contents() {
+        let root = unique_test_dir("dustdesk-organized-marker-recovery");
+        let data = root.join("data");
+        let organizer = root.join("organizer");
+        let launchers = root.join("launchers");
+        let category_dir = organizer.join("documents");
+        fs::create_dir_all(&category_dir).expect("create category directory");
+        let organized_item = category_dir.join("recovered.txt");
+        fs::write(&organized_item, b"recover me").expect("write unmarked organized item");
+
+        let store = AppStore::for_test(data, organizer, launchers);
+        let mut config = AppConfig {
+            desktop_categories: vec![DeskCategory {
+                name: "documents".to_owned(),
+                ..DeskCategory::default()
+            }],
+            ..AppConfig::default()
+        };
+        store
+            .save_config(&config)
+            .expect("persist config without marker");
+
+        repair_category_item_paths(&store, &mut config).expect("recover missing marker");
+        let recovered_marker = organized_item.display().to_string();
+        assert_eq!(
+            config.desktop_categories[0].item_paths,
+            vec![recovered_marker.clone()]
+        );
+        assert_eq!(
+            store
+                .load_config_strict()
+                .expect("reload repaired config")
+                .desktop_categories[0]
+                .item_paths,
+            vec![recovered_marker]
+        );
+        assert_eq!(
+            fs::read(&organized_item).expect("organized item remains stored"),
+            b"recover me"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn snapshot_repair_recovers_unknown_physical_category_after_marker_loss() {
+        let root = unique_test_dir("dustdesk-organized-category-recovery");
+        let data = root.join("data");
+        let organizer = root.join("organizer");
+        let launchers = root.join("launchers");
+        let category_dir = organizer.join("Recovered Custom");
+        fs::create_dir_all(&category_dir).expect("create recovered category");
+        let organized_item = category_dir.join("important.txt");
+        fs::write(&organized_item, b"recover custom category").expect("write organized item");
+
+        let store = AppStore::for_test(data, organizer, launchers);
+        let mut config = AppConfig {
+            desktop_categories: Vec::new(),
+            ..AppConfig::default()
+        };
+
+        repair_category_item_paths(&store, &mut config).expect("recover physical category");
+
+        assert_eq!(config.desktop_categories.len(), 1);
+        assert_eq!(config.desktop_categories[0].name, "Recovered Custom");
+        assert_eq!(
+            config.desktop_categories[0].item_paths,
+            vec![organized_item.display().to_string()]
+        );
+        let persisted = store.load_config_strict().expect("reload recovered marker");
+        assert_eq!(persisted.desktop_categories[0].name, "Recovered Custom");
+        assert!(
+            organized_item.exists(),
+            "recovery must not move stored data"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn snapshot_repair_does_not_duplicate_a_renamed_category_directory() {
+        let root = unique_test_dir("dustdesk-renamed-category-recovery");
+        let data = root.join("data");
+        let organizer = root.join("organizer");
+        let launchers = root.join("launchers");
+        let original_category_dir = organizer.join("Original Name");
+        fs::create_dir_all(&original_category_dir).expect("create original category");
+        let organized_item = original_category_dir.join("important.txt");
+        let unmarked_item = original_category_dir.join("also-important.txt");
+        fs::write(&organized_item, b"renamed category data").expect("write organized item");
+        fs::write(&unmarked_item, b"unmarked renamed data").expect("write unmarked item");
+
+        let store = AppStore::for_test(data, organizer, launchers);
+        let mut config = AppConfig {
+            desktop_categories: vec![DeskCategory {
+                name: "Renamed Category".to_owned(),
+                item_paths: vec![organized_item.display().to_string()],
+                ..DeskCategory::default()
+            }],
+            ..AppConfig::default()
+        };
+
+        repair_category_item_paths(&store, &mut config).expect("repair renamed category");
+
+        assert_eq!(config.desktop_categories.len(), 1);
+        assert_eq!(config.desktop_categories[0].name, "Renamed Category");
+        assert_eq!(config.desktop_categories[0].item_paths.len(), 2);
+        assert!(config.desktop_categories[0]
+            .item_paths
+            .iter()
+            .any(|path| same_path_text(path, &organized_item.display().to_string())));
+        assert!(config.desktop_categories[0]
+            .item_paths
+            .iter()
+            .any(|path| same_path_text(path, &unmarked_item.display().to_string())));
+        assert!(organized_item.exists());
+        assert!(unmarked_item.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn exit_restore_persists_complete_marker_and_unique_desktop_plans() {
+        let root = unique_test_dir("dustdesk-exit-restart-marker");
+        let (store, organizer, desktop) = lifecycle_test_store(&root);
+        let documents = organizer.join("documents");
+        let media = organizer.join("media");
+        fs::create_dir_all(&documents).expect("create documents category");
+        fs::create_dir_all(&media).expect("create media category");
+        let document_source = documents.join("report.txt");
+        let media_source = media.join("report.txt");
+        let existing_desktop = desktop.join("report.txt");
+        for path in [&document_source, &media_source, &existing_desktop] {
+            fs::write(path, b"identical bytes").expect("write collision fixture");
+        }
+        store
+            .save_config(&AppConfig {
+                desktop_categories: vec![
+                    DeskCategory {
+                        name: "documents".to_owned(),
+                        item_paths: vec![document_source.display().to_string()],
+                        ..DeskCategory::default()
+                    },
+                    DeskCategory {
+                        name: "media".to_owned(),
+                        item_paths: vec![media_source.display().to_string()],
+                        ..DeskCategory::default()
+                    },
+                ],
+                ..AppConfig::default()
+            })
+            .expect("save organized config");
+        let persistence = MemoryRestartPersistence::default();
+
+        let restored = restore_desktop_organization_for_exit_core(&store, &desktop, &persistence)
+            .expect("restore organized items for exit");
+
+        assert_eq!(restored, 2);
+        assert_eq!(
+            fs::read(&existing_desktop).expect("read original"),
+            b"identical bytes"
+        );
+        let marker = persistence.current().expect("restart marker remains");
+        assert_eq!(marker.categories.len(), 2);
+        assert_eq!(marker.categories[0].category_index, Some(0));
+        assert_eq!(marker.categories[1].category_index, Some(1));
+        let planned_paths = marker
+            .categories
+            .iter()
+            .flat_map(|category| &category.items)
+            .map(|item| PathBuf::from(item.desktop_path.as_ref().expect("planned desktop path")))
+            .collect::<Vec<_>>();
+        assert_eq!(planned_paths.len(), 2);
+        assert_ne!(planned_paths[0], planned_paths[1]);
+        assert!(planned_paths.iter().all(|path| path.exists()));
+        assert!(planned_paths.iter().all(|path| path != &existing_desktop));
+        assert!(!document_source.exists());
+        assert!(!media_source.exists());
+
+        let saves = persistence.saves.borrow();
+        assert!(saves.len() >= 3, "complete marker plus one plan per item");
+        assert!(saves[0]
+            .categories
+            .iter()
+            .flat_map(|category| &category.items)
+            .all(|item| item.desktop_path.is_none()));
+        assert!(persistence.source_states_at_save.borrow()[0]
+            .iter()
+            .all(|exists| *exists));
+        let persisted = store.load_config_strict().expect("reload exit config");
+        assert!(persisted
+            .desktop_categories
+            .iter()
+            .all(|category| category.item_paths.is_empty()));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn exit_never_moves_an_item_before_its_marker_plan_is_durable() {
+        for failed_save in 1..=3 {
+            let root = unique_test_dir(&format!("dustdesk-marker-save-failure-{failed_save}"));
+            let (store, organizer, desktop) = lifecycle_test_store(&root);
+            let category_dir = organizer.join("documents");
+            fs::create_dir_all(&category_dir).expect("create category");
+            let first_source = category_dir.join("first.txt");
+            let second_source = category_dir.join("second.txt");
+            fs::write(&first_source, b"first").expect("write first source");
+            fs::write(&second_source, b"second").expect("write second source");
+            store
+                .save_config(&AppConfig {
+                    desktop_categories: vec![DeskCategory {
+                        name: "documents".to_owned(),
+                        item_paths: vec![
+                            first_source.display().to_string(),
+                            second_source.display().to_string(),
+                        ],
+                        ..DeskCategory::default()
+                    }],
+                    ..AppConfig::default()
+                })
+                .expect("save config");
+            let persistence = MemoryRestartPersistence::failing_on_save(failed_save);
+
+            let error = restore_desktop_organization_for_exit_core(&store, &desktop, &persistence)
+                .expect_err("inject marker persistence failure");
+
+            assert!(error.contains("injected marker save failure"));
+            if failed_save <= 2 {
+                assert!(first_source.exists());
+                assert!(!desktop.join("first.txt").exists());
+            } else {
+                assert!(!first_source.exists());
+                assert!(desktop.join("first.txt").exists());
+            }
+            assert!(
+                second_source.exists(),
+                "failed plan must precede second move"
+            );
+            assert!(!desktop.join("second.txt").exists());
+            assert_eq!(
+                first_source.exists() as usize + desktop.join("first.txt").exists() as usize,
+                1
+            );
+            assert_eq!(
+                second_source.exists() as usize + desktop.join("second.txt").exists() as usize,
+                1
+            );
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn restart_round_trip_recollects_only_marked_item_and_removes_marker() {
+        let root = unique_test_dir("dustdesk-restart-round-trip");
+        let (store, organizer, desktop) = lifecycle_test_store(&root);
+        let category_dir = organizer.join("documents");
+        fs::create_dir_all(&category_dir).expect("create category");
+        let source = category_dir.join("report.txt");
+        let unmarked_desktop_item = desktop.join("report.txt");
+        fs::write(&source, b"organized copy").expect("write organized source");
+        fs::write(&unmarked_desktop_item, b"keep desktop copy").expect("write desktop collision");
+        store
+            .save_config(&AppConfig {
+                desktop_categories: vec![DeskCategory {
+                    name: "documents".to_owned(),
+                    item_paths: vec![source.display().to_string()],
+                    ..DeskCategory::default()
+                }],
+                ..AppConfig::default()
+            })
+            .expect("save config");
+        let persistence = MemoryRestartPersistence::default();
+        restore_desktop_organization_for_exit_core(&store, &desktop, &persistence)
+            .expect("exit restore");
+        let planned = PathBuf::from(
+            persistence.current().expect("marker").categories[0].items[0]
+                .desktop_path
+                .clone()
+                .expect("planned path"),
+        );
+        assert!(planned.exists());
+
+        let recollected =
+            run_startup_recollect(&store, &desktop, &persistence).expect("startup recollect");
+
+        assert_eq!(recollected, 1);
+        assert!(source.exists());
+        assert!(!planned.exists());
+        assert_eq!(
+            fs::read(&source).expect("read recollected"),
+            b"organized copy"
+        );
+        assert_eq!(
+            fs::read(&unmarked_desktop_item).expect("read unmarked desktop item"),
+            b"keep desktop copy"
+        );
+        assert!(persistence.current().is_none());
+        assert_eq!(persistence.remove_calls.get(), 1);
+        let config = store
+            .load_config_strict()
+            .expect("reload recollected config");
+        assert_eq!(config.desktop_categories[0].item_paths.len(), 1);
+        assert!(same_path_text(
+            &config.desktop_categories[0].item_paths[0],
+            &source.display().to_string()
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_without_restart_marker_never_recollects_desktop_reference() {
+        let root = unique_test_dir("dustdesk-no-restart-marker");
+        let (store, organizer, desktop) = lifecycle_test_store(&root);
+        let desktop_item = desktop.join("manual.txt");
+        fs::write(&desktop_item, b"manual desktop item").expect("write desktop item");
+        store
+            .save_config(&AppConfig {
+                desktop_categories: vec![DeskCategory {
+                    name: "documents".to_owned(),
+                    item_paths: vec![desktop_item.display().to_string()],
+                    ..DeskCategory::default()
+                }],
+                ..AppConfig::default()
+            })
+            .expect("save stale desktop reference");
+        let persistence = MemoryRestartPersistence::default();
+
+        assert_eq!(
+            run_startup_recollect(&store, &desktop, &persistence).expect("startup without marker"),
+            0
+        );
+        assert!(desktop_item.exists());
+        assert!(organizer_contents(&organizer).is_empty());
+        assert!(store
+            .load_config_strict()
+            .expect("reload config")
+            .desktop_categories[0]
+            .item_paths
+            .is_empty());
+        assert_eq!(persistence.remove_calls.get(), 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_retains_only_failed_marker_items_and_exit_merges_them() {
+        let root = unique_test_dir("dustdesk-recollect-partial-failure");
+        let (store, organizer, desktop) = lifecycle_test_store(&root);
+        let ok_source = organizer.join("ok").join("ok.txt");
+        let blocked_source = organizer.join("blocked").join("bad.txt");
+        let ok_desktop = desktop.join("ok.txt");
+        let blocked_desktop = desktop.join("bad.txt");
+        fs::write(&ok_desktop, b"ok").expect("write successful desktop item");
+        fs::write(&blocked_desktop, b"blocked").expect("write blocked desktop item");
+        fs::write(organizer.join("blocked"), b"parent is a file")
+            .expect("block target category directory");
+        store
+            .save_config(&AppConfig {
+                desktop_categories: vec![
+                    DeskCategory {
+                        name: "ok".to_owned(),
+                        ..DeskCategory::default()
+                    },
+                    DeskCategory {
+                        name: "blocked".to_owned(),
+                        ..DeskCategory::default()
+                    },
+                ],
+                ..AppConfig::default()
+            })
+            .expect("save config");
+        let persistence = MemoryRestartPersistence::with_marker(DesktopOrganizationRestartMarker {
+            schema_version: DESKTOP_ORGANIZATION_RESTART_SCHEMA_VERSION,
+            categories: vec![
+                RestartCategoryMarker {
+                    category_name: "ok".to_owned(),
+                    category_index: Some(0),
+                    items: vec![RestartItemMarker {
+                        source_path: ok_source.display().to_string(),
+                        desktop_path: Some(ok_desktop.display().to_string()),
+                    }],
+                },
+                RestartCategoryMarker {
+                    category_name: "blocked".to_owned(),
+                    category_index: Some(1),
+                    items: vec![RestartItemMarker {
+                        source_path: blocked_source.display().to_string(),
+                        desktop_path: Some(blocked_desktop.display().to_string()),
+                    }],
+                },
+            ],
+        });
+
+        assert_eq!(
+            run_startup_recollect(&store, &desktop, &persistence)
+                .expect("partial startup recollect"),
+            1
+        );
+        assert!(ok_source.exists());
+        assert!(!ok_desktop.exists());
+        assert!(blocked_desktop.exists());
+        let failed_marker = persistence.current().expect("failed marker retained");
+        assert_eq!(failed_marker.categories.len(), 1);
+        assert_eq!(failed_marker.categories[0].category_name, "blocked");
+        assert_eq!(failed_marker.categories[0].items.len(), 1);
+
+        let current_dir = organizer.join("current");
+        fs::create_dir_all(&current_dir).expect("create current category");
+        let current_source = current_dir.join("current.txt");
+        fs::write(&current_source, b"current organized item").expect("write current source");
+        let mut config = store.load_config_strict().expect("load partial config");
+        config.desktop_categories.push(DeskCategory {
+            name: "current".to_owned(),
+            item_paths: vec![current_source.display().to_string()],
+            ..DeskCategory::default()
+        });
+        store.save_config(&config).expect("save current config");
+
+        assert_eq!(
+            restore_desktop_organization_for_exit_core(&store, &desktop, &persistence)
+                .expect("merge failed marker on exit"),
+            2
+        );
+        let merged = persistence.current().expect("merged marker");
+        assert!(merged.categories.iter().any(|category| {
+            category.category_name == "blocked"
+                && category.items.iter().any(|item| {
+                    same_path_text(&item.source_path, &blocked_source.display().to_string())
+                })
+        }));
+        assert!(merged.categories.iter().any(|category| {
+            category.category_name == "current"
+                && category.items.iter().any(|item| {
+                    same_path_text(&item.source_path, &current_source.display().to_string())
+                })
+        }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_is_idempotent_across_restart_crash_boundaries() {
+        for state in 0..3 {
+            let root = unique_test_dir(&format!("dustdesk-restart-crash-{state}"));
+            let (store, organizer, desktop) = lifecycle_test_store(&root);
+            let source = organizer.join("documents").join("item.txt");
+            let desktop_path = desktop.join("item.txt");
+            fs::create_dir_all(source.parent().expect("source parent"))
+                .expect("create source parent");
+            if state != 1 {
+                fs::write(&source, b"crash-safe data").expect("write organizer source");
+            } else {
+                fs::write(&desktop_path, b"crash-safe data").expect("write moved desktop item");
+            }
+            let config_paths = if state == 2 {
+                Vec::new()
+            } else {
+                vec![source.display().to_string()]
+            };
+            store
+                .save_config(&AppConfig {
+                    desktop_categories: vec![DeskCategory {
+                        name: "documents".to_owned(),
+                        item_paths: config_paths,
+                        ..DeskCategory::default()
+                    }],
+                    ..AppConfig::default()
+                })
+                .expect("save crash state config");
+            let persistence =
+                MemoryRestartPersistence::with_marker(DesktopOrganizationRestartMarker {
+                    schema_version: DESKTOP_ORGANIZATION_RESTART_SCHEMA_VERSION,
+                    categories: vec![RestartCategoryMarker {
+                        category_name: "documents".to_owned(),
+                        category_index: Some(0),
+                        items: vec![RestartItemMarker {
+                            source_path: source.display().to_string(),
+                            desktop_path: (state != 0).then(|| desktop_path.display().to_string()),
+                        }],
+                    }],
+                });
+
+            run_startup_recollect(&store, &desktop, &persistence).expect("recover crash boundary");
+            run_startup_recollect(&store, &desktop, &persistence)
+                .expect("repeat recovery idempotently");
+
+            assert!(source.exists(), "state {state} source should be organized");
+            assert!(
+                !desktop_path.exists(),
+                "state {state} desktop should be clean"
+            );
+            assert_eq!(
+                fs::read(&source).expect("read recovered data"),
+                b"crash-safe data"
+            );
+            assert!(persistence.current().is_none());
+            let config = store.load_config_strict().expect("reload crash config");
+            assert_eq!(config.desktop_categories[0].item_paths.len(), 1);
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn startup_preserves_marker_when_source_and_desktop_both_exist() {
+        let root = unique_test_dir("dustdesk-restart-ambiguous-copies");
+        let (store, organizer, desktop) = lifecycle_test_store(&root);
+        let source = organizer.join("documents").join("item.txt");
+        let desktop_path = desktop.join("item.txt");
+        fs::create_dir_all(source.parent().expect("source parent")).expect("create category");
+        fs::write(&source, b"organizer copy").expect("write organizer copy");
+        fs::write(&desktop_path, b"desktop copy").expect("write desktop copy");
+        store
+            .save_config(&AppConfig {
+                desktop_categories: vec![DeskCategory {
+                    name: "documents".to_owned(),
+                    item_paths: vec![source.display().to_string()],
+                    ..DeskCategory::default()
+                }],
+                ..AppConfig::default()
+            })
+            .expect("save ambiguous config");
+        let persistence = MemoryRestartPersistence::with_marker(DesktopOrganizationRestartMarker {
+            schema_version: DESKTOP_ORGANIZATION_RESTART_SCHEMA_VERSION,
+            categories: vec![RestartCategoryMarker {
+                category_name: "documents".to_owned(),
+                category_index: Some(0),
+                items: vec![RestartItemMarker {
+                    source_path: source.display().to_string(),
+                    desktop_path: Some(desktop_path.display().to_string()),
+                }],
+            }],
+        });
+
+        assert_eq!(
+            run_startup_recollect(&store, &desktop, &persistence)
+                .expect("preserve ambiguous state"),
+            0
+        );
+        assert_eq!(fs::read(&source).expect("read source"), b"organizer copy");
+        assert_eq!(
+            fs::read(&desktop_path).expect("read desktop"),
+            b"desktop copy"
+        );
+        assert!(persistence.current().is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_keeps_duplicate_named_categories_distinct_when_indices_drift() {
+        let root = unique_test_dir("dustdesk-duplicate-category-marker");
+        let (store, organizer, desktop) = lifecycle_test_store(&root);
+        let first_source = organizer.join("first-physical").join("first.txt");
+        let second_source = organizer.join("second-physical").join("second.txt");
+        let first_desktop = desktop.join("first.txt");
+        let second_desktop = desktop.join("second.txt");
+        fs::write(&first_desktop, b"first").expect("write first desktop item");
+        fs::write(&second_desktop, b"second").expect("write second desktop item");
+        store
+            .save_config(&AppConfig {
+                desktop_categories: vec![
+                    DeskCategory {
+                        name: "same".to_owned(),
+                        ..DeskCategory::default()
+                    },
+                    DeskCategory {
+                        name: "same".to_owned(),
+                        ..DeskCategory::default()
+                    },
+                ],
+                ..AppConfig::default()
+            })
+            .expect("save duplicate categories");
+        let persistence = MemoryRestartPersistence::with_marker(DesktopOrganizationRestartMarker {
+            schema_version: DESKTOP_ORGANIZATION_RESTART_SCHEMA_VERSION,
+            categories: vec![
+                RestartCategoryMarker {
+                    category_name: "same".to_owned(),
+                    category_index: Some(10),
+                    items: vec![RestartItemMarker {
+                        source_path: first_source.display().to_string(),
+                        desktop_path: Some(first_desktop.display().to_string()),
+                    }],
+                },
+                RestartCategoryMarker {
+                    category_name: "same".to_owned(),
+                    category_index: Some(11),
+                    items: vec![RestartItemMarker {
+                        source_path: second_source.display().to_string(),
+                        desktop_path: Some(second_desktop.display().to_string()),
+                    }],
+                },
+            ],
+        });
+
+        assert_eq!(
+            run_startup_recollect(&store, &desktop, &persistence)
+                .expect("recollect duplicate categories"),
+            2
+        );
+        let config = store
+            .load_config_strict()
+            .expect("reload duplicate categories");
+        assert_eq!(config.desktop_categories[0].item_paths.len(), 1);
+        assert_eq!(config.desktop_categories[1].item_paths.len(), 1);
+        assert!(same_path_text(
+            &config.desktop_categories[0].item_paths[0],
+            &first_source.display().to_string()
+        ));
+        assert!(same_path_text(
+            &config.desktop_categories[1].item_paths[0],
+            &second_source.display().to_string()
+        ));
+        assert!(persistence.current().is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn exit_rehomes_source_marker_to_its_current_category() {
+        let root = unique_test_dir("dustdesk-rehome-restart-marker");
+        let (store, organizer, desktop) = lifecycle_test_store(&root);
+        let source = organizer.join("physical").join("item.txt");
+        fs::create_dir_all(source.parent().expect("source parent")).expect("create source parent");
+        fs::write(&source, b"reassigned item").expect("write source");
+        store
+            .save_config(&AppConfig {
+                desktop_categories: vec![DeskCategory {
+                    name: "current category".to_owned(),
+                    item_paths: vec![source.display().to_string()],
+                    ..DeskCategory::default()
+                }],
+                ..AppConfig::default()
+            })
+            .expect("save reassigned config");
+        let persistence = MemoryRestartPersistence::with_marker(DesktopOrganizationRestartMarker {
+            schema_version: DESKTOP_ORGANIZATION_RESTART_SCHEMA_VERSION,
+            categories: vec![RestartCategoryMarker {
+                category_name: "stale category".to_owned(),
+                category_index: Some(9),
+                items: vec![RestartItemMarker {
+                    source_path: source.display().to_string(),
+                    desktop_path: None,
+                }],
+            }],
+        });
+
+        assert_eq!(
+            restore_desktop_organization_for_exit_core(&store, &desktop, &persistence)
+                .expect("restore reassigned item"),
+            1
+        );
+        let marker = persistence.current().expect("reassigned marker");
+        assert_eq!(marker.categories.len(), 1);
+        assert_eq!(marker.categories[0].category_name, "current category");
+        assert_eq!(marker.categories[0].category_index, Some(0));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_restore_intent_clears_restart_marker() {
+        let persistence = MemoryRestartPersistence::with_marker(DesktopOrganizationRestartMarker {
+            schema_version: DESKTOP_ORGANIZATION_RESTART_SCHEMA_VERSION,
+            categories: vec![RestartCategoryMarker {
+                category_name: "documents".to_owned(),
+                category_index: Some(0),
+                items: vec![RestartItemMarker {
+                    source_path: r"C:\DesktopOrganizer\documents\item.txt".to_owned(),
+                    desktop_path: Some(r"C:\Users\User\Desktop\item.txt".to_owned()),
+                }],
+            }],
+        });
+
+        clear_desktop_organization_restart_marker(&persistence)
+            .expect("clear marker before explicit restore");
+
+        assert!(persistence.current().is_none());
+        assert_eq!(persistence.remove_calls.get(), 1);
+        assert_eq!(persistence.saves.borrow().len(), 1);
+        assert!(persistence.saves.borrow()[0].is_empty());
     }
 
     #[test]
@@ -6285,7 +8134,13 @@ mod tests {
         fs::remove_file(quarantine.payload.join("first.txt"))
             .expect("simulate interrupted source cleanup");
         let journal_path = quarantine.journal_path.clone();
+        let remaining_payload = quarantine.payload.clone();
         drop(quarantine);
+
+        recover_transfer_quarantine_journal_with_mode(&journal_path, true)
+            .expect("defer committed cleanup during startup");
+        assert!(journal_path.exists());
+        assert!(remaining_payload.join("second.txt").exists());
 
         recover_transfer_quarantine_journal(&journal_path).expect("finish committed cleanup");
 
@@ -6299,6 +8154,74 @@ mod tests {
             b"second"
         );
         assert!(!journal_path.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn committed_exit_journal_is_cleaned_before_marker_recollection() {
+        let root = unique_test_dir("dustdesk-committed-marker-recollect");
+        let (store, organizer, desktop) = lifecycle_test_store(&root);
+        let source = organizer.join("documents").join("folder");
+        let destination = desktop.join("folder");
+        fs::create_dir_all(&source).expect("create organized directory");
+        fs::write(source.join("important.txt"), b"journal protected data")
+            .expect("write organized data");
+        store
+            .save_config(&AppConfig {
+                desktop_categories: vec![DeskCategory {
+                    name: "documents".to_owned(),
+                    item_paths: vec![source.display().to_string()],
+                    ..DeskCategory::default()
+                }],
+                ..AppConfig::default()
+            })
+            .expect("save organized config");
+
+        let quarantine = QuarantinedTransferSource::reserve(&source, &destination)
+            .expect("reserve exit quarantine");
+        fs::create_dir_all(&destination).expect("create committed desktop destination");
+        copy_dir_recursive(&quarantine.payload, &destination).expect("copy committed destination");
+        quarantine
+            .mark_committed()
+            .expect("persist committed marker");
+        let journal_path = quarantine.journal_path.clone();
+        drop(quarantine);
+        assert!(transfer_quarantine_journal_matches_paths(
+            &journal_path,
+            &[source.clone(), destination.clone()]
+        )
+        .expect("match lifecycle paths"));
+        recover_transfer_quarantine_journal_with_mode(&journal_path, true)
+            .expect("defer committed cleanup");
+        assert!(journal_path.exists());
+
+        recover_transfer_quarantine_journal(&journal_path)
+            .expect("finish related cleanup before recollect");
+        assert!(!journal_path.exists());
+        assert!(destination.exists());
+        let persistence = MemoryRestartPersistence::with_marker(DesktopOrganizationRestartMarker {
+            schema_version: DESKTOP_ORGANIZATION_RESTART_SCHEMA_VERSION,
+            categories: vec![RestartCategoryMarker {
+                category_name: "documents".to_owned(),
+                category_index: Some(0),
+                items: vec![RestartItemMarker {
+                    source_path: source.display().to_string(),
+                    desktop_path: Some(destination.display().to_string()),
+                }],
+            }],
+        });
+
+        assert_eq!(
+            run_startup_recollect(&store, &desktop, &persistence)
+                .expect("recollect after committed cleanup"),
+            1
+        );
+        assert_eq!(
+            fs::read(source.join("important.txt")).expect("read recollected data"),
+            b"journal protected data"
+        );
+        assert!(!destination.exists());
+        assert!(persistence.current().is_none());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -6648,6 +8571,89 @@ mod tests {
             1
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[derive(Default)]
+    struct MemoryRestartPersistence {
+        marker: RefCell<Option<DesktopOrganizationRestartMarker>>,
+        saves: RefCell<Vec<DesktopOrganizationRestartMarker>>,
+        source_states_at_save: RefCell<Vec<Vec<bool>>>,
+        save_calls: Cell<usize>,
+        fail_on_save: Cell<Option<usize>>,
+        remove_calls: Cell<usize>,
+    }
+
+    impl MemoryRestartPersistence {
+        fn with_marker(marker: DesktopOrganizationRestartMarker) -> Self {
+            Self {
+                marker: RefCell::new(Some(marker)),
+                ..Self::default()
+            }
+        }
+
+        fn current(&self) -> Option<DesktopOrganizationRestartMarker> {
+            self.marker.borrow().clone()
+        }
+
+        fn failing_on_save(save_number: usize) -> Self {
+            let persistence = Self::default();
+            persistence.fail_on_save.set(Some(save_number));
+            persistence
+        }
+    }
+
+    impl DesktopOrganizationRestartPersistence for MemoryRestartPersistence {
+        fn load(&self) -> Result<Option<DesktopOrganizationRestartMarker>, String> {
+            Ok(self.current())
+        }
+
+        fn save(&self, marker: &DesktopOrganizationRestartMarker) -> Result<(), String> {
+            let save_number = self.save_calls.get() + 1;
+            self.save_calls.set(save_number);
+            if self.fail_on_save.get() == Some(save_number) {
+                return Err(format!("injected marker save failure {save_number}"));
+            }
+            let source_states = marker
+                .categories
+                .iter()
+                .flat_map(|category| &category.items)
+                .map(|item| Path::new(&item.source_path).exists())
+                .collect();
+            self.source_states_at_save.borrow_mut().push(source_states);
+            self.saves.borrow_mut().push(marker.clone());
+            self.marker.replace(Some(marker.clone()));
+            Ok(())
+        }
+
+        fn remove(&self) -> Result<(), String> {
+            self.remove_calls.set(self.remove_calls.get() + 1);
+            self.marker.replace(None);
+            Ok(())
+        }
+    }
+
+    fn lifecycle_test_store(root: &Path) -> (AppStore, PathBuf, PathBuf) {
+        let data = root.join("data");
+        let organizer = root.join("organizer");
+        let launchers = root.join("launchers");
+        let desktop = root.join("desktop");
+        for path in [&data, &organizer, &launchers, &desktop] {
+            fs::create_dir_all(path).expect("create lifecycle test directory");
+        }
+        (
+            AppStore::for_test(data, organizer.clone(), launchers),
+            organizer,
+            desktop,
+        )
+    }
+
+    fn run_startup_recollect(
+        store: &AppStore,
+        desktop: &Path,
+        persistence: &MemoryRestartPersistence,
+    ) -> Result<usize, String> {
+        let marker = persistence.load()?;
+        recollect_desktop_organization_from_restart_marker_core(store, desktop, marker, persistence)
     }
 
     #[cfg(windows)]
@@ -7088,6 +9094,26 @@ fn is_shortcut_modifier(token: &str) -> bool {
     matches!(token, "Ctrl" | "Alt" | "Shift" | "Super")
 }
 
+fn with_lazy_window_operation<T>(
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let _guard = LAZY_WINDOW_OPERATION_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "窗口操作锁已损坏".to_owned())?;
+    operation()
+}
+
+fn with_webview_window_creation<T>(
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let _guard = WEBVIEW_WINDOW_CREATION_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "WebView 创建锁已损坏".to_owned())?;
+    operation()
+}
+
 fn is_clipboard_overlay_visible(app: &tauri::AppHandle) -> bool {
     app.get_webview_window("clipboard")
         .and_then(|window| window.is_visible().ok())
@@ -7142,38 +9168,36 @@ fn configured_settings() -> AppSettings {
         .unwrap_or_default()
 }
 
-fn sync_launch_on_startup_setting() {
-    let Ok(store) = AppStore::open() else {
-        return;
-    };
-    let config = store.load_config();
-    if let Err(error) = set_launch_on_startup_entry(config.settings.launch_on_startup) {
+fn sync_launch_on_startup_setting(enabled: bool) {
+    if let Err(error) = set_launch_on_startup_entry(enabled) {
         eprintln!("failed to sync launch on startup entry: {error}");
     }
+}
+
+fn initialize_runtime_services(app: &tauri::AppHandle) {
+    clipboard_bridge::spawn_text_history_monitor();
+    let settings = configured_settings();
+    let clipboard_shortcut = settings.clipboard_shortcut_value();
+    if let Err(error) = app.global_shortcut().register(clipboard_shortcut.as_str()) {
+        eprintln!("failed to register {clipboard_shortcut} shortcut: {error}");
+    }
+
+    if settings.search_enabled {
+        let search_shortcut = settings.search_shortcut_value();
+        if search_shortcut != clipboard_shortcut {
+            if let Err(error) = app.global_shortcut().register(search_shortcut.as_str()) {
+                eprintln!("failed to register {search_shortcut} shortcut: {error}");
+            }
+        }
+    }
+
+    let launch_on_startup = settings.launch_on_startup;
+    tauri::async_runtime::spawn_blocking(move || sync_launch_on_startup_setting(launch_on_startup));
 }
 
 fn is_startup_launch_invocation() -> bool {
     env::args().any(|arg| arg == "--startup")
 }
-
-#[cfg(windows)]
-fn raise_startup_process_priority_if_needed(settings: &AppSettings) {
-    if !settings.launch_on_startup || !is_startup_launch_invocation() {
-        return;
-    }
-
-    use windows_sys::Win32::System::Threading::{
-        GetCurrentProcess, SetPriorityClass, HIGH_PRIORITY_CLASS,
-    };
-
-    let ok = unsafe { SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS) != 0 };
-    if !ok {
-        eprintln!("failed to raise startup process priority");
-    }
-}
-
-#[cfg(not(windows))]
-fn raise_startup_process_priority_if_needed(_settings: &AppSettings) {}
 
 fn shortcut_matches(shortcut: &Shortcut, configured: &str) -> bool {
     configured
@@ -7182,22 +9206,108 @@ fn shortcut_matches(shortcut: &Shortcut, configured: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn show_clipboard_overlay(app: &tauri::AppHandle) {
-    if let Some(window) = app.get_webview_window("clipboard") {
-        let _ = place_clipboard_overlay(&window);
-        let _ = window.show();
-        let _ = window.set_focus();
-        let _ = window.emit("dustdesk://clipboard-shortcut", ());
-    }
+fn create_main_window(app: &tauri::AppHandle) -> Result<WebviewWindow, String> {
+    with_webview_window_creation(|| {
+        WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+            .title("DeskNest")
+            .inner_size(1320.0, 820.0)
+            .min_inner_size(1080.0, 680.0)
+            .resizable(true)
+            .center()
+            .decorations(false)
+            .transparent(false)
+            .visible(true)
+            .build()
+            .map_err(to_message)
+    })
 }
 
-fn show_search_overlay(app: &tauri::AppHandle) {
-    if let Some(window) = app.get_webview_window("search") {
-        let _ = place_search_overlay(&window);
-        let _ = window.show();
-        let _ = window.set_focus();
-        let _ = window.emit("dustdesk://search-shortcut", ());
-    }
+fn create_clipboard_overlay(app: &tauri::AppHandle) -> Result<WebviewWindow, String> {
+    with_webview_window_creation(|| {
+        WebviewWindowBuilder::new(
+            app,
+            "clipboard",
+            WebviewUrl::App("index.html#/clipboard-overlay".into()),
+        )
+        .title("DeskNest Clipboard")
+        .inner_size(1600.0, 300.0)
+        .position(-32_000.0, -32_000.0)
+        .resizable(false)
+        .decorations(false)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .focused(false)
+        .transparent(false)
+        .visible(true)
+        .build()
+        .map_err(to_message)
+    })
+}
+
+fn create_search_overlay(app: &tauri::AppHandle) -> Result<WebviewWindow, String> {
+    with_webview_window_creation(|| {
+        WebviewWindowBuilder::new(
+            app,
+            "search",
+            WebviewUrl::App("index.html#/search-overlay".into()),
+        )
+        .title("DeskNest Search")
+        .inner_size(860.0, 620.0)
+        .position(-32_000.0, -32_000.0)
+        .resizable(false)
+        .decorations(false)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .focused(false)
+        .transparent(false)
+        .visible(true)
+        .build()
+        .map_err(to_message)
+    })
+}
+
+fn show_clipboard_overlay_impl(app: &tauri::AppHandle) -> Result<(), String> {
+    let window = match app.get_webview_window("clipboard") {
+        Some(window) => window,
+        None => create_clipboard_overlay(app)?,
+    };
+    place_clipboard_overlay(&window).map_err(to_message)?;
+    window.show().map_err(to_message)?;
+    let _ = window.set_focus();
+    let _ = window.emit("dustdesk://clipboard-shortcut", ());
+    Ok(())
+}
+
+fn show_search_overlay_impl(app: &tauri::AppHandle) -> Result<(), String> {
+    let window = match app.get_webview_window("search") {
+        Some(window) => window,
+        None => create_search_overlay(app)?,
+    };
+    place_search_overlay(&window).map_err(to_message)?;
+    window.show().map_err(to_message)?;
+    let _ = window.set_focus();
+    let _ = window.emit("dustdesk://search-shortcut", ());
+    Ok(())
+}
+
+fn show_clipboard_overlay_async(app: tauri::AppHandle, sync_clipboard: bool) {
+    tauri::async_runtime::spawn_blocking(move || {
+        if sync_clipboard {
+            clipboard_bridge::sync_current_clipboard_once();
+        }
+        let result = with_lazy_window_operation(|| show_clipboard_overlay_impl(&app));
+        if let Err(error) = result {
+            eprintln!("failed to show clipboard overlay: {error}");
+        }
+    });
+}
+
+fn show_search_overlay_async(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Err(error) = with_lazy_window_operation(|| show_search_overlay_impl(&app)) {
+            eprintln!("failed to show search overlay: {error}");
+        }
+    });
 }
 
 fn hide_search_overlay_impl(app: &tauri::AppHandle) {
@@ -7227,6 +9337,7 @@ fn start_desktop_background_operation(
 
     let started_payload = DesktopOperationPayload {
         kind,
+        scope: "manual",
         status: "started",
         message: match kind {
             "classify" => "正在智能收纳桌面...".to_owned(),
@@ -7248,6 +9359,7 @@ fn start_desktop_background_operation(
             Ok(Ok(payload)) => payload,
             Ok(Err(error)) => DesktopOperationPayload {
                 kind,
+                scope: "manual",
                 status: "failed",
                 message: error,
                 moved: 0,
@@ -7259,6 +9371,7 @@ fn start_desktop_background_operation(
             },
             Err(_) => DesktopOperationPayload {
                 kind,
+                scope: "manual",
                 status: "failed",
                 message: "桌面整理任务异常中断，请刷新后重试".to_owned(),
                 moved: 0,
@@ -7301,6 +9414,52 @@ fn set_last_desktop_operation(payload: DesktopOperationPayload) {
 
 fn emit_desktop_operation(app: &tauri::AppHandle, payload: DesktopOperationPayload) {
     let _ = app.emit(DESKTOP_OPERATION_EVENT, payload);
+}
+
+fn publish_lifecycle_desktop_operation(
+    app: &tauri::AppHandle,
+    payload: DesktopOperationPayload,
+    running: bool,
+) {
+    DESKTOP_OPERATION_RUNNING.store(running, Ordering::SeqCst);
+    set_last_desktop_operation(payload.clone());
+    emit_desktop_operation(app, payload);
+}
+
+fn wait_for_desktop_operation_idle() {
+    let started_at = Instant::now();
+    while DESKTOP_OPERATION_RUNNING.load(Ordering::SeqCst) {
+        if started_at.elapsed() >= Duration::from_secs(120) {
+            eprintln!(
+                "desktop operation status remained busy for 120 seconds; continuing exit recovery"
+            );
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(40));
+    }
+}
+
+struct DesktopOperationRunningResetGuard;
+
+impl Drop for DesktopOperationRunningResetGuard {
+    fn drop(&mut self) {
+        DESKTOP_OPERATION_RUNNING.store(false, Ordering::SeqCst);
+    }
+}
+
+fn keep_loading_effect_visible(started_at: Instant, minimum: Duration) {
+    if let Some(remaining) = minimum.checked_sub(started_at.elapsed()) {
+        std::thread::sleep(remaining);
+    }
+}
+
+fn restart_recollect_progress_message(current: usize, total: usize, path: &Path) -> String {
+    let name = display_path_name(path);
+    if total > 0 {
+        format!("正在恢复收纳分类 {current}/{total}：{name}")
+    } else {
+        format!("正在恢复收纳分类：{name}")
+    }
 }
 
 fn place_clipboard_overlay(window: &WebviewWindow) -> tauri::Result<()> {
@@ -7445,6 +9604,44 @@ fn keep_desktop_window_behind_apps(window: &WebviewWindow) {
     let _ = window.set_skip_taskbar(true);
 }
 
+fn keep_desktop_windows_behind_apps(app: &tauri::AppHandle) {
+    for window in app.webview_windows().values() {
+        if is_desktop_card_window_label(window.label()) {
+            keep_desktop_window_behind_apps(window);
+        }
+    }
+}
+
+fn settle_desktop_windows_after_launch(app: &tauri::AppHandle) {
+    keep_desktop_windows_behind_apps(app);
+    DESKTOP_WINDOW_SETTLE_GENERATION.fetch_add(1, Ordering::SeqCst);
+    if DESKTOP_WINDOW_SETTLE_SCHEDULED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || 'reschedule: loop {
+        let generation = DESKTOP_WINDOW_SETTLE_GENERATION.load(Ordering::SeqCst);
+        let mut elapsed = 0;
+        for deadline in [150, 500, 1_500] {
+            std::thread::sleep(Duration::from_millis(deadline - elapsed));
+            if DESKTOP_WINDOW_SETTLE_GENERATION.load(Ordering::SeqCst) != generation {
+                continue 'reschedule;
+            }
+            keep_desktop_windows_behind_apps(&app);
+            elapsed = deadline;
+        }
+
+        DESKTOP_WINDOW_SETTLE_SCHEDULED.store(false, Ordering::SeqCst);
+        if DESKTOP_WINDOW_SETTLE_GENERATION.load(Ordering::SeqCst) == generation {
+            return;
+        }
+        if DESKTOP_WINDOW_SETTLE_SCHEDULED.swap(true, Ordering::SeqCst) {
+            return;
+        }
+    });
+}
+
 fn show_desktop_background_window(window: &WebviewWindow) -> Result<(), String> {
     keep_desktop_window_behind_apps(window);
     window.show().map_err(to_message)?;
@@ -7477,29 +9674,32 @@ fn create_desktop_card(
     let row = index / columns;
     let x = work_area.position.x as f64 + 28.0 + (width + gap) * column as f64;
     let y = work_area.position.y as f64 + 72.0 + (height + gap) * row as f64;
-    WebviewWindowBuilder::new(app, label, WebviewUrl::App(url.into()))
-        .title(title)
-        .inner_size(width, height)
-        .min_inner_size(240.0, 160.0)
-        .position(x, y)
-        .resizable(true)
-        .decorations(false)
-        .transparent(true)
-        .shadow(false)
-        .background_color(Color(0, 0, 0, 0))
-        .skip_taskbar(true)
-        .always_on_top(false)
-        .always_on_bottom(true)
-        .focused(false)
-        .visible(true)
-        .build()
-        .map_err(to_message)
-        .and_then(|window| {
-            if !apply_saved_desktop_window_layout(&window, label)? {
-                restore_desktop_card_size_if_collapsed(&window, label)?;
-            }
-            show_desktop_background_window(&window)
-        })
+    let window = with_webview_window_creation(|| {
+        if let Some(window) = app.get_webview_window(label) {
+            return Ok(window);
+        }
+        WebviewWindowBuilder::new(app, label, WebviewUrl::App(url.into()))
+            .title(title)
+            .inner_size(width, height)
+            .min_inner_size(240.0, 160.0)
+            .position(x, y)
+            .resizable(true)
+            .decorations(false)
+            .transparent(true)
+            .shadow(false)
+            .background_color(Color(0, 0, 0, 0))
+            .skip_taskbar(true)
+            .always_on_top(false)
+            .always_on_bottom(true)
+            .focused(false)
+            .visible(true)
+            .build()
+            .map_err(to_message)
+    })?;
+    if !apply_saved_desktop_window_layout(&window, label)? {
+        restore_desktop_card_size_if_collapsed(&window, label)?;
+    }
+    show_desktop_background_window(&window)
 }
 
 fn desktop_card_url(kind: &str, index: Option<usize>) -> String {
@@ -7648,18 +9848,20 @@ fn hide_main_window_impl(app: &tauri::AppHandle) -> Result<(), String> {
 }
 
 fn show_main_window_impl(app: &tauri::AppHandle) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window("main") {
-        window.show().map_err(to_message)?;
-        let _ = window.unminimize();
-        let _ = window.set_focus();
-        let _ = app.emit("dustdesk://main-window-shown", ());
-    }
+    let window = match app.get_webview_window("main") {
+        Some(window) => window,
+        None => create_main_window(app)?,
+    };
+    window.show().map_err(to_message)?;
+    let _ = window.unminimize();
+    let _ = window.set_focus();
+    let _ = app.emit("dustdesk://main-window-shown", ());
     Ok(())
 }
 
 fn hide_main_window_to_tray_async(app: tauri::AppHandle) {
     tauri::async_runtime::spawn_blocking(move || {
-        if let Err(error) = hide_main_window_impl(&app) {
+        if let Err(error) = with_lazy_window_operation(|| hide_main_window_impl(&app)) {
             eprintln!("failed to hide main window to tray: {error}");
         }
     });
@@ -7667,7 +9869,7 @@ fn hide_main_window_to_tray_async(app: tauri::AppHandle) {
 
 fn show_main_window_from_tray_async(app: tauri::AppHandle) {
     tauri::async_runtime::spawn_blocking(move || {
-        if let Err(error) = show_main_window_impl(&app) {
+        if let Err(error) = with_lazy_window_operation(|| show_main_window_impl(&app)) {
             eprintln!("failed to show main window from tray: {error}");
         }
     });
@@ -7679,10 +9881,16 @@ fn request_real_app_exit(app: tauri::AppHandle) {
     }
 
     tauri::async_runtime::spawn_blocking(move || {
-        emit_desktop_operation(
+        wait_for_desktop_operation_idle();
+        if let Err(error) = with_lazy_window_operation(|| show_persisted_desktop_layout(&app)) {
+            eprintln!("failed to show exit operation overlay: {error}");
+        }
+        let loading_started_at = Instant::now();
+        publish_lifecycle_desktop_operation(
             &app,
             DesktopOperationPayload {
                 kind: "restore",
+                scope: "lifecycle",
                 status: "started",
                 message: "正在退出并还原桌面...".to_owned(),
                 moved: 0,
@@ -7692,15 +9900,17 @@ fn request_real_app_exit(app: tauri::AppHandle) {
                 current_path: String::new(),
                 category_counts: Vec::new(),
             },
+            true,
         );
-
+        let _running_reset_guard = DesktopOperationRunningResetGuard;
         let progress_app = app.clone();
-        if let Err(error) =
-            restore_all_organized_items_to_desktop_with_progress(move |current, total, path| {
-                emit_desktop_operation(
+        let restore_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            restore_desktop_organization_for_exit_with_progress(move |current, total, path| {
+                publish_lifecycle_desktop_operation(
                     &progress_app,
                     DesktopOperationPayload {
                         kind: "restore",
+                        scope: "lifecycle",
                         status: "progress",
                         message: restore_progress_message(current, total, path),
                         moved: 0,
@@ -7710,11 +9920,64 @@ fn request_real_app_exit(app: tauri::AppHandle) {
                         current_path: path.display().to_string(),
                         category_counts: Vec::new(),
                     },
+                    true,
                 );
             })
-        {
-            eprintln!("failed to restore organized desktop items on exit: {error}");
-        }
+        }))
+        .unwrap_or_else(|_| Err("退出前还原桌面任务异常中断".to_owned()));
+        keep_loading_effect_visible(loading_started_at, Duration::from_millis(850));
+
+        let restored = match restore_result {
+            Ok(restored) => restored,
+            Err(error) => {
+                eprintln!("failed to restore organized desktop items on exit: {error}");
+                REAL_EXIT_REQUESTED.store(false, Ordering::SeqCst);
+                publish_lifecycle_desktop_operation(
+                    &app,
+                    DesktopOperationPayload {
+                        kind: "restore",
+                        scope: "lifecycle",
+                        status: "failed",
+                        message: format!("退出前还原桌面失败，程序仍在运行：{error}"),
+                        moved: 0,
+                        skipped: 0,
+                        restored: 0,
+                        total: 0,
+                        current_path: String::new(),
+                        category_counts: Vec::new(),
+                    },
+                    false,
+                );
+                emit_desktop_cards_changed(&app);
+                if let Err(show_error) = with_lazy_window_operation(|| show_main_window_impl(&app))
+                {
+                    eprintln!("failed to show exit restore error: {show_error}");
+                }
+                return;
+            }
+        };
+        publish_lifecycle_desktop_operation(
+            &app,
+            DesktopOperationPayload {
+                kind: "restore",
+                scope: "lifecycle",
+                status: "finished",
+                message: if restored > 0 {
+                    format!("退出前已还原 {restored} 项到桌面")
+                } else {
+                    "桌面已还原，正在退出...".to_owned()
+                },
+                moved: 0,
+                skipped: 0,
+                restored,
+                total: restored,
+                current_path: String::new(),
+                category_counts: Vec::new(),
+            },
+            false,
+        );
+        EXIT_RESTORE_COMPLETED.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(120));
         cleanup_desktop_card_windows_impl(&app);
         app.exit(0);
     });
@@ -7758,7 +10021,12 @@ fn setup_system_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
 }
 
 fn main() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if !args.iter().any(|arg| arg == "--startup") {
+                show_main_window_from_tray_async(app.clone());
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
@@ -7767,7 +10035,7 @@ fn main() {
                         let settings = configured_settings();
                         if shortcut_matches(shortcut, &settings.search_shortcut_value()) {
                             if settings.search_enabled {
-                                show_search_overlay(app);
+                                show_search_overlay_async(app.clone());
                             }
                             return;
                         }
@@ -7776,11 +10044,11 @@ fn main() {
                             return;
                         }
 
-                        if !is_clipboard_overlay_visible(app) {
+                        let sync_clipboard = !is_clipboard_overlay_visible(app);
+                        if sync_clipboard {
                             clipboard_bridge::remember_foreground_window();
-                            clipboard_bridge::sync_current_clipboard_once();
                         }
-                        show_clipboard_overlay(app);
+                        show_clipboard_overlay_async(app.clone(), sync_clipboard);
                     }
                 })
                 .build(),
@@ -7798,45 +10066,133 @@ fn main() {
         .setup(|app| {
             let app_handle = app.handle().clone();
             setup_system_tray(&app_handle)?;
-            sync_launch_on_startup_setting();
-            clipboard_bridge::spawn_text_history_monitor();
-            let settings = configured_settings();
-            raise_startup_process_priority_if_needed(&settings);
-            let clipboard_shortcut = settings.clipboard_shortcut_value();
-            if let Err(error) = app.global_shortcut().register(clipboard_shortcut.as_str()) {
-                eprintln!("failed to register {clipboard_shortcut} shortcut: {error}");
-            }
-
-            if settings.search_enabled {
-                let search_shortcut = settings.search_shortcut_value();
-                if search_shortcut != clipboard_shortcut {
-                    if let Err(error) = app.global_shortcut().register(search_shortcut.as_str()) {
-                        eprintln!("failed to register {search_shortcut} shortcut: {error}");
-                    }
-                }
-            }
-
+            let show_main_on_start = !is_startup_launch_invocation();
             let handle = app.handle().clone();
             tauri::async_runtime::spawn_blocking(move || {
-                if let Err(error) =
-                    store::with_storage_mutation(recover_pending_runtime_migration_locked)
-                {
-                    eprintln!("failed to recover pending runtime directory migration: {error}");
-                }
-                if let Some(window) = handle.get_webview_window("desktop-widget") {
-                    let _ = place_desktop_widget(&window);
-                }
-                if let Err(error) = show_persisted_desktop_layout(&handle) {
-                    eprintln!("failed to show desktop cards: {error}");
-                }
-                if let Ok(store) = AppStore::open() {
-                    cleanup_startup_transfer_staging_dirs(&store);
-                    if let Err(error) = repair_existing_app_desktop_entries(&store) {
-                        eprintln!("failed to repair desktop entry shortcuts: {error}");
+                let mut completion_guard = StartupRecoveryCompletionGuard::new();
+                publish_lifecycle_desktop_operation(
+                    &handle,
+                    DesktopOperationPayload {
+                        kind: "classify",
+                        scope: "lifecycle",
+                        status: "started",
+                        message: "正在检查并恢复上次收纳布局...".to_owned(),
+                        moved: 0,
+                        skipped: 0,
+                        restored: 0,
+                        total: 0,
+                        current_path: String::new(),
+                        category_counts: Vec::new(),
+                    },
+                    true,
+                );
+                let _running_reset_guard = DesktopOperationRunningResetGuard;
+                if show_main_on_start {
+                    if let Err(error) =
+                        with_lazy_window_operation(|| show_main_window_impl(&handle))
+                    {
+                        eprintln!("failed to show startup loading window: {error}");
                     }
                 }
-                if let Err(error) = start_restore_background_operation(handle.clone()) {
-                    eprintln!("failed to start desktop restore on startup: {error}");
+
+                let progress_handle = handle.clone();
+                let mut loading_visible_at = None;
+                let recovery_result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        store::with_storage_mutation(recover_pending_runtime_migration_locked)?;
+                        if let Err(error) =
+                            with_lazy_window_operation(|| show_persisted_desktop_layout(&handle))
+                        {
+                            eprintln!("failed to show startup operation overlay: {error}");
+                        }
+                        loading_visible_at = Some(Instant::now());
+                        recollect_desktop_organization_from_restart_marker_with_progress(
+                            move |current, total, path| {
+                                publish_lifecycle_desktop_operation(
+                                    &progress_handle,
+                                    DesktopOperationPayload {
+                                        kind: "classify",
+                                        scope: "lifecycle",
+                                        status: "progress",
+                                        message: restart_recollect_progress_message(
+                                            current, total, path,
+                                        ),
+                                        moved: current,
+                                        skipped: 0,
+                                        restored: 0,
+                                        total,
+                                        current_path: path.display().to_string(),
+                                        category_counts: Vec::new(),
+                                    },
+                                    true,
+                                );
+                            },
+                        )
+                    }))
+                    .unwrap_or_else(|_| Err("启动恢复任务异常中断".to_owned()));
+                if let Some(visible_at) = loading_visible_at {
+                    keep_loading_effect_visible(visible_at, Duration::from_millis(850));
+                }
+                completion_guard.complete(recovery_result.clone().map(|_| ()));
+
+                match recovery_result {
+                    Ok(recollected) => {
+                        initialize_runtime_services(&handle);
+                        emit_desktop_cards_changed(&handle);
+                        if let Err(error) = with_lazy_window_operation(|| {
+                            if show_main_on_start {
+                                show_main_window_impl(&handle)?;
+                            }
+                            show_persisted_desktop_layout(&handle)
+                        }) {
+                            eprintln!("failed to show desktop cards: {error}");
+                        }
+                        publish_lifecycle_desktop_operation(
+                            &handle,
+                            DesktopOperationPayload {
+                                kind: "classify",
+                                scope: "lifecycle",
+                                status: "finished",
+                                message: if recollected > 0 {
+                                    format!("已恢复上次收纳布局，共 {recollected} 项")
+                                } else {
+                                    "收纳布局已就绪".to_owned()
+                                },
+                                moved: recollected,
+                                skipped: 0,
+                                restored: 0,
+                                total: recollected,
+                                current_path: String::new(),
+                                category_counts: Vec::new(),
+                            },
+                            false,
+                        );
+                        schedule_stale_transfer_staging_cleanup();
+                    }
+                    Err(error) => {
+                        eprintln!("failed to complete startup recovery: {error}");
+                        publish_lifecycle_desktop_operation(
+                            &handle,
+                            DesktopOperationPayload {
+                                kind: "classify",
+                                scope: "lifecycle",
+                                status: "failed",
+                                message: format!("启动恢复失败，请重新启动 DustDesk：{error}"),
+                                moved: 0,
+                                skipped: 0,
+                                restored: 0,
+                                total: 0,
+                                current_path: String::new(),
+                                category_counts: Vec::new(),
+                            },
+                            false,
+                        );
+                        if let Err(show_error) =
+                            with_lazy_window_operation(|| show_main_window_impl(&handle))
+                        {
+                            eprintln!("failed to show startup recovery error: {show_error}");
+                        }
+                    }
                 }
             });
             Ok(())
@@ -7865,6 +10221,8 @@ fn main() {
             create_desktop_entries,
             open_special,
             update_runtime_directory,
+            check_for_updates,
+            open_update_download,
             open_path,
             start_all_launchers,
             show_desktop_widget,
@@ -7893,6 +10251,30 @@ fn main() {
             update_search_settings,
             update_launch_on_startup
         ])
-        .run(tauri::generate_context!())
-        .expect("failed to run DustDesk Tauri app");
+        .build(tauri::generate_context!())
+        .expect("failed to build DustDesk Tauri app");
+
+    app.run(|app_handle, event| match event {
+        tauri::RunEvent::ExitRequested { api, .. } => {
+            if !REAL_EXIT_REQUESTED.load(Ordering::SeqCst) {
+                api.prevent_exit();
+                request_real_app_exit(app_handle.clone());
+            }
+        }
+        tauri::RunEvent::Exit => {
+            // Windows session shutdown may bypass the preventable exit request. This synchronous
+            // last chance keeps the same marker-first safety ordering before the process dies.
+            if !EXIT_RESTORE_COMPLETED.load(Ordering::SeqCst) {
+                REAL_EXIT_REQUESTED.store(true, Ordering::SeqCst);
+                if let Err(error) = restore_desktop_organization_for_exit() {
+                    eprintln!(
+                        "failed to restore organized desktop items on terminal exit: {error}"
+                    );
+                } else {
+                    EXIT_RESTORE_COMPLETED.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+        _ => {}
+    });
 }

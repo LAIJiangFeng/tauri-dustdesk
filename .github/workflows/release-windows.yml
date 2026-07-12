@@ -17,6 +17,7 @@ jobs:
   build-windows-installer:
     name: Build Windows NSIS installer
     runs-on: windows-latest
+    if: ${{ !contains(github.event.head_commit.message, '[skip release]') }}
 
     steps:
       - name: Checkout
@@ -27,6 +28,65 @@ jobs:
         with:
           node-version: 22
           cache: npm
+
+      - name: Bump patch version
+        id: bump
+        shell: pwsh
+        run: |
+          @'
+          const fs = require("fs")
+
+          function readJson(path) {
+            return JSON.parse(fs.readFileSync(path, "utf8"))
+          }
+
+          function writeJson(path, value) {
+            fs.writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`)
+          }
+
+          function bumpPatch(version) {
+            const match = String(version).match(/^(\d+)\.(\d+)\.(\d+)$/)
+            if (!match) throw new Error(`Unsupported version: ${version}`)
+            return `${match[1]}.${match[2]}.${Number(match[3]) + 1}`
+          }
+
+          const tauriConfigPath = "src-tauri/tauri.conf.json"
+          const tauriConfig = readJson(tauriConfigPath)
+          const nextVersion = bumpPatch(tauriConfig.version)
+          tauriConfig.version = nextVersion
+          writeJson(tauriConfigPath, tauriConfig)
+
+          const packagePath = "package.json"
+          const packageJson = readJson(packagePath)
+          packageJson.version = nextVersion
+          writeJson(packagePath, packageJson)
+
+          const lockPath = "package-lock.json"
+          const packageLock = readJson(lockPath)
+          packageLock.version = nextVersion
+          if (packageLock.packages && packageLock.packages[""]) {
+            packageLock.packages[""].version = nextVersion
+          }
+          writeJson(lockPath, packageLock)
+
+          const cargoPath = "src-tauri/Cargo.toml"
+          const cargo = fs.readFileSync(cargoPath, "utf8")
+          fs.writeFileSync(
+            cargoPath,
+            cargo.replace(/(^\[package\][\s\S]*?^version\s*=\s*)"[^"]+"/m, `$1"${nextVersion}"`)
+          )
+
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `version=${nextVersion}\n`)
+          '@ | node
+
+      - name: Commit bumped version
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package.json package-lock.json src-tauri/Cargo.toml src-tauri/tauri.conf.json
+          git commit -m "chore: bump version to ${{ steps.bump.outputs.version }} [skip release]"
+          git push
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -50,7 +110,7 @@ jobs:
         run: |
           $config = Get-Content -Raw src-tauri/tauri.conf.json | ConvertFrom-Json
           $version = [string]$config.version
-          $tag = "v$version-${{ github.run_number }}"
+          $tag = "v$version"
           "version=$version" >> $env:GITHUB_OUTPUT
           "tag=$tag" >> $env:GITHUB_OUTPUT
 
@@ -71,8 +131,11 @@ jobs:
           $assetName = "DustDesk-${{ steps.app.outputs.version }}-windows-x64-setup.exe"
           $assetPath = Join-Path $outDir $assetName
           Copy-Item -LiteralPath $installer.FullName -Destination $assetPath -Force
+          $latestPath = Join-Path $outDir "DustDesk-latest-windows-x64-setup.exe"
+          Copy-Item -LiteralPath $installer.FullName -Destination $latestPath -Force
 
           "asset_path=$assetPath" >> $env:GITHUB_OUTPUT
+          "latest_asset_path=$latestPath" >> $env:GITHUB_OUTPUT
           "asset_name=$assetName" >> $env:GITHUB_OUTPUT
 
       - name: Create GitHub Release
@@ -84,6 +147,8 @@ jobs:
             Windows installer for DustDesk.
 
             Download the `.exe` installer below. The installer supports selecting an install directory and defaults to a DustDesk folder.
-          files: ${{ steps.installer.outputs.asset_path }}
+          files: |
+            ${{ steps.installer.outputs.asset_path }}
+            ${{ steps.installer.outputs.latest_asset_path }}
           overwrite_files: true
           make_latest: true

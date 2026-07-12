@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react"
 import type { KeyboardEvent as ReactKeyboardEvent } from "react"
-import { Desktop, FolderOpen, GearSix, HardDrives, Keyboard, MagnifyingGlass, PlayCircle, Plus, X } from "@phosphor-icons/react"
+import { ArrowsClockwise, Desktop, DownloadSimple, FolderOpen, GearSix, HardDrives, Keyboard, MagnifyingGlass, PlayCircle, Plus, X } from "@phosphor-icons/react"
 import { open } from "@tauri-apps/plugin-dialog"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -8,6 +8,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { useDustDeskStore } from "@/stores/dustdesk-store"
+import type { AppUpdateInfo } from "@/types"
 
 const MODIFIER_CODES = new Set(["ControlLeft", "ControlRight", "ShiftLeft", "ShiftRight", "AltLeft", "AltRight", "MetaLeft", "MetaRight"])
 type RuntimeDirectoryTarget = "data" | "organizer" | "launchers"
@@ -39,6 +40,8 @@ export function SettingsPage() {
   const updateClipboardShortcut = useDustDeskStore((state) => state.updateClipboardShortcut)
   const updateSearchSettings = useDustDeskStore((state) => state.updateSearchSettings)
   const updateLaunchOnStartup = useDustDeskStore((state) => state.updateLaunchOnStartup)
+  const checkForUpdates = useDustDeskStore((state) => state.checkForUpdates)
+  const openUpdateDownload = useDustDeskStore((state) => state.openUpdateDownload)
   const shortcutInputRef = useRef<HTMLInputElement | null>(null)
   const searchShortcutInputRef = useRef<HTMLInputElement | null>(null)
   const [shortcutDraft, setShortcutDraft] = useState(snapshot.settings.clipboard_shortcut)
@@ -60,6 +63,10 @@ export function SettingsPage() {
   const [isSavingStartup, setIsSavingStartup] = useState(false)
   const [startupError, setStartupError] = useState("")
   const [startupSuccess, setStartupSuccess] = useState("")
+  const [isCheckingUpdate, setIsCheckingUpdate] = useState(false)
+  const [updateInfo, setUpdateInfo] = useState<AppUpdateInfo | null>(null)
+  const [updateError, setUpdateError] = useState("")
+  const [updateSuccess, setUpdateSuccess] = useState("")
   const safeSearchPathsDraft = Array.isArray(searchPathsDraft) ? searchPathsDraft : []
   const effectiveSearchPaths = safeSearchPathsDraft.length > 0 ? safeSearchPathsDraft : [snapshot.organizer_root].filter(Boolean)
   const rows = [
@@ -264,13 +271,43 @@ export function SettingsPage() {
     }
   }
 
+  const checkUpdateNow = async () => {
+    setIsCheckingUpdate(true)
+    setUpdateError("")
+    setUpdateSuccess("")
+    try {
+      const update = await checkForUpdates()
+      setUpdateInfo(update)
+      setUpdateSuccess(update.update_available ? `发现新版本 ${update.latest_version}` : "当前已经是最新版本")
+      if (update.update_available && window.confirm(`发现 DustDesk ${update.latest_version}，是否现在下载更新？`)) {
+        await openUpdateDownload(update.download_url)
+        setUpdateSuccess("已打开更新下载链接，下载后运行安装包即可覆盖更新")
+      }
+    } catch (reason) {
+      setUpdateError(reason instanceof Error ? reason.message : String(reason))
+    } finally {
+      setIsCheckingUpdate(false)
+    }
+  }
+
+  const downloadUpdate = async () => {
+    if (!updateInfo?.download_url) return
+    setUpdateError("")
+    try {
+      await openUpdateDownload(updateInfo.download_url)
+      setUpdateSuccess("已打开更新下载链接，下载后运行安装包即可覆盖更新")
+    } catch (reason) {
+      setUpdateError(reason instanceof Error ? reason.message : String(reason))
+    }
+  }
+
   return (
     <Card className="h-full min-h-0">
         <CardHeader>
           <div>
             <CardTitle>设置中心</CardTitle>
           </div>
-          <Badge variant="outline">{rows.length + 2} 项</Badge>
+          <Badge variant="outline">{rows.length + 3} 项</Badge>
       </CardHeader>
       <CardContent className="min-h-0">
         <ScrollArea className="h-full pr-2">
@@ -512,6 +549,58 @@ export function SettingsPage() {
                   <Button type="button" disabled={isSavingStartup} onClick={() => void toggleLaunchOnStartup()}>
                     {isSavingStartup ? "保存中" : snapshot.settings.launch_on_startup ? "关闭开机自启" : "开启开机自启"}
                   </Button>
+                </div>
+              </CardContent>
+            </Card>
+          </div>
+
+          <div className="mb-3 grid gap-3 xl:grid-cols-[minmax(0,1.05fr)_minmax(0,1.95fr)]">
+            <Card>
+              <CardContent className="flex min-h-44 flex-col gap-4 p-5">
+                <div className="flex size-11 items-center justify-center rounded-lg bg-muted text-muted-foreground">
+                  <ArrowsClockwise className="size-5" weight="duotone" />
+                </div>
+                <div>
+                  <h3 className="font-heading text-base font-medium">软件更新</h3>
+                  <p className="mt-2 text-sm leading-6 text-muted-foreground">
+                    检查 GitHub Release 上的最新安装包，有新版本时会提示下载更新。
+                  </p>
+                </div>
+                <Badge className="mt-auto w-fit" variant={updateInfo?.update_available ? "default" : "outline"}>
+                  {updateInfo ? `当前 ${updateInfo.current_version}` : "等待检查"}
+                </Badge>
+              </CardContent>
+            </Card>
+
+            <Card>
+              <CardContent className="flex min-h-44 flex-col gap-4 p-5">
+                <div className="grid gap-2">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <h3 className="font-heading text-base font-medium">检查更新</h3>
+                    <Badge variant={updateInfo?.update_available ? "default" : "outline"}>
+                      {updateInfo?.update_available ? "有新版本" : "手动检查"}
+                    </Badge>
+                  </div>
+                  <p className="text-sm leading-6 text-muted-foreground">
+                    {updateInfo
+                      ? `最新版本：${updateInfo.latest_version || "未知"}${updateInfo.asset_name ? `，安装包：${updateInfo.asset_name}` : ""}`
+                      : "点击检查后会联网读取最新发布版本。"}
+                  </p>
+                  {updateInfo?.release_name ? <p className="text-xs leading-5 text-muted-foreground">发布：{updateInfo.release_name}</p> : null}
+                  {updateSuccess ? <p className="text-xs leading-5 text-emerald-600 dark:text-emerald-400">{updateSuccess}</p> : null}
+                  {updateError ? <p className="text-xs leading-5 text-destructive">{updateError}</p> : null}
+                </div>
+                <div className="mt-auto flex flex-wrap gap-2">
+                  <Button type="button" disabled={isCheckingUpdate} onClick={() => void checkUpdateNow()}>
+                    <ArrowsClockwise className="size-4" weight="bold" />
+                    {isCheckingUpdate ? "检查中" : "检查更新"}
+                  </Button>
+                  {updateInfo?.update_available ? (
+                    <Button type="button" variant="secondary" onClick={() => void downloadUpdate()}>
+                      <DownloadSimple className="size-4" weight="bold" />
+                      下载更新
+                    </Button>
+                  ) : null}
                 </div>
               </CardContent>
             </Card>

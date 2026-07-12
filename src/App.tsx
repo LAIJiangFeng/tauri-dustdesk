@@ -3,21 +3,49 @@ import { HashRouter } from "react-router"
 import { AppRoutes } from "@/app/router"
 import { DesktopCardWindowPage } from "@/pages/desktop-card-window-page"
 import { DesktopWidgetPage } from "@/pages/desktop-widget-page"
+import { safeCurrentWindow } from "@/lib/tauri-window"
 import { useDustDeskStore } from "@/stores/dustdesk-store"
 
 function App() {
   const load = useDustDeskStore((state) => state.load)
   const loadDesktopSnapshot = useDustDeskStore((state) => state.loadDesktopSnapshot)
-  const directDesktopRoute = parseDirectDesktopRoute()
+  const routeParts = currentRouteParts()
+  const directDesktopRoute = parseDirectDesktopRoute(routeParts)
   const isDesktopRoute = Boolean(directDesktopRoute)
+  const isOverlayRoute = routeParts[0] === "clipboard-overlay" || routeParts[0] === "search-overlay"
+  const desktopPage = directDesktopRoute?.page
+  const desktopKind = directDesktopRoute?.kind
+  const desktopIndex = directDesktopRoute?.index
 
   useEffect(() => {
     if (isDesktopRoute) {
       void loadDesktopSnapshot({ iconOptions: desktopRouteIconOptions(directDesktopRoute) })
-    } else {
-      void load()
+      return
     }
-  }, [isDesktopRoute, load, loadDesktopSnapshot])
+
+    if (isOverlayRoute) return
+
+    let disposed = false
+    void (async () => {
+      const currentWindow = safeCurrentWindow()
+      if (!currentWindow) {
+        if (!disposed) void load()
+        return
+      }
+
+      let visible = true
+      try {
+        visible = await currentWindow.isVisible()
+      } catch {
+        // Loading is safer than leaving a visible main window without data.
+      }
+      if (!disposed && visible) void load()
+    })()
+
+    return () => {
+      disposed = true
+    }
+  }, [desktopIndex, desktopKind, desktopPage, isDesktopRoute, isOverlayRoute, load, loadDesktopSnapshot])
 
   if (directDesktopRoute?.page === "desktop-widget") {
     return <DesktopWidgetPage />
@@ -38,11 +66,14 @@ function App() {
   )
 }
 
-function parseDirectDesktopRoute() {
-  const route = new URLSearchParams(window.location.search).get("dustdeskRoute")?.trim()
-  if (!route) return null
+function currentRouteParts() {
+  const routeFromSearch = new URLSearchParams(window.location.search).get("dustdeskRoute")?.trim()
+  const route = routeFromSearch || window.location.hash.replace(/^#/, "").trim()
+  const path = route.split(/[?#]/, 1)[0]
+  return path.replace(/^\/+/, "").split("/").filter(Boolean)
+}
 
-  const parts = route.replace(/^\/+/, "").split("/").filter(Boolean)
+function parseDirectDesktopRoute(parts: string[]) {
   if (parts[0] === "desktop-widget") {
     return { page: "desktop-widget" as const }
   }

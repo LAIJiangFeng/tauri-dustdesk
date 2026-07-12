@@ -53,6 +53,7 @@ export interface DesktopLayout {
 
 export interface DesktopOperationEvent {
   kind: "classify" | "restore"
+  scope: "manual" | "lifecycle"
   status: "started" | "progress" | "finished" | "failed"
   message: string
   moved: number
@@ -66,6 +67,18 @@ export interface DesktopOperationEvent {
 export interface DesktopOperationStatus {
   running: boolean
   last?: DesktopOperationEvent | null
+}
+
+export interface AppUpdateInfo {
+  current_version: string
+  latest_version: string
+  update_available: boolean
+  release_name: string
+  release_url: string
+  download_url: string
+  asset_name: string
+  published_at: string
+  body: string
 }
 
 export interface CategoryClassifyCount {

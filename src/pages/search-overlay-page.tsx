@@ -8,7 +8,7 @@ import { Card, CardContent } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { useTheme } from "@/hooks/use-theme"
-import { safeListen } from "@/lib/tauri-window"
+import { safeCurrentWindow, safeListen } from "@/lib/tauri-window"
 import { cn, truncate } from "@/lib/utils"
 import { useDustDeskStore } from "@/stores/dustdesk-store"
 import type { SearchItem, SearchOverlayData } from "@/types"
@@ -141,26 +141,36 @@ export function SearchOverlayPage() {
   }, [focusInput, setActive])
 
   useEffect(() => {
-    void refreshOverlay()
-  }, [refreshOverlay])
-
-  useEffect(() => {
     let unlisten: (() => void) | undefined
     let disposed = false
 
-    void safeListen("dustdesk://search-shortcut", () => {
+    const handleShortcut = () => {
       const now = performance.now()
       if (now - lastShortcutEventAtRef.current < SHORTCUT_EVENT_GUARD_MS) return
       lastShortcutEventAtRef.current = now
       void refreshOverlay()
-    }).then((dispose) => {
+    }
+
+    void (async () => {
+      const dispose = await safeListen("dustdesk://search-shortcut", handleShortcut)
       if (disposed) {
         dispose?.()
         return
       }
 
       unlisten = dispose
-    })
+      const currentWindow = safeCurrentWindow()
+      if (!currentWindow) {
+        handleShortcut()
+        return
+      }
+
+      try {
+        if (await currentWindow.isVisible() && !disposed) handleShortcut()
+      } catch {
+        if (!disposed) handleShortcut()
+      }
+    })()
 
     return () => {
       disposed = true

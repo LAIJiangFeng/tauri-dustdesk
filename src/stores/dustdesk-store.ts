@@ -7,6 +7,7 @@ import type {
   AppPage,
   AppSettings,
   AppSnapshot,
+  AppUpdateInfo,
   ClassifyResult,
   ClipboardHistoryItem,
   DeskCategory,
@@ -210,6 +211,19 @@ async function call<T>(command: string, args?: InvokeArgs): Promise<T> {
         ...defaultSettings,
         launch_on_startup: asBoolean(args?.enabled),
       }) as T
+    }
+    if (command === "check_for_updates") {
+      return normalizeUpdateInfo({
+        current_version: "0.1.0",
+        latest_version: "0.1.0",
+        update_available: false,
+        release_name: "DustDesk 0.1.0",
+        release_url: "https://github.com/LAIJiangFeng/tauri-dustdesk/releases",
+        download_url: "https://github.com/LAIJiangFeng/tauri-dustdesk/releases",
+      }) as T
+    }
+    if (command === "open_update_download") {
+      return undefined as T
     }
     if (command === "classify_desktop_items") {
       return {
@@ -452,6 +466,21 @@ function normalizeSearchOverlay(value: unknown): SearchOverlayData {
       .filter(Boolean),
     recent: asArray(raw.recent ?? raw.Recent).map(normalizeSearchItem),
     frequent: asArray(raw.frequent ?? raw.Frequent).map(normalizeSearchItem),
+  }
+}
+
+function normalizeUpdateInfo(value: unknown): AppUpdateInfo {
+  const raw = asRecord(value)
+  return {
+    current_version: asString(raw.current_version ?? raw.CurrentVersion),
+    latest_version: asString(raw.latest_version ?? raw.LatestVersion),
+    update_available: asBoolean(raw.update_available ?? raw.UpdateAvailable),
+    release_name: asString(raw.release_name ?? raw.ReleaseName),
+    release_url: asString(raw.release_url ?? raw.ReleaseUrl),
+    download_url: asString(raw.download_url ?? raw.DownloadUrl),
+    asset_name: asString(raw.asset_name ?? raw.AssetName),
+    published_at: asString(raw.published_at ?? raw.PublishedAt),
+    body: asString(raw.body ?? raw.Body),
   }
 }
 
@@ -767,6 +796,8 @@ interface DustDeskState {
   hideSearchOverlay: () => Promise<void>
   updateSearchSettings: (enabled: boolean, shortcut: string, paths: string[]) => Promise<AppSettings>
   updateLaunchOnStartup: (enabled: boolean) => Promise<AppSettings>
+  checkForUpdates: () => Promise<AppUpdateInfo>
+  openUpdateDownload: (downloadUrl: string) => Promise<void>
 }
 
 export const useDustDeskStore = create<DustDeskState>()(
@@ -1200,6 +1231,15 @@ export const useDustDeskStore = create<DustDeskState>()(
         state.snapshot.settings = normalizeSettings(settings)
       })
       return normalizeSettings(settings)
+    },
+    checkForUpdates: async () => {
+      const update = await call<AppUpdateInfo>("check_for_updates")
+      return normalizeUpdateInfo(update)
+    },
+    openUpdateDownload: async (downloadUrl) => {
+      await call("open_update_download", {
+        downloadUrl,
+      })
     },
   })),
 )

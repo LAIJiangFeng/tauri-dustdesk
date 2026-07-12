@@ -49,7 +49,12 @@ export function OrganizerPage() {
   const [isRestoringDesktop, setIsRestoringDesktop] = useState(false)
   const [isMergingCategories, setIsMergingCategories] = useState(false)
   const [dropOperationLabel, setDropOperationLabel] = useState("")
-  const desktopOperationRef = useRef<{ kind: DesktopOperationEvent["kind"] | null; done: boolean }>({ kind: null, done: true })
+  const desktopOperationRef = useRef<{
+    kind: DesktopOperationEvent["kind"] | null
+    scope: DesktopOperationEvent["scope"] | null
+    done: boolean
+  }>({ kind: null, scope: null, done: true })
+  const desktopOperationEventRevisionRef = useRef(0)
   const desktopOperationTimeoutRef = useRef<number | null>(null)
   const deferredQuery = useDeferredValue(query.trim().toLowerCase())
   const desktopOperationLabel = isClassifyingDesktop
@@ -65,14 +70,14 @@ export function OrganizerPage() {
     : snapshot.desktop_items
   const handleClassifyDesktopItems = async () => {
     if (isClassifyingDesktop) return
-    beginDesktopOperation("classify")
-    setIsClassifyingDesktop(true)
+    beginDesktopOperation("classify", "manual")
     setNotice("正在智能收纳桌面...")
     try {
       await startClassifyDesktopItemsTask()
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error))
-      setIsClassifyingDesktop(false)
+      completeDesktopOperation("classify", "manual")
+      clearDesktopOperationFlags()
     }
   }
 
@@ -80,14 +85,14 @@ export function OrganizerPage() {
     if (isRestoringDesktop) return
     if (!window.confirm("确认把所有收纳箱项目移回桌面吗？这会清空对应的收纳记录。")) return
 
-    beginDesktopOperation("restore")
-    setIsRestoringDesktop(true)
+    beginDesktopOperation("restore", "manual")
     setNotice("正在还原桌面...")
     try {
       await startRestoreAllToDesktopTask()
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error))
-      setIsRestoringDesktop(false)
+      completeDesktopOperation("restore", "manual")
+      clearDesktopOperationFlags()
     }
   }
 
@@ -115,26 +120,16 @@ export function OrganizerPage() {
   useEffect(() => {
     let unlisten: (() => void) | undefined
     void safeListen<DesktopOperationEvent>("dustdesk://desktop-operation", (event) => {
+      desktopOperationEventRevisionRef.current += 1
       const payload = event.payload
       if (payload.status === "started") {
-        beginDesktopOperation(payload.kind)
+        beginDesktopOperation(payload.kind, payload.scope)
         setNotice(payload.message)
-        if (payload.kind === "classify") {
-          setIsClassifyingDesktop(true)
-        } else if (payload.kind === "restore") {
-          setIsRestoringDesktop(true)
-        }
         return
       }
       if (payload.status === "progress") {
-        beginDesktopOperation(payload.kind)
+        beginDesktopOperation(payload.kind, payload.scope)
         setNotice(payload.message)
-        if (payload.kind === "classify") {
-          setIsClassifyingDesktop(true)
-        }
-        if (payload.kind === "restore") {
-          setIsRestoringDesktop(true)
-        }
         return
       }
       if (payload.kind === "classify") {
@@ -144,8 +139,8 @@ export function OrganizerPage() {
       }
     }).then((value) => {
       unlisten = value
+      void syncDesktopOperationStatus()
     })
-    void syncDesktopOperationStatus()
     return () => {
       unlisten?.()
       clearDesktopOperationTimeout()
@@ -193,46 +188,51 @@ export function OrganizerPage() {
   }
 
   async function finishClassifyOperation(payload: DesktopOperationEvent) {
-    if (!completeDesktopOperation("classify")) return
+    if (!completeDesktopOperation(payload.kind, payload.scope)) return
+    clearDesktopOperationFlags()
     if (payload.status === "failed") {
       setNotice(payload.message || "智能收纳失败")
-      setIsClassifyingDesktop(false)
       return
     }
 
-    setNotice(classifyResultNotice(classifyResultFromOperation(payload)))
-    setIsClassifyingDesktop(false)
+    setNotice(payload.message || classifyResultNotice(classifyResultFromOperation(payload)))
   }
 
   async function finishRestoreOperation(payload: DesktopOperationEvent) {
-    if (!completeDesktopOperation("restore")) return
+    if (!completeDesktopOperation(payload.kind, payload.scope)) return
+    clearDesktopOperationFlags()
     if (payload.status === "failed") {
       setNotice(payload.message || "还原桌面失败")
-      setIsRestoringDesktop(false)
       return
     }
 
     setNotice(payload.message || (payload.restored > 0 ? `已还原 ${payload.restored} 项到桌面` : "没有需要还原到桌面的收纳项目"))
-    setIsRestoringDesktop(false)
   }
 
-  function beginDesktopOperation(kind: DesktopOperationEvent["kind"]) {
+  function beginDesktopOperation(kind: DesktopOperationEvent["kind"], scope: DesktopOperationEvent["scope"]) {
     clearDesktopOperationTimeout()
-    desktopOperationRef.current = { kind, done: false }
+    desktopOperationRef.current = { kind, scope, done: false }
+    setIsClassifyingDesktop(kind === "classify")
+    setIsRestoringDesktop(kind === "restore")
     desktopOperationTimeoutRef.current = window.setTimeout(() => {
       const current = desktopOperationRef.current
-      if (current.kind !== kind || current.done) return
+      if (current.kind !== kind || current.scope !== scope || current.done) return
       desktopOperationTimeoutRef.current = null
       void syncDesktopOperationStatus()
     }, 10_000)
   }
 
-  function completeDesktopOperation(kind: DesktopOperationEvent["kind"]) {
+  function completeDesktopOperation(kind: DesktopOperationEvent["kind"], scope: DesktopOperationEvent["scope"]) {
     const current = desktopOperationRef.current
-    if (current.kind !== kind || current.done) return false
+    if (current.kind !== kind || current.scope !== scope || current.done) return false
     clearDesktopOperationTimeout()
-    desktopOperationRef.current = { kind, done: true }
+    desktopOperationRef.current = { kind, scope, done: true }
     return true
+  }
+
+  function clearDesktopOperationFlags() {
+    setIsClassifyingDesktop(false)
+    setIsRestoringDesktop(false)
   }
 
   function clearDesktopOperationTimeout() {
@@ -242,32 +242,37 @@ export function OrganizerPage() {
   }
 
   async function syncDesktopOperationStatus() {
+    const eventRevision = desktopOperationEventRevisionRef.current
     try {
       const status = await getDesktopOperationStatus()
+      if (eventRevision !== desktopOperationEventRevisionRef.current) return
       const payload = status.last
       if (!status.running) {
-        if (!payload || payload.status === "finished" || payload.status === "failed") {
+        if (payload?.status === "finished" || payload?.status === "failed") {
+          if (payload.kind === "classify") {
+            await finishClassifyOperation(payload)
+          } else if (payload.kind === "restore") {
+            await finishRestoreOperation(payload)
+          }
+        } else if (!payload) {
           clearDesktopOperationTimeout()
-          desktopOperationRef.current = { kind: payload?.kind ?? null, done: true }
-          setIsClassifyingDesktop(false)
-          setIsRestoringDesktop(false)
+          desktopOperationRef.current = { kind: null, scope: null, done: true }
+          clearDesktopOperationFlags()
         }
         return
       }
       if (payload?.kind === "classify") {
-        beginDesktopOperation("classify")
-        setIsClassifyingDesktop(true)
+        beginDesktopOperation("classify", payload.scope)
         setNotice(payload.message || "正在智能收纳桌面...")
       } else if (payload?.kind === "restore") {
-        beginDesktopOperation("restore")
-        setIsRestoringDesktop(true)
+        beginDesktopOperation("restore", payload.scope)
         setNotice(payload.message || "正在还原桌面...")
       }
     } catch {
+      if (eventRevision !== desktopOperationEventRevisionRef.current) return
       clearDesktopOperationTimeout()
-      desktopOperationRef.current = { kind: null, done: true }
-      setIsClassifyingDesktop(false)
-      setIsRestoringDesktop(false)
+      desktopOperationRef.current = { kind: null, scope: null, done: true }
+      clearDesktopOperationFlags()
     }
   }
 

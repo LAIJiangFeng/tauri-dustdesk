@@ -12,46 +12,6 @@
   "app": {
     "windows": [
       {
-        "label": "main",
-        "title": "DeskNest",
-        "width": 1320,
-        "height": 820,
-        "minWidth": 1080,
-        "minHeight": 680,
-        "resizable": true,
-        "center": true,
-        "decorations": false,
-        "transparent": false
-      },
-      {
-        "label": "clipboard",
-        "title": "DeskNest Clipboard",
-        "url": "index.html#/clipboard-overlay",
-        "width": 1600,
-        "height": 300,
-        "resizable": false,
-        "decorations": false,
-        "alwaysOnTop": true,
-        "skipTaskbar": true,
-        "visible": false,
-        "focus": false,
-        "transparent": false
-      },
-      {
-        "label": "search",
-        "title": "DeskNest Search",
-        "url": "index.html#/search-overlay",
-        "width": 860,
-        "height": 620,
-        "resizable": false,
-        "decorations": false,
-        "alwaysOnTop": true,
-        "skipTaskbar": true,
-        "visible": false,
-        "focus": true,
-        "transparent": false
-      },
-      {
         "label": "desktop-widget",
         "title": "DustDesk Desktop Widget",
         "url": "index.html#/desktop-widget",
@@ -66,6 +26,7 @@
         "transparent": true,
         "shadow": false,
         "skipTaskbar": true,
+        "alwaysOnBottom": true,
         "visible": true,
         "focus": false,
         "dragDropEnabled": true

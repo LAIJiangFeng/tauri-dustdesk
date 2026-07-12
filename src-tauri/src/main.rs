@@ -52,6 +52,9 @@ const SEARCH_SCAN_LIMIT: usize = 8_000;
 const SEARCH_HISTORY_LIMIT: usize = 500;
 const CLIPBOARD_PREVIEW_IMAGE_MAX_BYTES: u64 = 800_000;
 const MAX_LOCKED_TRANSFER_TREE_ENTRIES: usize = 256;
+const ICON_DATA_CACHE_LIMIT: usize = 1024;
+const ICON_FAILURE_CACHE_LIMIT: usize = 1024;
+const ICON_FAILURE_CACHE_TTL: Duration = Duration::from_millis(750);
 const TRAY_MENU_SHOW_MAIN: &str = "show-main-window";
 const TRAY_MENU_QUIT: &str = "quit-app";
 const DESKTOP_OPERATION_EVENT: &str = "dustdesk://desktop-operation";
@@ -67,7 +70,9 @@ static RUNTIME_DIRECTORY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static TRANSFER_RECOVERY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static LAZY_WINDOW_OPERATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static WEBVIEW_WINDOW_CREATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-static ICON_DATA_URL_CACHE: OnceLock<Mutex<BTreeMap<String, Option<String>>>> = OnceLock::new();
+static ICON_DATA_URL_CACHE: OnceLock<Mutex<BTreeMap<String, String>>> = OnceLock::new();
+static ICON_FAILURE_CACHE: OnceLock<Mutex<BTreeMap<String, Instant>>> = OnceLock::new();
+static ICON_RESOLUTION_LOCKS: OnceLock<Mutex<BTreeMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
 static STARTUP_RECOVERY_STATE: OnceLock<(Mutex<Option<Result<(), String>>>, Condvar)> =
     OnceLock::new();
 static REAL_EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -3768,34 +3773,129 @@ fn resolve_path_icons_impl(paths: Vec<String>) -> Result<Vec<PathIconResult>, St
 }
 
 fn cached_icon_data_url(path: &Path) -> Option<String> {
-    const ICON_CACHE_LIMIT: usize = 1024;
+    cached_icon_data_url_with(path, system_icon::icon_data_url)
+}
 
+fn cached_icon_data_url_with(
+    path: &Path,
+    resolve: impl FnOnce(&Path) -> Option<String>,
+) -> Option<String> {
+    cached_icon_data_url_with_cooldown(path, ICON_FAILURE_CACHE_TTL, resolve)
+}
+
+fn cached_icon_data_url_with_cooldown(
+    path: &Path,
+    failure_cooldown: Duration,
+    resolve: impl FnOnce(&Path) -> Option<String>,
+) -> Option<String> {
     let key = normalize_path_for_compare(path);
-    if key.is_empty() {
+    if key.is_empty() || !path.exists() {
         return None;
     }
 
-    if let Ok(cache) = ICON_DATA_URL_CACHE
-        .get_or_init(|| Mutex::new(BTreeMap::new()))
-        .lock()
-    {
-        if let Some(icon) = cache.get(&key) {
-            return icon.clone();
-        }
+    if let Some(icon) = cached_icon_value(&key) {
+        return Some(icon);
+    }
+    if icon_failure_is_fresh(&key, failure_cooldown) {
+        return None;
     }
 
-    let icon = system_icon::icon_data_url(path);
-    if let Ok(mut cache) = ICON_DATA_URL_CACHE
+    // Multiple WebViews can request the same path at once. Deduplicate only matching paths so a
+    // slow Shell handler cannot block unrelated icons or search requests.
+    let resolution_lock = {
+        let mut locks = ICON_RESOLUTION_LOCKS
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+        locks
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    };
+    let resolution_guard = resolution_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let icon = if let Some(icon) = cached_icon_value(&key) {
+        Some(icon)
+    } else if icon_failure_is_fresh(&key, failure_cooldown) {
+        None
+    } else {
+        let icon = resolve(path);
+        remember_icon_result(&key, icon.as_ref());
+        icon
+    };
+    drop(resolution_guard);
+
+    if let Ok(mut locks) = ICON_RESOLUTION_LOCKS
         .get_or_init(|| Mutex::new(BTreeMap::new()))
         .lock()
     {
-        if cache.len() >= ICON_CACHE_LIMIT && !cache.contains_key(&key) {
-            cache.clear();
+        if Arc::strong_count(&resolution_lock) == 2
+            && locks
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(current, &resolution_lock))
+        {
+            locks.remove(&key);
         }
-        cache.insert(key, icon.clone());
     }
 
     icon
+}
+
+fn cached_icon_value(key: &str) -> Option<String> {
+    ICON_DATA_URL_CACHE
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(key)
+        .cloned()
+}
+
+fn icon_failure_is_fresh(key: &str, cooldown: Duration) -> bool {
+    let now = Instant::now();
+    let mut failures = ICON_FAILURE_CACHE
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(failed_at) = failures.get(key).copied() else {
+        return false;
+    };
+    if now.saturating_duration_since(failed_at) < cooldown {
+        true
+    } else {
+        failures.remove(key);
+        false
+    }
+}
+
+fn remember_icon_result(key: &str, icon: Option<&String>) {
+    if let Some(icon) = icon {
+        let mut cache = ICON_DATA_URL_CACHE
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if cache.len() >= ICON_DATA_CACHE_LIMIT && !cache.contains_key(key) {
+            cache.clear();
+        }
+        cache.insert(key.to_owned(), icon.clone());
+        drop(cache);
+        ICON_FAILURE_CACHE
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(key);
+        return;
+    }
+
+    let mut failures = ICON_FAILURE_CACHE
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if failures.len() >= ICON_FAILURE_CACHE_LIMIT && !failures.contains_key(key) {
+        failures.clear();
+    }
+    failures.insert(key.to_owned(), Instant::now());
 }
 
 fn desktop_items(include_icons: bool) -> Vec<DesktopItem> {
@@ -6961,6 +7061,136 @@ mod tests {
         assert_eq!(compare_semver_like("0.1.2", "0.1.1"), CmpOrdering::Greater);
         assert_eq!(compare_semver_like("0.1.1", "0.1.1"), CmpOrdering::Equal);
         assert_eq!(compare_semver_like("0.1.0", "0.1.1"), CmpOrdering::Less);
+    }
+
+    #[test]
+    fn icon_cache_retries_after_a_transient_resolution_failure() {
+        let root = unique_test_dir("dustdesk-icon-cache-retry");
+        let path = root.join("item.bin");
+        fs::create_dir_all(&root).expect("create icon test root");
+        fs::write(&path, b"item").expect("create icon test item");
+        let attempts = Cell::new(0usize);
+        let resolve = |_: &Path| {
+            let attempt = attempts.get() + 1;
+            attempts.set(attempt);
+            (attempt > 1).then(|| "data:image/png;base64,test".to_owned())
+        };
+
+        assert_eq!(
+            cached_icon_data_url_with_cooldown(&path, Duration::ZERO, &resolve),
+            None
+        );
+        assert_eq!(
+            cached_icon_data_url_with_cooldown(&path, Duration::ZERO, &resolve).as_deref(),
+            Some("data:image/png;base64,test")
+        );
+        assert_eq!(
+            cached_icon_data_url_with_cooldown(&path, Duration::ZERO, &resolve).as_deref(),
+            Some("data:image/png;base64,test")
+        );
+        assert_eq!(
+            attempts.get(),
+            2,
+            "successes should remain positively cached"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn icon_cache_coalesces_concurrent_failures_for_the_same_path() {
+        let root = unique_test_dir("dustdesk-icon-cache-failure-coalescing");
+        let path = root.join("item.bin");
+        fs::create_dir_all(&root).expect("create icon failure root");
+        fs::write(&path, b"item").expect("create icon failure item");
+        let path_key = normalize_path_for_compare(&path);
+        let attempts = Arc::new(AtomicU64::new(0));
+        let start = Arc::new(std::sync::Barrier::new(3));
+        let threads = [path.clone(), path.clone()].map(|path| {
+            let attempts = Arc::clone(&attempts);
+            let start = Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                cached_icon_data_url_with(&path, move |_| {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(100));
+                    None
+                })
+            })
+        });
+        start.wait();
+
+        for thread in threads {
+            assert_eq!(thread.join().expect("join failed icon resolution"), None);
+        }
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "same-path waiters should share the short failure cooldown"
+        );
+
+        let cleanup_path = root.join("cleanup.bin");
+        fs::write(&cleanup_path, b"cleanup").expect("create lock cleanup item");
+        assert!(cached_icon_data_url_with(&cleanup_path, |_| {
+            Some("data:image/png;base64,cleanup".to_owned())
+        })
+        .is_some());
+        let locks = ICON_RESOLUTION_LOCKS
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            !locks.contains_key(&path_key),
+            "the next miss should prune an unreferenced path lock"
+        );
+        drop(locks);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn icon_cache_resolves_unrelated_paths_concurrently() {
+        let root = unique_test_dir("dustdesk-icon-cache-concurrency");
+        fs::create_dir_all(&root).expect("create icon concurrency root");
+        let paths = [root.join("first.bin"), root.join("second.bin")];
+        for path in &paths {
+            fs::write(path, b"item").expect("create icon concurrency item");
+        }
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let threads = paths.map(|path| {
+            let started_tx = started_tx.clone();
+            let release_rx = Arc::clone(&release_rx);
+            std::thread::spawn(move || {
+                cached_icon_data_url_with(&path, move |_| {
+                    started_tx.send(()).expect("signal icon resolution start");
+                    release_rx
+                        .lock()
+                        .expect("lock icon resolution release")
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("release icon resolution");
+                    Some("data:image/png;base64,test".to_owned())
+                })
+            })
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first icon resolution should start");
+        let unrelated_resolution_started = started_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+        release_tx.send(()).expect("release first icon resolution");
+        release_tx.send(()).expect("release second icon resolution");
+        for thread in threads {
+            assert!(thread.join().expect("join icon resolution").is_some());
+        }
+        assert!(
+            unrelated_resolution_started,
+            "different icon paths must not share one global resolution lock"
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

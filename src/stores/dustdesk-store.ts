@@ -63,6 +63,11 @@ interface IconResolutionOptions {
   categoryIndices?: number[]
 }
 
+interface IconFailureState {
+  attempts: number
+  retryAfter: number
+}
+
 interface DesktopSnapshotLoadOptions {
   force?: boolean
   preserveDesktopItems?: boolean
@@ -81,12 +86,19 @@ interface RestoreDesktopArgs extends Record<string, unknown> {
 
 const iconBatchSize = 24
 const iconPathLimit = 512
+const iconFailureRetryDelayMs = 900
+const iconFailureRetryLimit = 2
+const iconFailureEntryLimit = 2048
+const iconFailureCooldownMs = 5000
 const snapshotReloadDedupeMs = 120
 const desktopSnapshotReloadDedupeMs = 120
 let iconResolutionToken = 0
 let iconResolutionActive = false
 let queuedIconResolutionOptions: IconResolutionOptions | null = null
-const iconCache = new Map<string, string | null>()
+let queuedIconRetryOptions: IconResolutionOptions | null = null
+let iconRetryTimer: ReturnType<typeof setTimeout> | null = null
+const iconCache = new Map<string, string>()
+const iconFailures = new Map<string, IconFailureState>()
 let snapshotLoadPromise: Promise<void> | null = null
 let snapshotForceReloadQueued = false
 let snapshotLoadedAt = 0
@@ -97,7 +109,13 @@ let desktopSnapshotLoadedAt = 0
 function resetRuntimeCaches() {
   iconResolutionToken += 1
   queuedIconResolutionOptions = null
+  queuedIconRetryOptions = null
+  if (iconRetryTimer !== null) {
+    clearTimeout(iconRetryTimer)
+    iconRetryTimer = null
+  }
   iconCache.clear()
+  iconFailures.clear()
   snapshotLoadPromise = null
   snapshotForceReloadQueued = false
   snapshotLoadedAt = 0
@@ -537,12 +555,14 @@ function hydrateSnapshotIcons(snapshot: AppSnapshot) {
 
 function rememberResolvedIcons(icons: PathIconResult[]) {
   for (const icon of icons) {
-    if (!icon.path) continue
-    iconCache.set(iconCacheKey(icon.path), icon.icon_data_url ?? null)
+    if (!icon.path || !icon.icon_data_url) continue
+    const key = iconCacheKey(icon.path)
+    iconCache.set(key, icon.icon_data_url)
+    iconFailures.delete(key)
   }
 }
 
-function collectMissingIconPaths(snapshot: AppSnapshot, options: IconResolutionOptions) {
+function collectMissingIconPaths(snapshot: AppSnapshot, options: IconResolutionOptions, excludedKeys = new Set<string>()) {
   const includeDesktopItems = options.includeDesktopItems ?? true
   const includeLaunchers = options.includeLaunchers ?? true
   const categoryIndexSet = options.categoryIndices ? new Set(options.categoryIndices.filter((index) => Number.isInteger(index) && index >= 0)) : null
@@ -554,8 +574,10 @@ function collectMissingIconPaths(snapshot: AppSnapshot, options: IconResolutionO
     if (!trimmed || iconDataUrl) return
     const key = trimmed.toLowerCase()
     const cached = iconCache.get(key)
-    if (cached || (cached === null && !isShortcutIconPath(trimmed))) return
-    if (seen.has(key)) return
+    if (cached) return
+    const failure = iconFailures.get(key)
+    if (failure && failure.retryAfter > Date.now()) return
+    if (seen.has(key) || excludedKeys.has(key)) return
     seen.add(key)
     paths.push(trimmed)
   }
@@ -578,10 +600,6 @@ function collectMissingIconPaths(snapshot: AppSnapshot, options: IconResolutionO
   }
 
   return paths.slice(0, iconPathLimit)
-}
-
-function isShortcutIconPath(path: string) {
-  return /\.(lnk|url|appref-ms)$/i.test(path.trim())
 }
 
 function shouldIncludeDesktopItems(options: IconResolutionOptions) {
@@ -610,6 +628,42 @@ function mergeIconResolutionOptions(left: IconResolutionOptions | null, right: I
     includeLaunchers: shouldIncludeLaunchers(left) || shouldIncludeLaunchers(right),
     categoryIndices: mergeCategoryIndices(left.categoryIndices, right.categoryIndices),
   }
+}
+
+function markIconFailures(paths: string[]) {
+  let shouldRetry = false
+  for (const path of paths) {
+    const key = iconCacheKey(path)
+    if (!key || iconCache.has(key)) continue
+    if (!iconFailures.has(key) && iconFailures.size >= iconFailureEntryLimit) {
+      const oldestKey = iconFailures.keys().next().value
+      if (oldestKey) iconFailures.delete(oldestKey)
+    }
+    const attempts = (iconFailures.get(key)?.attempts ?? 0) + 1
+    iconFailures.set(key, {
+      attempts,
+      retryAfter: Date.now() + (attempts <= iconFailureRetryLimit ? iconFailureRetryDelayMs : iconFailureCooldownMs),
+    })
+    if (attempts <= iconFailureRetryLimit) shouldRetry = true
+  }
+  return shouldRetry
+}
+
+function unresolvedIconPaths(paths: string[], icons: PathIconResult[]) {
+  const resolved = new Set(icons.filter((icon) => icon.path && icon.icon_data_url).map((icon) => iconCacheKey(icon.path)))
+  return paths.filter((path) => !resolved.has(iconCacheKey(path)))
+}
+
+function scheduleIconResolutionRetry(options: IconResolutionOptions, retry: (options: IconResolutionOptions) => void) {
+  queuedIconRetryOptions = mergeIconResolutionOptions(queuedIconRetryOptions, options)
+  if (iconRetryTimer !== null) return
+
+  iconRetryTimer = setTimeout(() => {
+    iconRetryTimer = null
+    const queued = queuedIconRetryOptions
+    queuedIconRetryOptions = null
+    if (queued) retry(queued)
+  }, iconFailureRetryDelayMs)
 }
 
 function iconOptionsForDesktopSnapshotLoad(options: DesktopSnapshotLoadOptions) {
@@ -913,30 +967,72 @@ export const useDustDeskStore = create<DustDeskState>()(
       if (iconResolutionActive) return
 
       iconResolutionActive = true
+      let retryOptions: IconResolutionOptions | null = null
       try {
         while (queuedIconResolutionOptions) {
           const currentOptions = queuedIconResolutionOptions
           queuedIconResolutionOptions = null
           const run = iconResolutionToken
-          const paths = collectMissingIconPaths(get().snapshot, currentOptions)
+          const attemptedPathKeys = new Set<string>()
+          const requeueCanceledScope = () => {
+            if (run === iconResolutionToken) return false
+            queuedIconResolutionOptions = mergeIconResolutionOptions(queuedIconResolutionOptions, currentOptions)
+            return true
+          }
 
-          for (let index = 0; index < paths.length; index += iconBatchSize) {
-            if (run !== iconResolutionToken) break
-            const batch = paths.slice(index, index + iconBatchSize)
-            const icons = asArray(
-              await call<PathIconResult[]>("resolve_path_icons", {
-                paths: batch,
-              }),
-            ).map(normalizePathIcon)
-            if (run !== iconResolutionToken) break
-            rememberResolvedIcons(icons)
-            set((state) => {
-              applyResolvedIcons(state.snapshot, icons)
-            })
+          while (true) {
+            if (requeueCanceledScope()) break
+            const paths = collectMissingIconPaths(get().snapshot, currentOptions, attemptedPathKeys)
+            if (paths.length === 0) break
+            for (const path of paths) attemptedPathKeys.add(iconCacheKey(path))
+
+            let canceled = false
+            for (let index = 0; index < paths.length; index += iconBatchSize) {
+              if (requeueCanceledScope()) {
+                canceled = true
+                break
+              }
+              const batch = paths.slice(index, index + iconBatchSize)
+              let icons: PathIconResult[]
+              try {
+                icons = asArray(
+                  await call<PathIconResult[]>("resolve_path_icons", {
+                    paths: batch,
+                  }),
+                ).map(normalizePathIcon)
+              } catch (error) {
+                if (requeueCanceledScope()) {
+                  canceled = true
+                  break
+                }
+                console.warn("Failed to resolve system icons", error)
+                if (markIconFailures(batch)) {
+                  retryOptions = mergeIconResolutionOptions(retryOptions, currentOptions)
+                }
+                continue
+              }
+              if (requeueCanceledScope()) {
+                canceled = true
+                break
+              }
+              rememberResolvedIcons(icons)
+              set((state) => {
+                applyResolvedIcons(state.snapshot, icons)
+              })
+              if (markIconFailures(unresolvedIconPaths(batch, icons))) {
+                retryOptions = mergeIconResolutionOptions(retryOptions, currentOptions)
+              }
+            }
+            if (canceled) break
           }
         }
       } finally {
         iconResolutionActive = false
+        if (retryOptions) {
+          scheduleIconResolutionRetry(retryOptions, (retry) => {
+            void get().resolveSnapshotIcons(retry)
+          })
+        }
         if (queuedIconResolutionOptions) {
           const queued = queuedIconResolutionOptions
           queuedIconResolutionOptions = null

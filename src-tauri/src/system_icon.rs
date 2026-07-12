@@ -58,18 +58,25 @@ mod windows_icon {
 
     pub fn icon_data_url(path: &Path) -> Option<String> {
         let is_shortcut = is_windows_shortcut(path);
-        let hicon = shortcut_icon_sources(path)
+        shortcut_icon_sources(path)
             .into_iter()
-            .find_map(|source| icon_source_icon(&source))
-            .or_else(|| shortcut_namespace_icon(path))
+            .find_map(|source| icon_source_data_url(&source))
+            .or_else(|| shortcut_namespace_icon(path).and_then(hicon_data_url))
             .or_else(|| {
                 if is_shortcut {
-                    return None;
+                    return if path.exists() {
+                        shell_icon(path).and_then(hicon_data_url)
+                    } else {
+                        None
+                    };
                 }
                 let icon_path =
                     internet_shortcut_icon_path(path).unwrap_or_else(|| path.to_path_buf());
-                shell_icon(&icon_path)
-            })?;
+                shell_icon(&icon_path).and_then(hicon_data_url)
+            })
+    }
+
+    fn hicon_data_url(hicon: HICON) -> Option<String> {
         let png = unsafe { hicon_to_png(hicon, ICON_SIZE, ICON_SIZE) };
         unsafe {
             DestroyIcon(hicon);
@@ -83,11 +90,12 @@ mod windows_icon {
             .is_some_and(|extension| extension.eq_ignore_ascii_case("lnk"))
     }
 
-    fn icon_source_icon(source: &IconSource) -> Option<HICON> {
+    fn icon_source_data_url(source: &IconSource) -> Option<String> {
         source
             .icon_index
             .and_then(|index| extracted_icon(&source.path, index))
-            .or_else(|| shell_icon(&source.path))
+            .and_then(hicon_data_url)
+            .or_else(|| shell_icon(&source.path).and_then(hicon_data_url))
     }
 
     fn shortcut_icon_sources(path: &Path) -> Vec<IconSource> {

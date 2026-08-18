@@ -31,6 +31,8 @@ const defaultSettings: AppSettings = {
 
 const emptyDesktopLayout: DesktopLayout = {
   split_category_indices: [],
+  locked: false,
+  click_through: false,
   windows: {},
 }
 
@@ -265,12 +267,7 @@ async function call<T>(command: string, args?: InvokeArgs): Promise<T> {
     if (command === "save_desktop_split_indices") {
       return normalizeSplitIndices(args?.indices) as T
     }
-    if (
-      command === "desktop_frame_visibility" ||
-      command === "toggle_desktop_frames" ||
-      command === "toggle_desktop_organizer_frame" ||
-      command === "toggle_desktop_launcher_frame"
-    ) {
+    if (command === "desktop_frame_visibility" || command === "toggle_desktop_frames" || command === "toggle_desktop_organizer_frame" || command === "toggle_desktop_launcher_frame") {
       return hiddenDesktopFrames as T
     }
     return undefined as T
@@ -280,12 +277,7 @@ async function call<T>(command: string, args?: InvokeArgs): Promise<T> {
   if (command === "load_snapshot" || command === "load_desktop_snapshot" || command === "update_runtime_directory") {
     return normalizeSnapshot(result) as T
   }
-  if (
-    command === "desktop_frame_visibility" ||
-    command === "toggle_desktop_frames" ||
-    command === "toggle_desktop_organizer_frame" ||
-    command === "toggle_desktop_launcher_frame"
-  ) {
+  if (command === "desktop_frame_visibility" || command === "toggle_desktop_frames" || command === "toggle_desktop_organizer_frame" || command === "toggle_desktop_launcher_frame") {
     return normalizeDesktopFrameVisibility(result) as T
   }
   return result
@@ -357,6 +349,8 @@ function normalizeDesktopLayout(value: unknown): DesktopLayout {
 
   return {
     split_category_indices: normalizeSplitIndices(raw.split_category_indices ?? raw.SplitCategoryIndices),
+    locked: asBoolean(raw.locked ?? raw.Locked),
+    click_through: asBoolean(raw.click_through ?? raw.ClickThrough),
     windows,
   }
 }
@@ -818,6 +812,8 @@ interface DustDeskState {
   renameCategory: () => Promise<void>
   deleteCategory: () => Promise<void>
   toggleCategory: () => Promise<void>
+  reorderCategory: (fromIndex: number, toIndex: number) => Promise<void>
+  reorderCategoryLight: (fromIndex: number, toIndex: number) => Promise<void>
   addItemToCategory: (index: number, path: string) => Promise<void>
   addItemsToCategory: (index: number, paths: string[]) => Promise<number>
   addItemsToCategoryLight: (index: number, paths: string[]) => Promise<number>
@@ -852,8 +848,9 @@ interface DustDeskState {
   openSpecial: (target: "organizer" | "launchers" | "data" | "desktop") => Promise<void>
   updateRuntimeDirectory: (target: "organizer" | "launchers" | "data", path: string) => Promise<AppSnapshot>
   openPath: (path: string) => Promise<void>
+  openPathAsAdministrator: (path: string) => Promise<void>
   showPathInFolder: (path: string) => Promise<void>
-  startAllLaunchers: () => Promise<number>
+  startAllLaunchers: (asAdministrator?: boolean) => Promise<number>
   pasteClipboardItem: (id: string) => Promise<void>
   clipboardImageBase64: (id: string) => Promise<string>
   hideClipboardOverlay: () => Promise<void>
@@ -1082,6 +1079,16 @@ export const useDustDeskStore = create<DustDeskState>()(
       await call("toggle_category", { index: get().selectedCategory })
       await get().load()
     },
+    reorderCategory: async (fromIndex, toIndex) => {
+      if (fromIndex === toIndex) return
+      await call("reorder_category", { fromIndex, toIndex })
+      await get().load({ force: true })
+    },
+    reorderCategoryLight: async (fromIndex, toIndex) => {
+      if (fromIndex === toIndex) return
+      await call("reorder_category", { fromIndex, toIndex })
+      await get().loadDesktopSnapshot({ force: true, preserveDesktopItems: true })
+    },
     addItemToCategory: async (index, path) => {
       await call("add_item_to_category", { index, path })
       await get().load()
@@ -1280,13 +1287,16 @@ export const useDustDeskStore = create<DustDeskState>()(
     openPath: async (path) => {
       await call("open_path", { path })
     },
+    openPathAsAdministrator: async (path) => {
+      await call("open_path_as_administrator", { path })
+    },
     showPathInFolder: async (path) => {
       await call("show_path_in_folder", { path })
     },
-    startAllLaunchers: async () => {
+    startAllLaunchers: async (asAdministrator = false) => {
       const count = get().snapshot.launchers.length
       if (count === 0) return 0
-      return call<number>("start_all_launchers")
+      return call<number>(asAdministrator ? "start_all_launchers_as_administrator" : "start_all_launchers")
     },
     pasteClipboardItem: async (id) => {
       await call("paste_clipboard_item", { id })

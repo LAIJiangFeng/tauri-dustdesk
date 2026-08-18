@@ -1,6 +1,7 @@
-import { useDeferredValue, useEffect, useRef, useState, type DragEvent as ReactDragEvent, type ReactNode } from "react"
-import { Archive, ArrowsClockwise, CaretRight, CheckCircle, Columns, Desktop, FolderOpen, MagnifyingGlass, PencilSimple, Plus, RocketLaunch, Trash, X } from "@phosphor-icons/react"
+import { useDeferredValue, useEffect, useRef, useState, type DragEvent as ReactDragEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from "react"
+import { Archive, ArrowsClockwise, CaretRight, CheckCircle, Columns, Desktop, DotsSixVertical, FolderOpen, MagnifyingGlass, PencilSimple, Plus, RocketLaunch, Trash, X } from "@phosphor-icons/react"
 import { EmptyState } from "@/components/dustdesk/empty-state"
+import { DesktopWidgetViewModeControl } from "@/components/dustdesk/desktop-widget-view-mode-control"
 import { FileIcon } from "@/components/dustdesk/file-icon"
 import { ItemContextMenu, type ItemContextMenuAction } from "@/components/dustdesk/item-context-menu"
 import { Badge } from "@/components/ui/badge"
@@ -17,6 +18,7 @@ import {
   type DesktopDropPosition,
   writeDustDeskPathDrag,
 } from "@/lib/dustdesk-dnd"
+import { desktopWidgetCategoryViewScope } from "@/lib/desktop-widget-settings"
 import { safeCurrentWebviewDragDropEvent, safeListen } from "@/lib/tauri-window"
 import { cn, displayPathName } from "@/lib/utils"
 import { useDustDeskStore } from "@/stores/dustdesk-store"
@@ -32,6 +34,7 @@ export function OrganizerPage() {
   const createCategory = useDustDeskStore((state) => state.createCategory)
   const renameCategory = useDustDeskStore((state) => state.renameCategory)
   const deleteCategory = useDustDeskStore((state) => state.deleteCategory)
+  const reorderCategory = useDustDeskStore((state) => state.reorderCategory)
   const openSpecial = useDustDeskStore((state) => state.openSpecial)
   const loadDesktopSnapshot = useDustDeskStore((state) => state.loadDesktopSnapshot)
   const startClassifyDesktopItemsTask = useDustDeskStore((state) => state.startClassifyDesktopItemsTask)
@@ -39,16 +42,28 @@ export function OrganizerPage() {
   const getDesktopOperationStatus = useDustDeskStore((state) => state.getDesktopOperationStatus)
   const addItemsToCategoryLight = useDustDeskStore((state) => state.addItemsToCategoryLight)
   const restoreItemToDesktop = useDustDeskStore((state) => state.restoreItemToDesktop)
-  const desktopFrames = useDustDeskStore((state) => state.desktopFrames)
-  const refreshDesktopFrameVisibility = useDustDeskStore((state) => state.refreshDesktopFrameVisibility)
-  const toggleDesktopOrganizerFrame = useDustDeskStore((state) => state.toggleDesktopOrganizerFrame)
   const mergeDesktopWidgets = useDustDeskStore((state) => state.mergeDesktopWidgets)
   const [query, setQuery] = useState("")
   const [notice, setNotice] = useState<string | null>(null)
   const [isClassifyingDesktop, setIsClassifyingDesktop] = useState(false)
   const [isRestoringDesktop, setIsRestoringDesktop] = useState(false)
   const [isMergingCategories, setIsMergingCategories] = useState(false)
+  const [isReorderingCategory, setIsReorderingCategory] = useState(false)
+  const [draggingCategoryIndex, setDraggingCategoryIndex] = useState<number | null>(null)
+  const [categoryDropTargetIndex, setCategoryDropTargetIndex] = useState<number | null>(null)
   const [dropOperationLabel, setDropOperationLabel] = useState("")
+  const categoryScrollAreaRef = useRef<HTMLDivElement>(null)
+  const categoryPointerRef = useRef<{
+    pointerId: number
+    sourceIndex: number
+    startX: number
+    startY: number
+    dragging: boolean
+  } | null>(null)
+  const categoryDropTargetIndexRef = useRef<number | null>(null)
+  const categoryPointerYRef = useRef(0)
+  const categoryAutoScrollFrameRef = useRef<number | null>(null)
+  const suppressCategoryClickUntilRef = useRef(0)
   const desktopOperationRef = useRef<{
     kind: DesktopOperationEvent["kind"] | null
     scope: DesktopOperationEvent["scope"] | null
@@ -65,9 +80,7 @@ export function OrganizerPage() {
         ? "正在合并分类..."
         : dropOperationLabel
   const category = snapshot.categories[selectedCategory]
-  const desktopItems = deferredQuery
-    ? snapshot.desktop_items.filter((item) => `${item.name} ${item.path} ${item.extension}`.toLowerCase().includes(deferredQuery))
-    : snapshot.desktop_items
+  const desktopItems = deferredQuery ? snapshot.desktop_items.filter((item) => `${item.name} ${item.path} ${item.extension}`.toLowerCase().includes(deferredQuery)) : snapshot.desktop_items
   const handleClassifyDesktopItems = async () => {
     if (isClassifyingDesktop) return
     beginDesktopOperation("classify", "manual")
@@ -114,8 +127,12 @@ export function OrganizerPage() {
   }
 
   useEffect(() => {
-    void refreshDesktopFrameVisibility()
-  }, [refreshDesktopFrameVisibility])
+    return () => {
+      if (categoryAutoScrollFrameRef.current !== null) {
+        window.cancelAnimationFrame(categoryAutoScrollFrameRef.current)
+      }
+    }
+  }, [])
 
   useEffect(() => {
     let unlisten: (() => void) | undefined
@@ -185,6 +202,137 @@ export function OrganizerPage() {
     } finally {
       setDropOperationLabel("")
     }
+  }
+
+  async function handleCategoryReorder(fromIndex: number, toIndex: number) {
+    if (isReorderingCategory || fromIndex === toIndex) return
+    const categoryName = snapshot.categories[fromIndex]?.name ?? "分类"
+    setIsReorderingCategory(true)
+    try {
+      await reorderCategory(fromIndex, toIndex)
+      setNotice(`已调整「${categoryName}」的分类顺序`)
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : String(error))
+    } finally {
+      setIsReorderingCategory(false)
+    }
+  }
+
+  function handleCategoryPointerDown(event: ReactPointerEvent<HTMLButtonElement>, sourceIndex: number) {
+    if (event.button !== 0 || !event.isPrimary || isReorderingCategory || snapshot.categories.length < 2) return
+
+    finishCategoryPointerInteraction()
+    categoryPointerRef.current = {
+      pointerId: event.pointerId,
+      sourceIndex,
+      startX: event.clientX,
+      startY: event.clientY,
+      dragging: false,
+    }
+    categoryPointerYRef.current = event.clientY
+    event.currentTarget.setPointerCapture(event.pointerId)
+  }
+
+  function handleCategoryPointerMove(event: ReactPointerEvent<HTMLButtonElement>) {
+    const pointer = categoryPointerRef.current
+    if (!pointer || pointer.pointerId !== event.pointerId) return
+
+    categoryPointerYRef.current = event.clientY
+    if (!pointer.dragging) {
+      const deltaX = Math.abs(event.clientX - pointer.startX)
+      const deltaY = Math.abs(event.clientY - pointer.startY)
+      if (deltaY < 6 || deltaY < deltaX) return
+
+      pointer.dragging = true
+      categoryDropTargetIndexRef.current = pointer.sourceIndex
+      setDraggingCategoryIndex(pointer.sourceIndex)
+      setCategoryDropTargetIndex(pointer.sourceIndex)
+    }
+
+    event.preventDefault()
+    updateCategoryPointerTarget(event.clientY)
+    scheduleCategoryAutoScroll()
+  }
+
+  function handleCategoryPointerUp(event: ReactPointerEvent<HTMLButtonElement>) {
+    const pointer = categoryPointerRef.current
+    if (!pointer || pointer.pointerId !== event.pointerId) return
+
+    const sourceIndex = pointer.sourceIndex
+    const targetIndex = categoryDropTargetIndexRef.current
+    const wasDragging = pointer.dragging
+    finishCategoryPointerInteraction()
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId)
+    }
+    if (!wasDragging) return
+
+    event.preventDefault()
+    suppressCategoryClickUntilRef.current = Date.now() + 600
+    if (targetIndex !== null && sourceIndex !== targetIndex) {
+      void handleCategoryReorder(sourceIndex, targetIndex)
+    }
+  }
+
+  function handleCategoryPointerCancel(event: ReactPointerEvent<HTMLButtonElement>) {
+    const pointer = categoryPointerRef.current
+    if (!pointer || pointer.pointerId !== event.pointerId) return
+    if (pointer.dragging) suppressCategoryClickUntilRef.current = Date.now() + 600
+    finishCategoryPointerInteraction()
+  }
+
+  function handleCategoryPointerCaptureLost(event: ReactPointerEvent<HTMLButtonElement>) {
+    const pointer = categoryPointerRef.current
+    if (!pointer || pointer.pointerId !== event.pointerId) return
+    if (pointer.dragging) suppressCategoryClickUntilRef.current = Date.now() + 600
+    finishCategoryPointerInteraction()
+  }
+
+  function finishCategoryPointerInteraction() {
+    if (categoryAutoScrollFrameRef.current !== null) {
+      window.cancelAnimationFrame(categoryAutoScrollFrameRef.current)
+      categoryAutoScrollFrameRef.current = null
+    }
+    categoryPointerRef.current = null
+    categoryDropTargetIndexRef.current = null
+    setDraggingCategoryIndex(null)
+    setCategoryDropTargetIndex(null)
+  }
+
+  function updateCategoryPointerTarget(clientY: number) {
+    const container = categoryScrollAreaRef.current
+    if (!container) return
+    const targetIndex = categoryIndexFromDragPoint(container, clientY)
+    if (targetIndex === null || categoryDropTargetIndexRef.current === targetIndex) return
+    categoryDropTargetIndexRef.current = targetIndex
+    setCategoryDropTargetIndex(targetIndex)
+  }
+
+  function scheduleCategoryAutoScroll() {
+    if (categoryAutoScrollFrameRef.current !== null) return
+    categoryAutoScrollFrameRef.current = window.requestAnimationFrame(() => {
+      categoryAutoScrollFrameRef.current = null
+      if (!categoryPointerRef.current?.dragging) return
+      const didScroll = scrollCategoryListDuringDrag(categoryPointerYRef.current)
+      updateCategoryPointerTarget(categoryPointerYRef.current)
+      if (didScroll) scheduleCategoryAutoScroll()
+    })
+  }
+
+  function scrollCategoryListDuringDrag(clientY: number) {
+    const viewport = categoryScrollAreaRef.current?.querySelector<HTMLElement>("[data-slot='scroll-area-viewport']")
+    if (!viewport) return false
+    const bounds = viewport.getBoundingClientRect()
+    const edgeSize = Math.min(72, bounds.height * 0.22)
+    const previousScrollTop = viewport.scrollTop
+    if (clientY < bounds.top + edgeSize) {
+      const intensity = Math.min(1, (bounds.top + edgeSize - clientY) / edgeSize)
+      viewport.scrollTop -= Math.ceil(8 + intensity * 24)
+    } else if (clientY > bounds.bottom - edgeSize) {
+      const intensity = Math.min(1, (clientY - (bounds.bottom - edgeSize)) / edgeSize)
+      viewport.scrollTop += Math.ceil(8 + intensity * 24)
+    }
+    return viewport.scrollTop !== previousScrollTop
   }
 
   async function finishClassifyOperation(payload: DesktopOperationEvent) {
@@ -315,23 +463,51 @@ export function OrganizerPage() {
             </Button>
           </div>
 
-          <ScrollArea className="min-h-0 flex-1 pr-2">
+          <ScrollArea ref={categoryScrollAreaRef} className="min-h-0 flex-1 pr-2">
             <div className="grid gap-2">
               {snapshot.categories.map((item, index) => (
-                <Button
-                  key={`${item.name}-${index}`}
-                  variant={selectedCategory === index ? "default" : "outline"}
-                  className="h-auto justify-start gap-3 p-3 text-left"
-                  onClick={() => selectCategory(index)}
-                >
-                  <span className="min-w-0 flex-1">
-                    <span className="block truncate font-medium">{item.name}</span>
-                    <span className={cn("block text-xs", selectedCategory === index ? "text-primary-foreground/70" : "text-muted-foreground")}>
-                      {item.item_paths.length} 个项目
+                <div key={`${item.name}-${index}`} data-category-index={index} className="relative">
+                  {categoryDropTargetIndex === index && draggingCategoryIndex !== index ? (
+                    <span
+                      className={cn(
+                        "pointer-events-none absolute inset-x-1 z-10 h-0.5 rounded-full bg-primary",
+                        draggingCategoryIndex !== null && draggingCategoryIndex < index ? "-bottom-1.5" : "-top-1.5",
+                      )}
+                    />
+                  ) : null}
+                  <Button
+                    variant={selectedCategory === index ? "default" : "outline"}
+                    className={cn("h-auto w-full cursor-grab touch-none justify-start gap-2 p-3 text-left active:cursor-grabbing", draggingCategoryIndex === index && "cursor-grabbing opacity-45")}
+                    aria-grabbed={draggingCategoryIndex === index}
+                    title="按住并上下拖动调整分类顺序，或按 Alt + 上下方向键移动"
+                    onClick={(event) => {
+                      if (Date.now() < suppressCategoryClickUntilRef.current) {
+                        event.preventDefault()
+                        return
+                      }
+                      selectCategory(index)
+                    }}
+                    onPointerDown={(event) => handleCategoryPointerDown(event, index)}
+                    onPointerMove={handleCategoryPointerMove}
+                    onPointerUp={handleCategoryPointerUp}
+                    onPointerCancel={handleCategoryPointerCancel}
+                    onLostPointerCapture={handleCategoryPointerCaptureLost}
+                    onKeyDown={(event) => {
+                      if (!event.altKey || (event.key !== "ArrowUp" && event.key !== "ArrowDown")) return
+                      event.preventDefault()
+                      const toIndex = event.key === "ArrowUp" ? index - 1 : index + 1
+                      if (toIndex < 0 || toIndex >= snapshot.categories.length) return
+                      void handleCategoryReorder(index, toIndex)
+                    }}
+                  >
+                    <DotsSixVertical className="size-4 shrink-0 opacity-55" weight="bold" />
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate font-medium">{item.name}</span>
+                      <span className={cn("block text-xs", selectedCategory === index ? "text-primary-foreground/70" : "text-muted-foreground")}>{item.item_paths.length} 个项目</span>
                     </span>
-                  </span>
-                  <CaretRight className="size-4 shrink-0" weight="bold" />
-                </Button>
+                    <CaretRight className="size-4 shrink-0" weight="bold" />
+                  </Button>
+                </div>
               ))}
             </div>
           </ScrollArea>
@@ -352,13 +528,9 @@ export function OrganizerPage() {
           </div>
         </CardHeader>
         <CardContent className="flex min-h-0 flex-col gap-4">
-          <div className="grid grid-cols-2 gap-2 2xl:grid-cols-5">
+          <div className="grid grid-cols-2 gap-2 2xl:grid-cols-4">
             <Button variant="secondary" size="sm" onClick={() => void openSpecial("organizer")}>
               打开收纳箱
-            </Button>
-            <Button variant="secondary" size="sm" onClick={() => void toggleDesktopOrganizerFrame()}>
-              <Desktop className="size-3.5" weight="duotone" />
-              {desktopFrames.organizer ? "隐藏收纳桌面框" : "显示收纳桌面框"}
             </Button>
             <Button variant="secondary" size="sm" disabled={isMergingCategories} onClick={() => void handleMergeAllCategories()}>
               <Columns className="size-3.5" weight="duotone" />
@@ -399,7 +571,10 @@ export function OrganizerPage() {
           <div>
             <CardTitle>{category?.name ?? "分类内容"}</CardTitle>
           </div>
-          <Badge variant="secondary">{category?.item_paths.length ?? 0} 项</Badge>
+          <div className="flex flex-wrap items-center gap-2">
+            {category ? <DesktopWidgetViewModeControl scope={desktopWidgetCategoryViewScope(category.name, selectedCategory)} label={`${category.name}桌面框排版`} /> : null}
+            <Badge variant="secondary">{category?.item_paths.length ?? 0} 项</Badge>
+          </div>
         </CardHeader>
         <CardContent className="flex min-h-0 flex-col gap-4">
           <ScrollArea className="min-h-0 flex-1 pr-2">
@@ -666,6 +841,25 @@ function classifyResultFromOperation(payload: DesktopOperationEvent) {
     skipped: payload.skipped,
     category_counts: payload.category_counts ?? [],
   }
+}
+
+function categoryIndexFromDragPoint(container: HTMLElement, clientY: number) {
+  const categories = Array.from(container.querySelectorAll<HTMLElement>("[data-category-index]"))
+  if (categories.length === 0) return null
+
+  let closestIndex = Number(categories[0].dataset.categoryIndex)
+  let closestDistance = Number.POSITIVE_INFINITY
+  for (const category of categories) {
+    const index = Number(category.dataset.categoryIndex)
+    if (!Number.isInteger(index)) continue
+    const bounds = category.getBoundingClientRect()
+    const distance = Math.abs(clientY - (bounds.top + bounds.bottom) / 2)
+    if (distance < closestDistance) {
+      closestIndex = index
+      closestDistance = distance
+    }
+  }
+  return Number.isInteger(closestIndex) ? closestIndex : null
 }
 
 function writeSplitCategoryIndices(indices: number[]) {

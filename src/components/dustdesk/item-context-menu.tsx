@@ -1,4 +1,4 @@
-import { FolderOpen, RocketLaunch, Trash, UploadSimple } from "@phosphor-icons/react"
+import { FolderOpen, RocketLaunch, ShieldCheck, Trash, UploadSimple } from "@phosphor-icons/react"
 import { useLayoutEffect, useRef, useState } from "react"
 import { createPortal } from "react-dom"
 import { cn } from "@/lib/utils"
@@ -6,7 +6,7 @@ import { cn } from "@/lib/utils"
 export interface ItemContextMenuAction {
   label: string
   tone?: "default" | "danger"
-  icon?: "open" | "folder" | "restore" | "remove"
+  icon?: "open" | "admin" | "folder" | "restore" | "remove"
   onSelect: () => void | Promise<void>
 }
 
@@ -19,6 +19,7 @@ interface ItemContextMenuProps {
 
 const actionIcons = {
   open: RocketLaunch,
+  admin: ShieldCheck,
   folder: FolderOpen,
   restore: UploadSimple,
   remove: Trash,

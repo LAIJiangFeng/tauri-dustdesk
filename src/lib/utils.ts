@@ -43,3 +43,10 @@ export function extensionFromPath(path: string | undefined | null, fallback = "F
 export function formatCount(value: number) {
   return new Intl.NumberFormat("zh-CN").format(value)
 }
+
+export function remapIndexAfterMove(index: number, fromIndex: number, toIndex: number) {
+  if (index === fromIndex) return toIndex
+  if (fromIndex < toIndex && index > fromIndex && index <= toIndex) return index - 1
+  if (fromIndex > toIndex && index >= toIndex && index < fromIndex) return index + 1
+  return index
+}

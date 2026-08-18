@@ -39,7 +39,7 @@ use models::{
 use serde::{Deserialize, Serialize};
 use store::AppStore;
 use tauri::{
-    menu::{Menu, MenuItem},
+    menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     utils::config::Color,
     Emitter, Manager, PhysicalPosition, PhysicalSize, Position, Size, WebviewUrl, WebviewWindow,
@@ -55,9 +55,16 @@ const MAX_LOCKED_TRANSFER_TREE_ENTRIES: usize = 256;
 const ICON_DATA_CACHE_LIMIT: usize = 1024;
 const ICON_FAILURE_CACHE_LIMIT: usize = 1024;
 const ICON_FAILURE_CACHE_TTL: Duration = Duration::from_millis(750);
+#[cfg(not(test))]
+const DIAGNOSTIC_LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
 const TRAY_MENU_SHOW_MAIN: &str = "show-main-window";
+const TRAY_MENU_DESKTOP_VISIBLE: &str = "desktop-frames-visible";
+const TRAY_MENU_DESKTOP_LOCKED: &str = "desktop-frames-locked";
+const TRAY_MENU_DESKTOP_CLICK_THROUGH: &str = "desktop-frames-click-through";
 const TRAY_MENU_QUIT: &str = "quit-app";
 const DESKTOP_OPERATION_EVENT: &str = "dustdesk://desktop-operation";
+const CATEGORY_ORDER_CHANGED_EVENT: &str = "dustdesk://category-order-changed";
+const DESKTOP_WINDOW_STATE_CHANGED_EVENT: &str = "dustdesk://desktop-window-state-changed";
 const DESKTOP_ORGANIZATION_RESTART_SCHEMA_VERSION: u32 = 1;
 const UPDATE_RELEASE_API_URL: &str =
     "https://api.github.com/repos/LAIJiangFeng/tauri-dustdesk/releases/latest";
@@ -73,6 +80,8 @@ static WEBVIEW_WINDOW_CREATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static ICON_DATA_URL_CACHE: OnceLock<Mutex<BTreeMap<String, String>>> = OnceLock::new();
 static ICON_FAILURE_CACHE: OnceLock<Mutex<BTreeMap<String, Instant>>> = OnceLock::new();
 static ICON_RESOLUTION_LOCKS: OnceLock<Mutex<BTreeMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+#[cfg(not(test))]
+static DIAGNOSTIC_LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static STARTUP_RECOVERY_STATE: OnceLock<(Mutex<Option<Result<(), String>>>, Condvar)> =
     OnceLock::new();
 static REAL_EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -81,12 +90,32 @@ static DESKTOP_OPERATION_RUNNING: AtomicBool = AtomicBool::new(false);
 static DESKTOP_WINDOW_SETTLE_SCHEDULED: AtomicBool = AtomicBool::new(false);
 static DESKTOP_WINDOW_SETTLE_GENERATION: AtomicU64 = AtomicU64::new(0);
 static DESKTOP_OPERATION_LAST: OnceLock<Mutex<Option<DesktopOperationPayload>>> = OnceLock::new();
+static TRAY_MENU_ITEMS: OnceLock<TrayMenuItems> = OnceLock::new();
+
+#[derive(Clone)]
+struct TrayMenuItems {
+    desktop_visible: CheckMenuItem<tauri::Wry>,
+    desktop_locked: CheckMenuItem<tauri::Wry>,
+    desktop_click_through: CheckMenuItem<tauri::Wry>,
+}
 
 #[derive(Debug, Clone, Copy, Serialize)]
 struct DesktopFrameVisibility {
     organizer: bool,
     launcher: bool,
     any: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+struct DesktopWindowState {
+    locked: bool,
+    click_through: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+struct CategoryOrderChangedPayload {
+    from_index: usize,
+    to_index: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -456,6 +485,144 @@ fn toggle_category(app: tauri::AppHandle, index: usize) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn reorder_category(
+    app: tauri::AppHandle,
+    from_index: usize,
+    to_index: usize,
+) -> Result<usize, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        with_lazy_window_operation(|| reorder_category_impl(&app, from_index, to_index))
+    })
+    .await
+    .map_err(to_message)?
+}
+
+fn reorder_category_impl(
+    app: &tauri::AppHandle,
+    from_index: usize,
+    to_index: usize,
+) -> Result<usize, String> {
+    let desktop_organizer_was_visible = app.webview_windows().values().any(|window| {
+        window.is_visible().unwrap_or(false)
+            && (window.label() == "desktop-widget"
+                || desktop_category_index_from_label(window.label()).is_some())
+    });
+
+    let (categories, split_category_indices) = with_config_mutation(|| {
+        let store = AppStore::open().map_err(to_message)?;
+        let mut config = store.load_config_strict().map_err(to_message)?;
+        reorder_category_config(&mut config, from_index, to_index)?;
+        let categories = config.desktop_categories.clone();
+        let split_category_indices = config.desktop_layout.split_category_indices.clone();
+        store.save_config(&config).map_err(to_message)?;
+        Ok((categories, split_category_indices))
+    })?;
+
+    if from_index != to_index {
+        reconcile_reordered_category_windows(
+            app,
+            &categories,
+            &split_category_indices,
+            desktop_organizer_was_visible,
+        )?;
+    }
+
+    let payload = CategoryOrderChangedPayload {
+        from_index,
+        to_index,
+    };
+    let _ = app.emit(CATEGORY_ORDER_CHANGED_EVENT, payload);
+    emit_desktop_cards_changed(app);
+    Ok(to_index)
+}
+
+fn reconcile_reordered_category_windows(
+    app: &tauri::AppHandle,
+    categories: &[DeskCategory],
+    split_category_indices: &[usize],
+    desktop_organizer_was_visible: bool,
+) -> Result<(), String> {
+    for window in app.webview_windows().values() {
+        let Some(index) = desktop_category_index_from_label(window.label()) else {
+            continue;
+        };
+        if !desktop_organizer_was_visible || !split_category_indices.contains(&index) {
+            window.hide().map_err(to_message)?;
+        }
+    }
+
+    if !desktop_organizer_was_visible {
+        return Ok(());
+    }
+
+    for index in split_category_indices.iter().copied() {
+        let category = categories
+            .get(index)
+            .ok_or_else(|| "分类不存在".to_owned())?;
+        let label = desktop_category_label(index);
+        let title = format!("DustDesk {}", category.name);
+        let url = desktop_card_url("category", Some(index));
+        show_or_create_desktop_card(app, &label, &title, &url, index)?;
+    }
+    Ok(())
+}
+
+fn reorder_category_config(
+    config: &mut AppConfig,
+    from_index: usize,
+    to_index: usize,
+) -> Result<(), String> {
+    let category_count = config.desktop_categories.len();
+    if from_index >= category_count || to_index >= category_count {
+        return Err("分类不存在".to_owned());
+    }
+    if from_index == to_index {
+        return Ok(());
+    }
+
+    let category = config.desktop_categories.remove(from_index);
+    config.desktop_categories.insert(to_index, category);
+    config.desktop_layout.split_category_indices = normalize_desktop_split_indices(
+        config
+            .desktop_layout
+            .split_category_indices
+            .iter()
+            .copied()
+            .map(|index| remap_category_index(index, from_index, to_index))
+            .collect(),
+        category_count,
+    );
+
+    let previous_layouts = std::mem::take(&mut config.desktop_layout.windows);
+    config.desktop_layout.windows = previous_layouts
+        .into_iter()
+        .map(|(label, layout)| {
+            let mapped_label = desktop_category_index_from_label(&label)
+                .filter(|index| desktop_category_label(*index) == label)
+                .map(|index| {
+                    desktop_category_label(remap_category_index(index, from_index, to_index))
+                })
+                .unwrap_or(label);
+            (mapped_label, layout)
+        })
+        .collect();
+    Ok(())
+}
+
+fn remap_category_index(index: usize, from_index: usize, to_index: usize) -> usize {
+    if index == from_index {
+        return to_index;
+    }
+    if from_index < to_index && index > from_index && index <= to_index {
+        return index - 1;
+    }
+    if from_index > to_index && index >= to_index && index < from_index {
+        return index + 1;
+    }
+    index
+}
+
+#[tauri::command]
 async fn add_item_to_category(
     app: tauri::AppHandle,
     index: usize,
@@ -817,8 +984,15 @@ fn classify_desktop_items_impl() -> Result<ClassifyResult, String> {
 fn classify_desktop_items_with_progress(
     mut on_progress: impl FnMut(usize, usize, &Path, usize, usize),
 ) -> Result<ClassifyResult, String> {
-    with_config_mutation(|| {
-        let overall_started = Instant::now();
+    let overall_started = Instant::now();
+    append_desktop_diagnostic(
+        "classify_task_started",
+        &format!(
+            "current_exe=\"{}\"",
+            diagnostic_value(&current_exe_diagnostic_value())
+        ),
+    );
+    let result = with_config_mutation(|| {
         let store = AppStore::open().map_err(to_message)?;
         store.ensure_runtime_dirs().map_err(to_message)?;
         recover_transfer_quarantine_journals_strict(true)?;
@@ -978,6 +1152,10 @@ fn classify_desktop_items_with_progress(
                     ClassifyWorkerMessage::Failed(error) => {
                         handled += 1;
                         skipped += 1;
+                        append_desktop_diagnostic(
+                            "classify_worker_failed",
+                            &format!("error=\"{}\"", diagnostic_value(&error)),
+                        );
                         eprintln!("failed to classify desktop item: {error}");
                         continue;
                     }
@@ -1074,7 +1252,27 @@ fn classify_desktop_items_with_progress(
                 })
                 .collect(),
         })
-    })
+    });
+    match &result {
+        Ok(result) => append_desktop_diagnostic(
+            "classify_task_finished",
+            &format!(
+                "elapsed_ms={} moved={} skipped={}",
+                overall_started.elapsed().as_millis(),
+                result.moved,
+                result.skipped
+            ),
+        ),
+        Err(error) => append_desktop_diagnostic(
+            "classify_task_failed",
+            &format!(
+                "elapsed_ms={} error=\"{}\"",
+                overall_started.elapsed().as_millis(),
+                diagnostic_value(error)
+            ),
+        ),
+    }
+    result
 }
 
 #[tauri::command]
@@ -1527,7 +1725,22 @@ fn runtime_migration_copy_pairs(journal: &RuntimeMigrationJournal) -> Vec<(PathB
 #[tauri::command]
 async fn open_path(app: tauri::AppHandle, path: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        open_path_impl(Path::new(&path))?;
+        let path = Path::new(&path);
+        repair_dustdesk_shortcut_if_needed(path)?;
+        open_path_impl(path)?;
+        settle_desktop_windows_after_launch(&app);
+        Ok(())
+    })
+    .await
+    .map_err(to_message)?
+}
+
+#[tauri::command]
+async fn open_path_as_administrator(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = Path::new(&path);
+        repair_dustdesk_shortcut_if_needed(path)?;
+        open_path_as_administrator_impl(path)?;
         settle_desktop_windows_after_launch(&app);
         Ok(())
     })
@@ -1545,6 +1758,7 @@ async fn start_all_launchers(app: tauri::AppHandle) -> Result<usize, String> {
             if launcher.path.trim().is_empty() {
                 continue;
             }
+            repair_dustdesk_shortcut_if_needed(Path::new(&launcher.path))?;
             open_with_shell(&launcher.path)?;
             keep_desktop_windows_behind_apps(&app);
             count += 1;
@@ -1553,6 +1767,32 @@ async fn start_all_launchers(app: tauri::AppHandle) -> Result<usize, String> {
             settle_desktop_windows_after_launch(&app);
         }
         Ok(count)
+    })
+    .await
+    .map_err(to_message)?
+}
+
+#[tauri::command]
+async fn start_all_launchers_as_administrator(app: tauri::AppHandle) -> Result<usize, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = AppStore::open().map_err(to_message)?;
+        let launchers = store.load_launchers();
+        let mut paths = Vec::new();
+        for launcher in launchers.items {
+            if launcher.path.trim().is_empty() {
+                continue;
+            }
+            let path = PathBuf::from(&launcher.path);
+            repair_dustdesk_shortcut_if_needed(&path)?;
+            paths.push(path);
+        }
+        if paths.is_empty() {
+            return Ok(0);
+        }
+
+        open_paths_as_administrator(&paths)?;
+        settle_desktop_windows_after_launch(&app);
+        Ok(paths.len())
     })
     .await
     .map_err(to_message)?
@@ -1570,6 +1810,37 @@ async fn desktop_frame_visibility(app: tauri::AppHandle) -> Result<DesktopFrameV
     tauri::async_runtime::spawn_blocking(move || Ok(desktop_frame_visibility_impl(&app)))
         .await
         .map_err(to_message)?
+}
+
+#[tauri::command]
+async fn desktop_window_state() -> Result<DesktopWindowState, String> {
+    tauri::async_runtime::spawn_blocking(load_desktop_window_state)
+        .await
+        .map_err(to_message)?
+}
+
+#[tauri::command]
+async fn set_desktop_windows_locked(
+    app: tauri::AppHandle,
+    locked: bool,
+) -> Result<DesktopWindowState, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        set_desktop_window_state_impl(&app, Some(locked), None)
+    })
+    .await
+    .map_err(to_message)?
+}
+
+#[tauri::command]
+async fn set_desktop_windows_click_through(
+    app: tauri::AppHandle,
+    click_through: bool,
+) -> Result<DesktopWindowState, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        set_desktop_window_state_impl(&app, None, Some(click_through))
+    })
+    .await
+    .map_err(to_message)?
 }
 
 #[tauri::command]
@@ -1630,6 +1901,9 @@ async fn save_desktop_window_layout(app: tauri::AppHandle, label: String) -> Res
         let Some(window) = app.get_webview_window(&label) else {
             return Ok(());
         };
+        if window.is_maximized().unwrap_or(false) {
+            return Ok(());
+        }
         let position = window.outer_position().map_err(to_message)?;
         let size = window.inner_size().map_err(to_message)?;
         if size.width < 120 || size.height < 100 {
@@ -1962,6 +2236,7 @@ async fn open_search_item(app: tauri::AppHandle, item: SearchItem) -> Result<(),
         if path.is_empty() {
             return Err("路径为空".to_owned());
         }
+        repair_dustdesk_shortcut_if_needed(Path::new(path))?;
 
         if item.kind == SearchItemKind::Directory || item.is_dir {
             open_path_impl(Path::new(path))?;
@@ -1995,9 +2270,16 @@ async fn hide_search_overlay(app: tauri::AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 async fn hide_current_window(window: WebviewWindow) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || window.hide().map_err(to_message))
-        .await
-        .map_err(to_message)?
+    tauri::async_runtime::spawn_blocking(move || {
+        let is_desktop_window = is_desktop_card_window_label(window.label());
+        window.hide().map_err(to_message)?;
+        if is_desktop_window {
+            sync_system_tray_menu(window.app_handle());
+        }
+        Ok(())
+    })
+    .await
+    .map_err(to_message)?
 }
 
 #[tauri::command]
@@ -2761,6 +3043,7 @@ fn recollect_marked_desktop_item(
     fs::create_dir_all(parent).map_err(to_message)?;
     move_path(desktop_source, original_source)?;
     notify_shell_path_moved(desktop_source, original_source);
+    repair_dustdesk_shortcut_best_effort(original_source);
     Ok(original_source.display().to_string())
 }
 
@@ -3663,6 +3946,7 @@ fn launcher_items_from_directory(
         if file_name.eq_ignore_ascii_case("desktop.ini") {
             continue;
         }
+        repair_dustdesk_shortcut_best_effort(&path);
 
         let path_text = path.display().to_string();
         let name = previous_names
@@ -4462,6 +4746,165 @@ fn is_app_desktop_entry(lower_name: &str, extension: &str) -> bool {
     )
 }
 
+fn is_windows_shortcut_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("lnk"))
+}
+
+fn is_dustdesk_shortcut_name(path: &Path) -> bool {
+    let compact_name = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .chars()
+        .filter(|ch| !ch.is_whitespace() && !matches!(ch, '-' | '_'))
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    matches!(
+        compact_name.as_str(),
+        "dustdesk"
+            | "dustdesk快捷方式"
+            | "dustdusk"
+            | "dustdusk快捷方式"
+            | "desknest"
+            | "desknest快捷方式"
+    )
+}
+
+fn is_dustdesk_executable_target(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            matches!(
+                name.to_ascii_lowercase().as_str(),
+                "dustdesk-tauri.exe" | "dustdesk.exe" | "dustdusk.exe" | "desknest.exe"
+            )
+        })
+}
+
+fn is_dustdesk_shortcut(path: &Path, target: Option<&Path>) -> bool {
+    is_windows_shortcut_path(path)
+        && (is_dustdesk_shortcut_name(path) || target.is_some_and(is_dustdesk_executable_target))
+}
+
+fn dustdesk_shortcut_target_needs_repair(target: Option<&Path>, current_exe: &Path) -> bool {
+    match target {
+        None => true,
+        Some(target) if same_path_for_move(target, current_exe) => false,
+        Some(target) => {
+            !target.exists()
+                || is_dustdesk_executable_target(target)
+                || is_likely_temporary_directory(target)
+        }
+    }
+}
+
+fn is_likely_temporary_directory(path: &Path) -> bool {
+    env::var_os("TEMP")
+        .into_iter()
+        .chain(env::var_os("TMP"))
+        .map(PathBuf::from)
+        .any(|root| is_path_within(path, &root))
+}
+
+fn repair_dustdesk_shortcut_if_needed(path: &Path) -> Result<bool, String> {
+    if !is_windows_shortcut_path(path) || !path.exists() {
+        return Ok(false);
+    }
+    let current_exe =
+        env::current_exe().map_err(|error| format!("无法定位当前 DustDesk 程序：{error}"))?;
+    repair_dustdesk_shortcut_target(path, &current_exe)
+}
+
+fn repair_dustdesk_shortcut_best_effort(path: &Path) {
+    if let Err(error) = repair_dustdesk_shortcut_if_needed(path) {
+        append_desktop_diagnostic(
+            "shortcut_repair_deferred",
+            &format!(
+                "shortcut=\"{}\" error=\"{}\"",
+                diagnostic_value(&path.display().to_string()),
+                diagnostic_value(&error)
+            ),
+        );
+        eprintln!(
+            "DustDesk 快捷方式暂时无法自动修复 {}：{error}",
+            path.display()
+        );
+    }
+}
+
+fn repair_dustdesk_shortcut_target(path: &Path, current_exe: &Path) -> Result<bool, String> {
+    let old_target = system_icon::shortcut_target_path(path);
+    if !is_dustdesk_shortcut(path, old_target.as_deref()) {
+        return Ok(false);
+    }
+    if !dustdesk_shortcut_target_needs_repair(old_target.as_deref(), current_exe) {
+        return Ok(false);
+    }
+    if !current_exe.is_file() {
+        return Err(format!(
+            "当前 DustDesk 程序不存在，无法修复快捷方式：{}",
+            current_exe.display()
+        ));
+    }
+
+    let old_target_text = old_target
+        .as_deref()
+        .map(|target| target.display().to_string())
+        .unwrap_or_else(|| "<无法读取>".to_owned());
+    append_desktop_diagnostic(
+        "shortcut_repair_started",
+        &format!(
+            "shortcut=\"{}\" old_target=\"{}\" new_target=\"{}\"",
+            diagnostic_value(&path.display().to_string()),
+            diagnostic_value(&old_target_text),
+            diagnostic_value(&current_exe.display().to_string())
+        ),
+    );
+
+    if let Err(error) = system_icon::update_shortcut_target(path, current_exe) {
+        append_desktop_diagnostic(
+            "shortcut_repair_failed",
+            &format!(
+                "shortcut=\"{}\" error=\"{}\"",
+                diagnostic_value(&path.display().to_string()),
+                diagnostic_value(&error)
+            ),
+        );
+        return Err(format!("DustDesk 快捷方式自动修复失败：{error}"));
+    }
+
+    let verified_target = system_icon::shortcut_target_path(path)
+        .ok_or_else(|| format!("修复后仍无法读取 DustDesk 快捷方式目标：{}", path.display()))?;
+    if !same_path_for_move(&verified_target, current_exe) {
+        let error = format!(
+            "修复后的 DustDesk 快捷方式仍指向 {}",
+            verified_target.display()
+        );
+        append_desktop_diagnostic(
+            "shortcut_repair_failed",
+            &format!(
+                "shortcut=\"{}\" error=\"{}\"",
+                diagnostic_value(&path.display().to_string()),
+                diagnostic_value(&error)
+            ),
+        );
+        return Err(error);
+    }
+
+    append_desktop_diagnostic(
+        "shortcut_repair_finished",
+        &format!(
+            "shortcut=\"{}\" old_target=\"{}\" new_target=\"{}\"",
+            diagnostic_value(&path.display().to_string()),
+            diagnostic_value(&old_target_text),
+            diagnostic_value(&verified_target.display().to_string())
+        ),
+    );
+    Ok(true)
+}
+
 fn classify_desktop_item(item: &DesktopItem, categories: &[DeskCategory]) -> Option<usize> {
     let name = item.name.to_lowercase();
     let extension = item.extension.trim().to_lowercase();
@@ -4666,12 +5109,30 @@ fn has_any(value: &str, keywords: &[&str]) -> bool {
 fn archive_item_path(store: &AppStore, category_name: &str, path: &str) -> Result<String, String> {
     let source = PathBuf::from(path);
     if !source.exists() {
+        append_desktop_diagnostic(
+            "archive_failed",
+            &format!(
+                "source=\"{}\" error=\"源项目不存在\"",
+                diagnostic_value(&source.display().to_string())
+            ),
+        );
         return Err(format!("源项目不存在：{}", source.display()));
     }
 
     let organizer_root = store.organizer_root();
     let category_dir = organizer_root.join(safe_windows_file_name(category_name));
-    validate_archive_source(store, &source, &organizer_root, &category_dir)?;
+    if let Err(error) = validate_archive_source(store, &source, &organizer_root, &category_dir) {
+        append_desktop_diagnostic(
+            "archive_rejected",
+            &format!(
+                "source=\"{}\" category=\"{}\" error=\"{}\"",
+                diagnostic_value(&source.display().to_string()),
+                diagnostic_value(category_name),
+                diagnostic_value(&error)
+            ),
+        );
+        return Err(error);
+    }
     if is_path_within(&source, &category_dir) {
         return Ok(path.to_owned());
     }
@@ -4679,13 +5140,47 @@ fn archive_item_path(store: &AppStore, category_name: &str, path: &str) -> Resul
 
     for _ in 0..1000 {
         let destination = archive_destination(&category_dir, &source)?;
+        append_desktop_diagnostic(
+            "archive_started",
+            &format!(
+                "source=\"{}\" destination=\"{}\" current_exe=\"{}\"",
+                diagnostic_value(&source.display().to_string()),
+                diagnostic_value(&destination.display().to_string()),
+                diagnostic_value(&current_exe_diagnostic_value())
+            ),
+        );
         match move_path(&source, &destination) {
             Ok(()) => {
                 notify_shell_path_moved(&source, &destination);
+                if let Err(error) = repair_dustdesk_shortcut_if_needed(&destination) {
+                    eprintln!(
+                        "failed to repair archived DustDesk shortcut {}: {error}",
+                        destination.display()
+                    );
+                }
+                append_desktop_diagnostic(
+                    "archive_committed",
+                    &format!(
+                        "source=\"{}\" destination=\"{}\"",
+                        diagnostic_value(&source.display().to_string()),
+                        diagnostic_value(&destination.display().to_string())
+                    ),
+                );
                 return Ok(destination.display().to_string());
             }
             Err(error) if error.contains("目标项目已存在") => continue,
-            Err(error) => return Err(error),
+            Err(error) => {
+                append_desktop_diagnostic(
+                    "archive_failed",
+                    &format!(
+                        "source=\"{}\" destination=\"{}\" error=\"{}\"",
+                        diagnostic_value(&source.display().to_string()),
+                        diagnostic_value(&destination.display().to_string()),
+                        diagnostic_value(&error)
+                    ),
+                );
+                return Err(error);
+            }
         }
     }
 
@@ -4698,6 +5193,15 @@ fn validate_archive_source(
     organizer_root: &Path,
     category_dir: &Path,
 ) -> Result<(), String> {
+    let current_exe =
+        env::current_exe().map_err(|error| format!("无法验证 DustDesk 安装目录：{error}"))?;
+    if is_protected_app_runtime_source(source, &current_exe) {
+        return Err(format!(
+            "不能收纳当前 DustDesk 程序或其安装目录：{}",
+            source.display()
+        ));
+    }
+
     let protected_roots = [
         store.data_dir(),
         organizer_root.to_path_buf(),
@@ -4719,6 +5223,10 @@ fn validate_archive_source(
         return Err(format!("不能把目录迁移到其自身内部：{}", source.display()));
     }
     Ok(())
+}
+
+fn is_protected_app_runtime_source(source: &Path, current_exe: &Path) -> bool {
+    same_path_for_move(source, current_exe) || is_target_inside_source(source, current_exe)
 }
 
 fn archive_destination(category_dir: &Path, source: &Path) -> Result<PathBuf, String> {
@@ -4764,6 +5272,7 @@ fn repair_category_item_paths_with_desktop_roots(
                 changed = true;
                 continue;
             }
+            repair_dustdesk_shortcut_best_effort(&source);
             if !same_path_text(&item_path, &source.display().to_string()) {
                 changed = true;
             }
@@ -4821,6 +5330,7 @@ fn repair_category_item_paths_with_desktop_roots(
             if is_desktop_ini_path(&path) || is_internal_transfer_path(&path) {
                 continue;
             }
+            repair_dustdesk_shortcut_best_effort(&path);
 
             let path_text = path.display().to_string();
             if seen_paths
@@ -7068,6 +7578,141 @@ mod tests {
     }
 
     #[test]
+    fn dustdesk_shortcut_detection_does_not_match_unrelated_shortcuts() {
+        assert!(is_dustdesk_shortcut(
+            Path::new(r"C:\Desktop\DustDesk.lnk"),
+            None
+        ));
+        assert!(is_dustdesk_shortcut(
+            Path::new(r"C:\Desktop\任意名称.lnk"),
+            Some(Path::new(r"D:\OldDustDesk\dustdesk-tauri.exe"))
+        ));
+        assert!(!is_dustdesk_shortcut(
+            Path::new(r"C:\Desktop\普通工具.lnk"),
+            Some(Path::new(r"D:\Tools\ordinary.exe"))
+        ));
+        assert!(!is_dustdesk_shortcut(
+            Path::new(r"C:\Desktop\DustDesk.url"),
+            Some(Path::new(r"D:\OldDustDesk\dustdesk-tauri.exe"))
+        ));
+        assert!(dustdesk_shortcut_target_needs_repair(
+            Some(Path::new(r"D:\OldDustDesk\dustdesk-tauri.exe")),
+            Path::new(r"D:\CurrentDustDesk\dustdesk-tauri.exe")
+        ));
+        let existing_target = env::current_exe().expect("测试进程应有可执行文件路径");
+        assert!(!dustdesk_shortcut_target_needs_repair(
+            Some(&existing_target),
+            Path::new(r"D:\CurrentDustDesk\dustdesk-tauri.exe")
+        ));
+    }
+
+    #[test]
+    fn archive_source_protection_covers_running_binary_and_ancestor_directories() {
+        let current_exe = Path::new(r"D:\Apps\DustDesk\dustdesk-tauri.exe");
+        assert!(is_protected_app_runtime_source(current_exe, current_exe));
+        assert!(is_protected_app_runtime_source(
+            Path::new(r"D:\Apps\DustDesk"),
+            current_exe
+        ));
+        assert!(is_protected_app_runtime_source(
+            Path::new(r"D:\Apps"),
+            current_exe
+        ));
+        assert!(!is_protected_app_runtime_source(
+            Path::new(r"D:\Apps\DustDesk\readme.txt"),
+            current_exe
+        ));
+        assert!(!is_protected_app_runtime_source(
+            Path::new(r"C:\Desktop\DustDesk.lnk"),
+            current_exe
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stale_dustdesk_shortcut_is_retargeted_without_moving_executables() {
+        let root = unique_test_dir("dustdesk-shortcut-repair");
+        let old_target = root.join("old").join("dustdesk-tauri.exe");
+        let current_target = root.join("current").join("dustdesk-tauri.exe");
+        let shortcut = root.join("DustDesk.lnk");
+        fs::create_dir_all(old_target.parent().expect("旧目标应有父目录")).expect("创建旧目标目录");
+        fs::create_dir_all(current_target.parent().expect("新目标应有父目录"))
+            .expect("创建新目标目录");
+        fs::write(&old_target, b"old").expect("创建旧目标");
+        fs::write(&current_target, b"current").expect("创建新目标");
+        create_windows_shortcut(&shortcut, &old_target, "DustDesk").expect("创建测试快捷方式");
+
+        assert!(repair_dustdesk_shortcut_target(&shortcut, &current_target).expect("修复快捷方式"));
+        let repaired_target =
+            system_icon::shortcut_target_path(&shortcut).expect("读取修复后的目标");
+        assert!(same_path_for_move(&repaired_target, &current_target));
+        assert!(old_target.exists());
+        assert!(current_target.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn category_reorder_remaps_split_indices_and_window_layouts() {
+        let category = |name: &str| DeskCategory {
+            name: name.to_owned(),
+            is_collapsed: false,
+            item_paths: Vec::new(),
+            item_details: Vec::new(),
+        };
+        let layout = |x| DesktopWindowLayout {
+            x,
+            y: 0,
+            width: 320,
+            height: 240,
+        };
+        let mut config = AppConfig {
+            desktop_categories: vec![category("A"), category("B"), category("C"), category("D")],
+            settings: AppSettings::default(),
+            desktop_layout: DesktopLayout {
+                split_category_indices: vec![0, 2],
+                locked: false,
+                click_through: false,
+                windows: BTreeMap::from([
+                    ("desktop-category-0".to_owned(), layout(10)),
+                    ("desktop-category-2".to_owned(), layout(30)),
+                    ("desktop-widget".to_owned(), layout(90)),
+                ]),
+            },
+        };
+
+        reorder_category_config(&mut config, 0, 2).expect("分类重排应成功");
+
+        assert_eq!(
+            config
+                .desktop_categories
+                .iter()
+                .map(|category| category.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["B", "C", "A", "D"]
+        );
+        assert_eq!(config.desktop_layout.split_category_indices, vec![1, 2]);
+        assert_eq!(config.desktop_layout.windows["desktop-category-1"].x, 30);
+        assert_eq!(config.desktop_layout.windows["desktop-category-2"].x, 10);
+        assert_eq!(config.desktop_layout.windows["desktop-widget"].x, 90);
+    }
+
+    #[test]
+    fn category_index_remapping_handles_both_move_directions() {
+        assert_eq!(
+            (0..4)
+                .map(|index| remap_category_index(index, 0, 2))
+                .collect::<Vec<_>>(),
+            vec![2, 0, 1, 3]
+        );
+        assert_eq!(
+            (0..4)
+                .map(|index| remap_category_index(index, 3, 1))
+                .collect::<Vec<_>>(),
+            vec![0, 2, 3, 1]
+        );
+    }
+
+    #[test]
     fn icon_cache_retries_after_a_transient_resolution_failure() {
         let root = unique_test_dir("dustdesk-icon-cache-retry");
         let path = root.join("item.bin");
@@ -9150,6 +9795,101 @@ fn open_with_shell(path: &str) -> Result<(), String> {
         .map_err(to_message)
 }
 
+#[cfg(windows)]
+fn open_path_as_administrator_impl(path: &Path) -> Result<(), String> {
+    shell_execute_as_administrator(path, None)
+}
+
+#[cfg(not(windows))]
+fn open_path_as_administrator_impl(path: &Path) -> Result<(), String> {
+    open_with_shell(&path.display().to_string())
+}
+
+#[cfg(windows)]
+fn open_paths_as_administrator(paths: &[PathBuf]) -> Result<(), String> {
+    if let [path] = paths {
+        return open_path_as_administrator_impl(path);
+    }
+
+    let script_root = env::temp_dir().join("DustDesk").join("admin-launch");
+    fs::create_dir_all(&script_root).map_err(to_message)?;
+    let created_at = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let script_path = script_root.join(format!("launch-{}-{created_at}.ps1", std::process::id()));
+    let items = paths
+        .iter()
+        .map(|path| format!("  {}", ps_quote(&path.display().to_string())))
+        .collect::<Vec<_>>()
+        .join(",\r\n");
+    let script = format!(
+        "$ErrorActionPreference = 'Continue'\r\n\
+         $items = @(\r\n{items}\r\n)\r\n\
+         try {{\r\n\
+           foreach ($item in $items) {{\r\n\
+             try {{ Start-Process -FilePath $item -ErrorAction Stop | Out-Null }} catch {{ }}\r\n\
+           }}\r\n\
+         }} finally {{\r\n\
+           Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue\r\n\
+         }}\r\n"
+    );
+    let mut encoded_script = vec![0xef, 0xbb, 0xbf];
+    encoded_script.extend_from_slice(script.as_bytes());
+    fs::write(&script_path, encoded_script).map_err(to_message)?;
+
+    let parameters = format!(
+        "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{}\"",
+        script_path.display()
+    );
+    if let Err(error) =
+        shell_execute_as_administrator(Path::new("powershell.exe"), Some(&parameters))
+    {
+        let _ = fs::remove_file(&script_path);
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn open_paths_as_administrator(paths: &[PathBuf]) -> Result<(), String> {
+    for path in paths {
+        open_path_as_administrator_impl(path)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn shell_execute_as_administrator(path: &Path, parameters: Option<&str>) -> Result<(), String> {
+    use std::ptr::{null, null_mut};
+    use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
+
+    let operation = wide_null("runas");
+    let file = wide_null(&path.display().to_string());
+    let parameters = parameters.map(wide_null);
+    let parameters_ptr = parameters
+        .as_ref()
+        .map_or(null(), |parameters| parameters.as_ptr());
+    let result = unsafe {
+        ShellExecuteW(
+            null_mut(),
+            operation.as_ptr(),
+            file.as_ptr(),
+            parameters_ptr,
+            null(),
+            SW_SHOWNORMAL,
+        )
+    } as isize;
+
+    if result > 32 {
+        Ok(())
+    } else if result == 5 {
+        Err("已取消管理员授权".to_owned())
+    } else {
+        Err(format!("管理员启动失败，Windows 错误码：{result}"))
+    }
+}
+
 fn set_launch_on_startup_entry(enabled: bool) -> Result<(), String> {
     remove_legacy_startup_shortcut();
     set_launch_on_startup_run_entry(enabled)
@@ -9323,6 +10063,82 @@ fn now_local_string() -> String {
 fn now_id() -> String {
     let now = chrono::Local::now();
     format!("s{:x}{:x}", now.timestamp_millis(), std::process::id())
+}
+
+fn current_exe_diagnostic_value() -> String {
+    env::current_exe()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|error| format!("<无法读取：{error}>"))
+}
+
+fn diagnostic_value(value: &str) -> String {
+    value.replace(['\r', '\n', '\t'], " ").replace('"', "'")
+}
+
+#[cfg(not(test))]
+fn desktop_diagnostic_log_path() -> Option<PathBuf> {
+    env::var_os("APPDATA").map(|app_data| {
+        PathBuf::from(app_data)
+            .join("DustDesk")
+            .join("logs")
+            .join("desktop-operations.log")
+    })
+}
+
+#[cfg(not(test))]
+fn append_desktop_diagnostic(event: &str, details: &str) {
+    let Some(path) = desktop_diagnostic_log_path() else {
+        return;
+    };
+    let lock = DIAGNOSTIC_LOG_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = match lock.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+
+    if fs::metadata(&path).is_ok_and(|metadata| metadata.len() >= DIAGNOSTIC_LOG_MAX_BYTES) {
+        let rotated = path.with_extension("log.1");
+        let _ = fs::remove_file(&rotated);
+        let _ = fs::rename(&path, rotated);
+    }
+
+    let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+    let _ = writeln!(
+        file,
+        "{} event={} {}",
+        chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f%:z"),
+        diagnostic_value(event),
+        diagnostic_value(details)
+    );
+}
+
+#[cfg(test)]
+fn append_desktop_diagnostic(_event: &str, _details: &str) {}
+
+fn install_persistent_panic_hook() {
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let thread = std::thread::current();
+        let thread_name = thread.name().unwrap_or("未命名线程");
+        append_desktop_diagnostic(
+            "panic",
+            &format!(
+                "thread=\"{}\" current_exe=\"{}\" message=\"{}\"",
+                diagnostic_value(thread_name),
+                diagnostic_value(&current_exe_diagnostic_value()),
+                diagnostic_value(&panic_info.to_string())
+            ),
+        );
+        previous_hook(panic_info);
+    }));
 }
 
 fn normalize_name(name: &str, fallback_index: usize) -> String {
@@ -9852,6 +10668,7 @@ fn show_or_create_desktop_card(
     index: usize,
 ) -> Result<(), String> {
     if let Some(window) = app.get_webview_window(label) {
+        window.set_title(title).map_err(to_message)?;
         if !apply_saved_desktop_window_layout(&window, label)? {
             restore_desktop_card_size_if_collapsed(&window, label)?;
         }
@@ -9935,11 +10752,12 @@ fn settle_desktop_windows_after_launch(app: &tauri::AppHandle) {
 }
 
 fn show_desktop_background_window(window: &WebviewWindow) -> Result<(), String> {
+    let state = load_desktop_window_state()?;
+    apply_desktop_window_state(window, state)?;
     keep_desktop_window_behind_apps(window);
     window.show().map_err(to_message)?;
-    // Showing an existing Windows window can bump it in z-order, so reapply the
-    // desktop-level placement after every show.
     keep_desktop_window_behind_apps(window);
+    sync_system_tray_menu(window.app_handle());
     Ok(())
 }
 
@@ -9976,6 +10794,7 @@ fn create_desktop_card(
             .min_inner_size(240.0, 160.0)
             .position(x, y)
             .resizable(true)
+            .maximizable(false)
             .decorations(false)
             .transparent(true)
             .shadow(false)
@@ -10025,6 +10844,7 @@ fn hide_desktop_category_windows(app: &tauri::AppHandle, index: usize) {
             let _ = window.hide();
         }
     }
+    sync_system_tray_menu(app);
 }
 
 fn hide_desktop_organizer_windows(app: &tauri::AppHandle) {
@@ -10034,12 +10854,14 @@ fn hide_desktop_organizer_windows(app: &tauri::AppHandle) {
             let _ = window.hide();
         }
     }
+    sync_system_tray_menu(app);
 }
 
 fn hide_desktop_launcher_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("desktop-launcher") {
         let _ = window.hide();
     }
+    sync_system_tray_menu(app);
 }
 
 fn hide_desktop_card_windows(app: &tauri::AppHandle) {
@@ -10048,6 +10870,7 @@ fn hide_desktop_card_windows(app: &tauri::AppHandle) {
             let _ = window.hide();
         }
     }
+    sync_system_tray_menu(app);
 }
 
 fn desktop_category_index_from_label(label: &str) -> Option<usize> {
@@ -10088,6 +10911,99 @@ fn desktop_frame_visibility_impl(app: &tauri::AppHandle) -> DesktopFrameVisibili
         launcher,
         any: organizer || launcher,
     }
+}
+
+fn load_desktop_window_state() -> Result<DesktopWindowState, String> {
+    let store = AppStore::open().map_err(to_message)?;
+    let config = store.load_config();
+    Ok(DesktopWindowState {
+        locked: config.desktop_layout.locked,
+        click_through: config.desktop_layout.click_through,
+    })
+}
+
+fn set_desktop_window_state_impl(
+    app: &tauri::AppHandle,
+    locked: Option<bool>,
+    click_through: Option<bool>,
+) -> Result<DesktopWindowState, String> {
+    let state = with_config_mutation(|| {
+        let store = AppStore::open().map_err(to_message)?;
+        let mut config = store.load_config_strict().map_err(to_message)?;
+
+        if let Some(locked) = locked {
+            config.desktop_layout.locked = locked;
+            if !locked {
+                config.desktop_layout.click_through = false;
+            }
+        }
+        if let Some(click_through) = click_through {
+            config.desktop_layout.click_through = click_through;
+            if click_through {
+                config.desktop_layout.locked = true;
+            }
+        }
+
+        let state = DesktopWindowState {
+            locked: config.desktop_layout.locked,
+            click_through: config.desktop_layout.click_through,
+        };
+        store.save_config(&config).map_err(to_message)?;
+        Ok(state)
+    })?;
+
+    apply_desktop_window_state_to_all(app, state)?;
+    sync_system_tray_menu(app);
+    let _ = app.emit(DESKTOP_WINDOW_STATE_CHANGED_EVENT, state);
+    Ok(state)
+}
+
+fn apply_desktop_window_state_to_all(
+    app: &tauri::AppHandle,
+    state: DesktopWindowState,
+) -> Result<(), String> {
+    for window in app.webview_windows().values() {
+        if is_desktop_card_window_label(window.label()) {
+            apply_desktop_window_state(window, state)?;
+        }
+    }
+    Ok(())
+}
+
+fn apply_desktop_window_state(
+    window: &WebviewWindow,
+    state: DesktopWindowState,
+) -> Result<(), String> {
+    if window.is_maximized().unwrap_or(false) {
+        window.unmaximize().map_err(to_message)?;
+        let label = window.label().to_owned();
+        let _ = apply_saved_desktop_window_layout(window, &label);
+    }
+    window.set_maximizable(false).map_err(to_message)?;
+    window.set_resizable(!state.locked).map_err(to_message)?;
+    window
+        .set_ignore_cursor_events(state.click_through)
+        .map_err(to_message)?;
+    Ok(())
+}
+
+fn sync_system_tray_menu(app: &tauri::AppHandle) {
+    let Some(items) = TRAY_MENU_ITEMS.get() else {
+        return;
+    };
+    let visibility = desktop_frame_visibility_impl(app);
+    let state = load_desktop_window_state().unwrap_or(DesktopWindowState {
+        locked: false,
+        click_through: false,
+    });
+    let _ = items.desktop_visible.set_checked(visibility.any);
+    let _ = items.desktop_locked.set_text(if state.locked {
+        "解锁全部桌面框"
+    } else {
+        "锁定全部桌面框"
+    });
+    let _ = items.desktop_locked.set_checked(state.locked);
+    let _ = items.desktop_click_through.set_checked(state.click_through);
 }
 
 fn saved_desktop_window_layout(label: &str) -> Option<DesktopWindowLayout> {
@@ -10277,8 +11193,60 @@ fn request_real_app_exit(app: tauri::AppHandle) {
 
 fn setup_system_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     let show_item = MenuItem::with_id(app, TRAY_MENU_SHOW_MAIN, "显示主窗口", true, None::<&str>)?;
+    let visibility = desktop_frame_visibility_impl(app);
+    let state = load_desktop_window_state().unwrap_or(DesktopWindowState {
+        locked: false,
+        click_through: false,
+    });
+    let desktop_visible_item = CheckMenuItem::with_id(
+        app,
+        TRAY_MENU_DESKTOP_VISIBLE,
+        "显示桌面框",
+        true,
+        visibility.any,
+        None::<&str>,
+    )?;
+    let desktop_locked_item = CheckMenuItem::with_id(
+        app,
+        TRAY_MENU_DESKTOP_LOCKED,
+        if state.locked {
+            "解锁全部桌面框"
+        } else {
+            "锁定全部桌面框"
+        },
+        true,
+        state.locked,
+        None::<&str>,
+    )?;
+    let desktop_click_through_item = CheckMenuItem::with_id(
+        app,
+        TRAY_MENU_DESKTOP_CLICK_THROUGH,
+        "桌面框鼠标穿透",
+        true,
+        state.click_through,
+        None::<&str>,
+    )?;
+    let separator = PredefinedMenuItem::separator(app)?;
+    let exit_separator = PredefinedMenuItem::separator(app)?;
     let quit_item = MenuItem::with_id(app, TRAY_MENU_QUIT, "退出", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+    let menu = Menu::with_items(
+        app,
+        &[
+            &show_item,
+            &separator,
+            &desktop_visible_item,
+            &desktop_locked_item,
+            &desktop_click_through_item,
+            &exit_separator,
+            &quit_item,
+        ],
+    )?;
+
+    let _ = TRAY_MENU_ITEMS.set(TrayMenuItems {
+        desktop_visible: desktop_visible_item,
+        desktop_locked: desktop_locked_item,
+        desktop_click_through: desktop_click_through_item,
+    });
 
     let mut tray = TrayIconBuilder::with_id("desknest-main-tray")
         .menu(&menu)
@@ -10287,6 +11255,50 @@ fn setup_system_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
         .on_menu_event(|app, event| {
             if event.id() == TRAY_MENU_SHOW_MAIN {
                 show_main_window_from_tray_async(app.clone());
+            } else if event.id() == TRAY_MENU_DESKTOP_VISIBLE {
+                let app = app.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    let result = if desktop_frame_visibility_impl(&app).any {
+                        hide_desktop_card_windows(&app);
+                        Ok(())
+                    } else {
+                        show_persisted_desktop_layout(&app)
+                    };
+                    if let Err(error) = result {
+                        eprintln!("failed to toggle desktop frames from tray: {error}");
+                    }
+                    sync_system_tray_menu(&app);
+                });
+            } else if event.id() == TRAY_MENU_DESKTOP_LOCKED {
+                let app = app.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    let state = load_desktop_window_state().unwrap_or(DesktopWindowState {
+                        locked: false,
+                        click_through: false,
+                    });
+                    if let Err(error) =
+                        set_desktop_window_state_impl(&app, Some(!state.locked), None)
+                    {
+                        eprintln!("failed to toggle desktop frame lock from tray: {error}");
+                    }
+                    sync_system_tray_menu(&app);
+                });
+            } else if event.id() == TRAY_MENU_DESKTOP_CLICK_THROUGH {
+                let app = app.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    let state = load_desktop_window_state().unwrap_or(DesktopWindowState {
+                        locked: false,
+                        click_through: false,
+                    });
+                    if let Err(error) =
+                        set_desktop_window_state_impl(&app, None, Some(!state.click_through))
+                    {
+                        eprintln!(
+                            "failed to toggle desktop frame click-through from tray: {error}"
+                        );
+                    }
+                    sync_system_tray_menu(&app);
+                });
             } else if event.id() == TRAY_MENU_QUIT {
                 request_real_app_exit(app.clone());
             }
@@ -10313,6 +11325,7 @@ fn setup_system_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
 }
 
 fn main() {
+    install_persistent_panic_hook();
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             if !args.iter().any(|arg| arg == "--startup") {
@@ -10353,6 +11366,25 @@ fn main() {
                         hide_main_window_to_tray_async(window.app_handle().clone());
                     }
                 }
+                return;
+            }
+
+            if is_desktop_card_window_label(window.label())
+                && matches!(event, tauri::WindowEvent::Resized(_))
+                && window.is_maximized().unwrap_or(false)
+            {
+                let app = window.app_handle().clone();
+                let label = window.label().to_owned();
+                tauri::async_runtime::spawn_blocking(move || {
+                    let Some(window) = app.get_webview_window(&label) else {
+                        return;
+                    };
+                    let _ = window.unmaximize();
+                    let _ = apply_saved_desktop_window_layout(&window, &label);
+                    if let Ok(state) = load_desktop_window_state() {
+                        let _ = apply_desktop_window_state(&window, state);
+                    }
+                });
             }
         })
         .setup(|app| {
@@ -10362,6 +11394,14 @@ fn main() {
             let handle = app.handle().clone();
             tauri::async_runtime::spawn_blocking(move || {
                 let mut completion_guard = StartupRecoveryCompletionGuard::new();
+                let recovery_started = Instant::now();
+                append_desktop_diagnostic(
+                    "startup_recovery_started",
+                    &format!(
+                        "current_exe=\"{}\"",
+                        diagnostic_value(&current_exe_diagnostic_value())
+                    ),
+                );
                 publish_lifecycle_desktop_operation(
                     &handle,
                     DesktopOperationPayload {
@@ -10429,6 +11469,14 @@ fn main() {
 
                 match recovery_result {
                     Ok(recollected) => {
+                        append_desktop_diagnostic(
+                            "startup_recovery_finished",
+                            &format!(
+                                "elapsed_ms={} recollected={}",
+                                recovery_started.elapsed().as_millis(),
+                                recollected
+                            ),
+                        );
                         initialize_runtime_services(&handle);
                         emit_desktop_cards_changed(&handle);
                         if let Err(error) = with_lazy_window_operation(|| {
@@ -10462,6 +11510,14 @@ fn main() {
                         schedule_stale_transfer_staging_cleanup();
                     }
                     Err(error) => {
+                        append_desktop_diagnostic(
+                            "startup_recovery_failed",
+                            &format!(
+                                "elapsed_ms={} error=\"{}\"",
+                                recovery_started.elapsed().as_millis(),
+                                diagnostic_value(&error)
+                            ),
+                        );
                         eprintln!("failed to complete startup recovery: {error}");
                         publish_lifecycle_desktop_operation(
                             &handle,
@@ -10497,6 +11553,7 @@ fn main() {
             rename_category,
             delete_category,
             toggle_category,
+            reorder_category,
             add_item_to_category,
             add_items_to_category,
             remove_item_from_category,
@@ -10516,9 +11573,14 @@ fn main() {
             check_for_updates,
             open_update_download,
             open_path,
+            open_path_as_administrator,
             start_all_launchers,
+            start_all_launchers_as_administrator,
             show_desktop_widget,
             desktop_frame_visibility,
+            desktop_window_state,
+            set_desktop_windows_locked,
+            set_desktop_windows_click_through,
             toggle_desktop_frames,
             toggle_desktop_organizer_frame,
             toggle_desktop_launcher_frame,

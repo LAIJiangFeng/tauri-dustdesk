@@ -11,6 +11,26 @@ pub fn icon_data_url(_path: &Path) -> Option<String> {
 }
 
 #[cfg(windows)]
+pub fn shortcut_target_path(path: &Path) -> Option<std::path::PathBuf> {
+    windows_icon::shortcut_target_path(path)
+}
+
+#[cfg(not(windows))]
+pub fn shortcut_target_path(_path: &Path) -> Option<std::path::PathBuf> {
+    None
+}
+
+#[cfg(windows)]
+pub fn update_shortcut_target(path: &Path, target: &Path) -> Result<(), String> {
+    windows_icon::update_shortcut_target(path, target)
+}
+
+#[cfg(not(windows))]
+pub fn update_shortcut_target(_path: &Path, _target: &Path) -> Result<(), String> {
+    Err("当前系统不支持 Windows 快捷方式修复".to_owned())
+}
+
+#[cfg(windows)]
 mod windows_icon {
     use std::{
         env,
@@ -34,7 +54,7 @@ mod windows_icon {
         Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, WIN32_FIND_DATAW},
         System::Com::{
             CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_INPROC_SERVER,
-            COINIT_APARTMENTTHREADED, STGM_READ,
+            COINIT_APARTMENTTHREADED, STGM_READ, STGM_READWRITE,
         },
         UI::{
             Shell::{
@@ -74,6 +94,49 @@ mod windows_icon {
                     internet_shortcut_icon_path(path).unwrap_or_else(|| path.to_path_buf());
                 shell_icon(&icon_path).and_then(hicon_data_url)
             })
+    }
+
+    pub fn shortcut_target_path(path: &Path) -> Option<PathBuf> {
+        if !is_windows_shortcut(path) {
+            return None;
+        }
+
+        unsafe {
+            let init_result = CoInitializeEx(null_mut(), COINIT_APARTMENTTHREADED as u32);
+            let initialized = init_result == S_OK || init_result == S_FALSE;
+            let target = if initialized || init_result == RPC_E_CHANGED_MODE {
+                read_shortcut_target_path(path)
+            } else {
+                None
+            };
+            if initialized {
+                CoUninitialize();
+            }
+            target
+        }
+    }
+
+    pub fn update_shortcut_target(path: &Path, target: &Path) -> Result<(), String> {
+        if !is_windows_shortcut(path) {
+            return Err("目标文件不是 Windows 快捷方式".to_owned());
+        }
+
+        unsafe {
+            let init_result = CoInitializeEx(null_mut(), COINIT_APARTMENTTHREADED as u32);
+            let initialized = init_result == S_OK || init_result == S_FALSE;
+            let result = if initialized || init_result == RPC_E_CHANGED_MODE {
+                update_shortcut_target_inner(path, target)
+            } else {
+                Err(format!(
+                    "初始化 Windows 快捷方式组件失败：HRESULT=0x{:08X}",
+                    init_result as u32
+                ))
+            };
+            if initialized {
+                CoUninitialize();
+            }
+            result
+        }
     }
 
     fn hicon_data_url(hicon: HICON) -> Option<String> {
@@ -159,7 +222,7 @@ mod windows_icon {
         if let Some(icon_source) = shortcut_icon_location(link) {
             push_icon_source(&mut sources, icon_source);
         }
-        if let Some(target_path) = shortcut_target_path(link) {
+        if let Some(target_path) = shortcut_link_target_path(link) {
             push_icon_source(
                 &mut sources,
                 IconSource {
@@ -174,6 +237,129 @@ mod windows_icon {
             release_interface(link.cast());
         }
         Some(sources)
+    }
+
+    unsafe fn read_shortcut_target_path(path: &Path) -> Option<PathBuf> {
+        let mut link_ptr = null_mut();
+        let create_result = unsafe {
+            CoCreateInstance(
+                &CLSID_SHELL_LINK,
+                null_mut(),
+                CLSCTX_INPROC_SERVER,
+                &IID_ISHELL_LINK_W,
+                &mut link_ptr,
+            )
+        };
+        if create_result < 0 || link_ptr.is_null() {
+            return None;
+        }
+
+        let link = link_ptr.cast::<IShellLinkW>();
+        let Some(persist) = query_persist_file(link) else {
+            unsafe {
+                release_interface(link.cast());
+            }
+            return None;
+        };
+        let link_path = wide_path(path);
+        let load_result =
+            unsafe { ((*(*persist).vtbl).load)(persist.cast(), link_path.as_ptr(), STGM_READ) };
+        let target = if load_result >= 0 {
+            shortcut_link_target_path(link)
+        } else {
+            None
+        };
+
+        unsafe {
+            release_interface(persist.cast());
+            release_interface(link.cast());
+        }
+        target
+    }
+
+    unsafe fn update_shortcut_target_inner(path: &Path, target: &Path) -> Result<(), String> {
+        let mut link_ptr = null_mut();
+        let create_result = unsafe {
+            CoCreateInstance(
+                &CLSID_SHELL_LINK,
+                null_mut(),
+                CLSCTX_INPROC_SERVER,
+                &IID_ISHELL_LINK_W,
+                &mut link_ptr,
+            )
+        };
+        if create_result < 0 || link_ptr.is_null() {
+            return Err(format!(
+                "创建 Windows 快捷方式组件失败：HRESULT=0x{:08X}",
+                create_result as u32
+            ));
+        }
+
+        let link = link_ptr.cast::<IShellLinkW>();
+        let Some(persist) = query_persist_file(link) else {
+            unsafe {
+                release_interface(link.cast());
+            }
+            return Err("读取 Windows 快捷方式保存接口失败".to_owned());
+        };
+        let link_path = wide_path(path);
+        let load_result = unsafe {
+            ((*(*persist).vtbl).load)(persist.cast(), link_path.as_ptr(), STGM_READWRITE)
+        };
+        if load_result < 0 {
+            unsafe {
+                release_interface(persist.cast());
+                release_interface(link.cast());
+            }
+            return Err(format!(
+                "读取 Windows 快捷方式失败：HRESULT=0x{:08X}",
+                load_result as u32
+            ));
+        }
+
+        let target_path = wide_path(target);
+        let set_path_result =
+            unsafe { ((*(*link).vtbl).set_path)(link.cast(), target_path.as_ptr()) };
+        if set_path_result < 0 {
+            unsafe {
+                release_interface(persist.cast());
+                release_interface(link.cast());
+            }
+            return Err(format!(
+                "更新 Windows 快捷方式目标失败：HRESULT=0x{:08X}",
+                set_path_result as u32
+            ));
+        }
+
+        let working_directory = target.parent().unwrap_or(target);
+        let working_directory = wide_path(working_directory);
+        let set_working_directory_result = unsafe {
+            ((*(*link).vtbl).set_working_directory)(link.cast(), working_directory.as_ptr())
+        };
+        if set_working_directory_result < 0 {
+            unsafe {
+                release_interface(persist.cast());
+                release_interface(link.cast());
+            }
+            return Err(format!(
+                "更新 Windows 快捷方式工作目录失败：HRESULT=0x{:08X}",
+                set_working_directory_result as u32
+            ));
+        }
+
+        let save_result =
+            unsafe { ((*(*persist).vtbl).save)(persist.cast(), link_path.as_ptr(), 1) };
+        unsafe {
+            release_interface(persist.cast());
+            release_interface(link.cast());
+        }
+        if save_result < 0 {
+            return Err(format!(
+                "保存 Windows 快捷方式失败：HRESULT=0x{:08X}",
+                save_result as u32
+            ));
+        }
+        Ok(())
     }
 
     unsafe fn query_persist_file(link: *mut IShellLinkW) -> Option<*mut IPersistFile> {
@@ -219,7 +405,7 @@ mod windows_icon {
         })
     }
 
-    fn shortcut_target_path(link: *mut IShellLinkW) -> Option<PathBuf> {
+    fn shortcut_link_target_path(link: *mut IShellLinkW) -> Option<PathBuf> {
         let mut buffer = vec![0u16; 32768];
         let result = unsafe {
             ((*(*link).vtbl).get_path)(

@@ -47,6 +47,12 @@ pub struct DesktopLayout {
     )]
     pub split_category_indices: Vec<usize>,
 
+    #[serde(rename = "Locked", alias = "locked", default)]
+    pub locked: bool,
+
+    #[serde(rename = "ClickThrough", alias = "click_through", default)]
+    pub click_through: bool,
+
     #[serde(rename = "Windows", alias = "windows", default)]
     pub windows: BTreeMap<String, DesktopWindowLayout>,
 }

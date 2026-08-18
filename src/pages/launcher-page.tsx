@@ -1,6 +1,7 @@
 import { useEffect, useState, type DragEvent as ReactDragEvent, type ReactNode } from "react"
 import { open } from "@tauri-apps/plugin-dialog"
-import { Desktop, FolderOpen, Plus, RocketLaunch } from "@phosphor-icons/react"
+import { FolderOpen, Plus, RocketLaunch, ShieldCheck } from "@phosphor-icons/react"
+import { DesktopWidgetViewModeControl } from "@/components/dustdesk/desktop-widget-view-mode-control"
 import { EmptyState } from "@/components/dustdesk/empty-state"
 import { FileIcon } from "@/components/dustdesk/file-icon"
 import { ItemContextMenu, type ItemContextMenuAction } from "@/components/dustdesk/item-context-menu"
@@ -17,27 +18,20 @@ import { useDustDeskStore } from "@/stores/dustdesk-store"
 export function LauncherPage() {
   const snapshot = useDustDeskStore((state) => state.snapshot)
   const openPath = useDustDeskStore((state) => state.openPath)
+  const openPathAsAdministrator = useDustDeskStore((state) => state.openPathAsAdministrator)
   const openSpecial = useDustDeskStore((state) => state.openSpecial)
   const addLaunchers = useDustDeskStore((state) => state.addLaunchers)
   const removeLauncher = useDustDeskStore((state) => state.removeLauncher)
   const showPathInFolder = useDustDeskStore((state) => state.showPathInFolder)
-  const desktopFrames = useDustDeskStore((state) => state.desktopFrames)
-  const refreshDesktopFrameVisibility = useDustDeskStore((state) => state.refreshDesktopFrameVisibility)
-  const toggleDesktopLauncherFrame = useDustDeskStore((state) => state.toggleDesktopLauncherFrame)
-
-  useEffect(() => {
-    void refreshDesktopFrameVisibility()
-  }, [refreshDesktopFrameVisibility])
 
   useEffect(() => {
     let unlisten: (() => void) | undefined
     void safeCurrentWebviewDragDropEvent((event) => {
-        if (event.payload.type !== "drop") return
-        void addLauncherPaths(event.payload.paths)
-      })
-      .then((value) => {
-        unlisten = value
-      })
+      if (event.payload.type !== "drop") return
+      void addLauncherPaths(event.payload.paths)
+    }).then((value) => {
+      unlisten = value
+    })
     return () => unlisten?.()
   }, [addLaunchers])
 
@@ -95,10 +89,7 @@ export function LauncherPage() {
               添加目录
             </Button>
             <LaunchConfirmButton count={snapshot.launchers.length} size="sm" />
-            <Button variant="secondary" size="sm" onClick={() => void toggleDesktopLauncherFrame()}>
-              <Desktop className="size-3.5" weight="duotone" />
-              {desktopFrames.launcher ? "隐藏启动桌面框" : "显示启动桌面框"}
-            </Button>
+            <DesktopWidgetViewModeControl scope="launcher" label="快捷启动桌面框排版" />
             <Button size="sm" variant="secondary" onClick={() => void openSpecial("launchers")}>
               <FolderOpen className="size-3.5" weight="duotone" />
               启动目录
@@ -116,6 +107,7 @@ export function LauncherPage() {
                     onOpen={() => void openPath(item.path)}
                     actions={[
                       { label: "启动", icon: "open", onSelect: () => openPath(item.path) },
+                      { label: "以管理员身份启动", icon: "admin", onSelect: () => openPathAsAdministrator(item.path) },
                       { label: "在资源管理器中显示", icon: "folder", onSelect: () => showPathInFolder(item.path) },
                       { label: "从快捷启动移除", icon: "remove", tone: "danger", onSelect: () => removeLauncher(item.path) },
                     ]}
@@ -125,13 +117,31 @@ export function LauncherPage() {
                         <FileIcon name={item.name || displayPathName(item.path)} extension={extensionFromPath(item.path)} iconDataUrl={item.icon_data_url} className="size-12" />
                         <span className="w-full truncate text-sm font-medium">{item.name || displayPathName(item.path)}</span>
                       </div>
-                      <Button size="xs" variant="secondary" className="w-full" onClick={(event) => {
-                        event.stopPropagation()
-                        void openPath(item.path)
-                      }}>
-                        <RocketLaunch className="size-3" weight="duotone" />
-                        启动
-                      </Button>
+                      <div className="grid w-full grid-cols-2 gap-1.5">
+                        <Button
+                          size="xs"
+                          variant="secondary"
+                          onClick={(event) => {
+                            event.stopPropagation()
+                            void openPath(item.path)
+                          }}
+                        >
+                          <RocketLaunch className="size-3" weight="duotone" />
+                          启动
+                        </Button>
+                        <Button
+                          size="xs"
+                          variant="outline"
+                          title="以管理员身份启动"
+                          onClick={(event) => {
+                            event.stopPropagation()
+                            void openPathAsAdministrator(item.path)
+                          }}
+                        >
+                          <ShieldCheck className="size-3" weight="duotone" />
+                          管理员
+                        </Button>
+                      </div>
                     </CardContent>
                   </LauncherItemShell>
                 ))}
@@ -146,17 +156,7 @@ export function LauncherPage() {
   )
 }
 
-function LauncherItemShell({
-  title,
-  actions,
-  onOpen,
-  children,
-}: {
-  title: string
-  actions: ItemContextMenuAction[]
-  onOpen: () => void
-  children: ReactNode
-}) {
+function LauncherItemShell({ title, actions, onOpen, children }: { title: string; actions: ItemContextMenuAction[]; onOpen: () => void; children: ReactNode }) {
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null)
 
   return (

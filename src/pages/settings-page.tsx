@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react"
 import type { KeyboardEvent as ReactKeyboardEvent } from "react"
 import { ArrowsClockwise, Desktop, DownloadSimple, FolderOpen, GearSix, HardDrives, Keyboard, MagnifyingGlass, PlayCircle, Plus, X } from "@phosphor-icons/react"
 import { open } from "@tauri-apps/plugin-dialog"
+import { DesktopFrameControlPanel } from "@/components/dustdesk/desktop-frame-control-panel"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -70,10 +71,30 @@ export function SettingsPage() {
   const safeSearchPathsDraft = Array.isArray(searchPathsDraft) ? searchPathsDraft : []
   const effectiveSearchPaths = safeSearchPathsDraft.length > 0 ? safeSearchPathsDraft : [snapshot.organizer_root].filter(Boolean)
   const rows = [
-    { name: "数据目录", value: snapshot.data_dir, target: "data" as const, icon: HardDrives },
-    { name: "收纳目录", value: snapshot.organizer_root, target: "organizer" as const, icon: FolderOpen },
-    { name: "快捷启动目录", value: snapshot.launchers_root, target: "launchers" as const, icon: GearSix },
-    { name: "系统桌面", value: "当前用户 Desktop", target: "desktop" as const, icon: Desktop },
+    {
+      name: "数据目录",
+      value: snapshot.data_dir,
+      target: "data" as const,
+      icon: HardDrives,
+    },
+    {
+      name: "收纳目录",
+      value: snapshot.organizer_root,
+      target: "organizer" as const,
+      icon: FolderOpen,
+    },
+    {
+      name: "快捷启动目录",
+      value: snapshot.launchers_root,
+      target: "launchers" as const,
+      icon: GearSix,
+    },
+    {
+      name: "系统桌面",
+      value: "当前用户 Desktop",
+      target: "desktop" as const,
+      icon: Desktop,
+    },
   ]
 
   useEffect(() => {
@@ -125,11 +146,7 @@ export function SettingsPage() {
     }
   }
 
-  const saveSearchSettings = async (
-    enabled = searchEnabledDraft,
-    shortcut = searchShortcutDraft,
-    paths = searchPathsDraft,
-  ) => {
+  const saveSearchSettings = async (enabled = searchEnabledDraft, shortcut = searchShortcutDraft, paths = searchPathsDraft) => {
     const nextShortcut = shortcut.trim()
     if (!nextShortcut) {
       setSearchError("搜索快捷键不能为空")
@@ -303,14 +320,16 @@ export function SettingsPage() {
 
   return (
     <Card className="h-full min-h-0">
-        <CardHeader>
-          <div>
-            <CardTitle>设置中心</CardTitle>
-          </div>
-          <Badge variant="outline">{rows.length + 3} 项</Badge>
+      <CardHeader>
+        <div>
+          <CardTitle>设置中心</CardTitle>
+        </div>
+        <Badge variant="outline">{rows.length + 5} 项</Badge>
       </CardHeader>
       <CardContent className="min-h-0">
         <ScrollArea className="h-full pr-2">
+          <DesktopFrameControlPanel />
+
           <div className="mb-3 grid gap-3 xl:grid-cols-[minmax(0,1.15fr)_minmax(0,1.85fr)]">
             <Card>
               <CardContent className="flex min-h-56 flex-col gap-4 p-5">
@@ -319,9 +338,7 @@ export function SettingsPage() {
                 </div>
                 <div>
                   <h3 className="font-heading text-base font-medium">剪贴板快捷键</h3>
-                  <p className="mt-2 text-sm leading-6 text-muted-foreground">
-                    按住组合键唤起剪贴板；松开 Ctrl 后会粘贴当前选中的记录。
-                  </p>
+                  <p className="mt-2 text-sm leading-6 text-muted-foreground">按住组合键唤起剪贴板；松开 Ctrl 后会粘贴当前选中的记录。</p>
                 </div>
                 <Badge className="mt-auto w-fit" variant="outline">
                   当前：{snapshot.settings.clipboard_shortcut}
@@ -344,9 +361,7 @@ export function SettingsPage() {
                     onChange={(event) => setShortcutDraft(event.target.value)}
                     onKeyDown={handleShortcutKeyDown}
                   />
-                  <p className="text-xs leading-5 text-muted-foreground">
-                    格式示例：Ctrl+Tab、Ctrl+Alt+V、Alt+Space。必须包含至少一个修饰键。
-                  </p>
+                  <p className="text-xs leading-5 text-muted-foreground">格式示例：Ctrl+Tab、Ctrl+Alt+V、Alt+Space。必须包含至少一个修饰键。</p>
                   {shortcutSuccess ? <p className="text-xs leading-5 text-emerald-600 dark:text-emerald-400">{shortcutSuccess}</p> : null}
                   {shortcutError ? <p className="text-xs leading-5 text-destructive">{shortcutError}</p> : null}
                 </div>
@@ -382,9 +397,7 @@ export function SettingsPage() {
                 </div>
                 <div>
                   <h3 className="font-heading text-base font-medium">全局搜索</h3>
-                  <p className="mt-2 text-sm leading-6 text-muted-foreground">
-                    Ctrl+Space 屏幕中间弹出搜索框，支持搜索配置路径、快捷启动、程序、文件和目录。
-                  </p>
+                  <p className="mt-2 text-sm leading-6 text-muted-foreground">Ctrl+Space 屏幕中间弹出搜索框，支持搜索配置路径、快捷启动、程序、文件和目录。</p>
                 </div>
                 <div className="mt-auto flex flex-wrap gap-2">
                   <Badge className="w-fit" variant={searchEnabledDraft ? "default" : "outline"}>
@@ -413,17 +426,11 @@ export function SettingsPage() {
                       onChange={(event) => setSearchShortcutDraft(event.target.value)}
                       onKeyDown={handleSearchShortcutKeyDown}
                     />
-                    <Button
-                      type="button"
-                      variant={isRecordingSearchShortcut ? "default" : "secondary"}
-                      onClick={() => setIsRecordingSearchShortcut(true)}
-                    >
+                    <Button type="button" variant={isRecordingSearchShortcut ? "default" : "secondary"} onClick={() => setIsRecordingSearchShortcut(true)}>
                       {isRecordingSearchShortcut ? "请按组合键" : "录制搜索快捷键"}
                     </Button>
                   </div>
-                  <p className="text-xs leading-5 text-muted-foreground">
-                    默认 Ctrl+Space。如与输入法冲突，可以改成 Ctrl+Alt+Space、Alt+Space 等。
-                  </p>
+                  <p className="text-xs leading-5 text-muted-foreground">默认 Ctrl+Space。如与输入法冲突，可以改成 Ctrl+Alt+Space、Alt+Space 等。</p>
                 </div>
 
                 <div className="grid gap-2">
@@ -522,9 +529,7 @@ export function SettingsPage() {
                 </div>
                 <div>
                   <h3 className="font-heading text-base font-medium">开机自启</h3>
-                  <p className="mt-2 text-sm leading-6 text-muted-foreground">
-                    登录 Windows 后自动启动 DeskNest，并继续显示桌面收纳卡片。
-                  </p>
+                  <p className="mt-2 text-sm leading-6 text-muted-foreground">登录 Windows 后自动启动 DeskNest，并继续显示桌面收纳卡片。</p>
                 </div>
                 <Badge className="mt-auto w-fit" variant={snapshot.settings.launch_on_startup ? "default" : "outline"}>
                   {snapshot.settings.launch_on_startup ? "已启用" : "已关闭"}
@@ -539,9 +544,7 @@ export function SettingsPage() {
                     <h3 className="font-heading text-base font-medium">启动项设置</h3>
                     <Badge variant="outline">当前用户</Badge>
                   </div>
-                  <p className="text-sm leading-6 text-muted-foreground">
-                    使用 Windows 当前用户的 Startup 启动目录，不需要管理员权限。
-                  </p>
+                  <p className="text-sm leading-6 text-muted-foreground">使用 Windows 当前用户的 Startup 启动目录，不需要管理员权限。</p>
                   {startupSuccess ? <p className="text-xs leading-5 text-emerald-600 dark:text-emerald-400">{startupSuccess}</p> : null}
                   {startupError ? <p className="text-xs leading-5 text-destructive">{startupError}</p> : null}
                 </div>
@@ -562,9 +565,7 @@ export function SettingsPage() {
                 </div>
                 <div>
                   <h3 className="font-heading text-base font-medium">软件更新</h3>
-                  <p className="mt-2 text-sm leading-6 text-muted-foreground">
-                    检查 GitHub Release 上的最新安装包，有新版本时会提示下载更新。
-                  </p>
+                  <p className="mt-2 text-sm leading-6 text-muted-foreground">检查 GitHub Release 上的最新安装包，有新版本时会提示下载更新。</p>
                 </div>
                 <Badge className="mt-auto w-fit" variant={updateInfo?.update_available ? "default" : "outline"}>
                   {updateInfo ? `当前 ${updateInfo.current_version}` : "等待检查"}
@@ -577,14 +578,10 @@ export function SettingsPage() {
                 <div className="grid gap-2">
                   <div className="flex flex-wrap items-center justify-between gap-3">
                     <h3 className="font-heading text-base font-medium">检查更新</h3>
-                    <Badge variant={updateInfo?.update_available ? "default" : "outline"}>
-                      {updateInfo?.update_available ? "有新版本" : "手动检查"}
-                    </Badge>
+                    <Badge variant={updateInfo?.update_available ? "default" : "outline"}>{updateInfo?.update_available ? "有新版本" : "手动检查"}</Badge>
                   </div>
                   <p className="text-sm leading-6 text-muted-foreground">
-                    {updateInfo
-                      ? `最新版本：${updateInfo.latest_version || "未知"}${updateInfo.asset_name ? `，安装包：${updateInfo.asset_name}` : ""}`
-                      : "点击检查后会联网读取最新发布版本。"}
+                    {updateInfo ? `最新版本：${updateInfo.latest_version || "未知"}${updateInfo.asset_name ? `，安装包：${updateInfo.asset_name}` : ""}` : "点击检查后会联网读取最新发布版本。"}
                   </p>
                   {updateInfo?.release_name ? <p className="text-xs leading-5 text-muted-foreground">发布：{updateInfo.release_name}</p> : null}
                   {updateSuccess ? <p className="text-xs leading-5 text-emerald-600 dark:text-emerald-400">{updateSuccess}</p> : null}
@@ -630,12 +627,7 @@ export function SettingsPage() {
                         打开
                       </Button>
                       {directoryTarget ? (
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          disabled={isSavingDirectory}
-                          onClick={() => void chooseRuntimeDirectory(directoryTarget, row.value)}
-                        >
+                        <Button variant="outline" size="sm" disabled={isSavingDirectory} onClick={() => void chooseRuntimeDirectory(directoryTarget, row.value)}>
                           {isSavingDirectory ? "修改中" : "修改目录"}
                         </Button>
                       ) : null}

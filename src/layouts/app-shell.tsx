@@ -1,6 +1,7 @@
 import { startTransition, useEffect, useRef } from "react"
 import { NavLink, Outlet, useLocation } from "react-router"
-import { ArrowsClockwise, Crosshair, Desktop, Minus, MoonStars, Square, SunDim, Warning, X } from "@phosphor-icons/react"
+import { ArrowsClockwise, Crosshair, Minus, MoonStars, Square, SunDim, Warning, X } from "@phosphor-icons/react"
+import { DesktopFrameOperationMenu } from "@/components/dustdesk/desktop-frame-operation-menu"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { ScrollArea } from "@/components/ui/scroll-area"
@@ -8,13 +9,15 @@ import { Separator } from "@/components/ui/separator"
 import { navigationItems, pageFromPath, pageMeta } from "@/config/navigation"
 import { useTheme } from "@/hooks/use-theme"
 import { hideMainWindowToTray, minimizeCurrentWindow, safeListen, toggleCurrentWindowMaximize } from "@/lib/tauri-window"
-import { truncate } from "@/lib/utils"
+import { remapIndexAfterMove, truncate } from "@/lib/utils"
 import { useDustDeskStore } from "@/stores/dustdesk-store"
+import type { CategoryOrderChangedEvent } from "@/types"
 
 export function AppShell() {
   const location = useLocation()
   const activePage = pageFromPath(location.pathname)
   const setPage = useDustDeskStore((state) => state.setPage)
+  const selectCategory = useDustDeskStore((state) => state.selectCategory)
   const load = useDustDeskStore((state) => state.load)
   const { theme, toggleTheme } = useTheme()
   const previousPageRef = useRef(activePage)
@@ -47,6 +50,18 @@ export function AppShell() {
 
     register("dustdesk://desktop-cards-changed")
     register("dustdesk://main-window-shown")
+    void safeListen<CategoryOrderChangedEvent>("dustdesk://category-order-changed", (event) => {
+      const { from_index: fromIndex, to_index: toIndex } = event.payload
+      const currentIndex = useDustDeskStore.getState().selectedCategory
+      selectCategory(remapIndexAfterMove(currentIndex, fromIndex, toIndex))
+    }).then((unlisten) => {
+      if (!unlisten) return
+      if (disposed) {
+        unlisten()
+      } else {
+        unlisteners.push(unlisten)
+      }
+    })
     window.addEventListener("focus", refreshSnapshot)
     document.addEventListener("visibilitychange", handleVisibilityChange)
     return () => {
@@ -55,7 +70,7 @@ export function AppShell() {
       window.removeEventListener("focus", refreshSnapshot)
       document.removeEventListener("visibilitychange", handleVisibilityChange)
     }
-  }, [load])
+  }, [load, selectCategory])
 
   return (
     <div className="flex h-screen w-screen flex-col overflow-hidden bg-background text-foreground">
@@ -123,13 +138,7 @@ function DesktopRail({ activePath }: { activePath: string }) {
           {navigationItems.map((item) => {
             const Icon = item.icon
             return (
-              <Button
-                key={item.page}
-                asChild
-                variant={item.path === activePath ? "default" : "ghost"}
-                size="lg"
-                className="h-auto w-full flex-col gap-1 py-3"
-              >
+              <Button key={item.page} asChild variant={item.path === activePath ? "default" : "ghost"} size="lg" className="h-auto w-full flex-col gap-1 py-3">
                 <NavLink to={item.path} end={item.path === "/"} title={`${item.label} - ${item.hint}`}>
                   <Icon className="size-5" weight="duotone" />
                   <span className="text-xs">{item.label}</span>
@@ -164,27 +173,12 @@ function MobileDock({ activePath }: { activePath: string }) {
   )
 }
 
-function TopBar({
-  activePage,
-  theme,
-  onToggleTheme,
-}: {
-  activePage: ReturnType<typeof pageFromPath>
-  theme: "dark" | "light"
-  onToggleTheme: () => void
-}) {
+function TopBar({ activePage, theme, onToggleTheme }: { activePage: ReturnType<typeof pageFromPath>; theme: "dark" | "light"; onToggleTheme: () => void }) {
   const loading = useDustDeskStore((state) => state.loading)
   const error = useDustDeskStore((state) => state.error)
   const refresh = useDustDeskStore((state) => state.refresh)
   const openSpecial = useDustDeskStore((state) => state.openSpecial)
-  const desktopFrames = useDustDeskStore((state) => state.desktopFrames)
-  const refreshDesktopFrameVisibility = useDustDeskStore((state) => state.refreshDesktopFrameVisibility)
-  const toggleDesktopFrames = useDustDeskStore((state) => state.toggleDesktopFrames)
   const meta = pageMeta[activePage]
-
-  useEffect(() => {
-    void refreshDesktopFrameVisibility()
-  }, [refreshDesktopFrameVisibility])
 
   return (
     <header className="window-drag flex min-h-20 shrink-0 items-center justify-between gap-4 px-4 py-3 md:px-6">
@@ -207,13 +201,10 @@ function TopBar({
           {theme === "dark" ? <SunDim className="size-4" weight="duotone" /> : <MoonStars className="size-4" weight="duotone" />}
           {theme === "dark" ? "白色" : "黑色"}
         </Button>
+        <DesktopFrameOperationMenu />
         <Button variant="secondary" size="lg" onClick={() => void openSpecial("desktop")}>
           <Crosshair className="size-4" weight="duotone" />
           桌面
-        </Button>
-        <Button variant="secondary" size="lg" onClick={() => void toggleDesktopFrames()}>
-          <Desktop className="size-4" weight="duotone" />
-          {desktopFrames.any ? "隐藏桌面框" : "显示桌面框"}
         </Button>
         <Button variant="secondary" size="lg" onClick={() => void refresh()}>
           <ArrowsClockwise className="size-4" weight="duotone" />

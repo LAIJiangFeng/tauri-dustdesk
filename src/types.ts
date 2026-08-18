@@ -1,16 +1,15 @@
-export type AppPage =
-  | "home"
-  | "organizer"
-  | "launcher"
-  | "search"
-  | "clipboard"
-  | "settings"
+export type AppPage = "home" | "organizer" | "launcher" | "search" | "clipboard" | "settings"
 
 export interface DeskCategory {
   name: string
   is_collapsed: boolean
   item_paths: string[]
   item_details: DesktopItem[]
+}
+
+export interface CategoryOrderChangedEvent {
+  from_index: number
+  to_index: number
 }
 
 export interface DesktopItem {
@@ -39,6 +38,11 @@ export interface DesktopFrameVisibility {
   any: boolean
 }
 
+export interface DesktopWindowState {
+  locked: boolean
+  click_through: boolean
+}
+
 export interface DesktopWindowLayout {
   x: number
   y: number
@@ -48,6 +52,8 @@ export interface DesktopWindowLayout {
 
 export interface DesktopLayout {
   split_category_indices: number[]
+  locked: boolean
+  click_through: boolean
   windows: Record<string, DesktopWindowLayout>
 }
 

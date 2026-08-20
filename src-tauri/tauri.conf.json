@@ -23,6 +23,7 @@
         "minHeight": 320,
         "resizable": true,
         "maximizable": false,
+        "minimizable": false,
         "decorations": false,
         "transparent": true,
         "shadow": false,

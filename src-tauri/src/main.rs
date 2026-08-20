@@ -4,6 +4,8 @@ mod clipboard_bridge;
 mod models;
 mod store;
 mod system_icon;
+#[cfg(windows)]
+mod windows_show_desktop;
 
 use std::{
     cmp::Ordering as CmpOrdering,
@@ -10708,9 +10710,18 @@ fn restore_desktop_card_size_if_collapsed(
 }
 
 fn keep_desktop_window_behind_apps(window: &WebviewWindow) {
+    let _ = window.set_skip_taskbar(true);
+    #[cfg(windows)]
+    {
+        windows_show_desktop::configure_desktop_card_window(window);
+        if windows_show_desktop::is_active() {
+            windows_show_desktop::request_z_order_refresh(window.app_handle());
+            return;
+        }
+    }
+
     let _ = window.set_always_on_top(false);
     let _ = window.set_always_on_bottom(true);
-    let _ = window.set_skip_taskbar(true);
 }
 
 fn keep_desktop_windows_behind_apps(app: &tauri::AppHandle) {
@@ -10795,6 +10806,7 @@ fn create_desktop_card(
             .position(x, y)
             .resizable(true)
             .maximizable(false)
+            .minimizable(false)
             .decorations(false)
             .transparent(true)
             .shadow(false)
@@ -11390,6 +11402,8 @@ fn main() {
         .setup(|app| {
             let app_handle = app.handle().clone();
             setup_system_tray(&app_handle)?;
+            #[cfg(windows)]
+            windows_show_desktop::start(app_handle.clone());
             let show_main_on_start = !is_startup_launch_invocation();
             let handle = app.handle().clone();
             tauri::async_runtime::spawn_blocking(move || {

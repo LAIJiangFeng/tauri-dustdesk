@@ -1,6 +1,6 @@
 [package]
 name = "dustdesk-tauri"
-version = "0.1.4"
+version = "0.1.5"
 description = "DeskNest desktop manager"
 edition = "2021"
 publish = false

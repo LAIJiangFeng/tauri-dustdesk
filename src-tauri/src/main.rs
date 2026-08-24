@@ -34,8 +34,8 @@ use std::os::windows::{
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use models::{
     AppConfig, AppSettings, AppSnapshot, CategoryClassifyCount, ClassifyResult,
-    ClipboardHistoryItem, DeskCategory, DesktopItem, DesktopWindowLayout, LaunchItem,
-    PathIconResult, SearchHistoryData, SearchHistoryItem, SearchItem, SearchItemKind,
+    ClipboardHistoryItem, DeskCategory, DesktopIconPosition, DesktopItem, DesktopWindowLayout,
+    LaunchItem, PathIconResult, SearchHistoryData, SearchHistoryItem, SearchItem, SearchItemKind,
     SearchOverlayData,
 };
 use serde::{Deserialize, Serialize};
@@ -216,6 +216,7 @@ struct ClassifyCandidate {
     category_name: String,
     is_dir: bool,
     work_estimate: u64,
+    desktop_icon_position: Option<DesktopIconPosition>,
 }
 
 #[derive(Debug)]
@@ -230,6 +231,14 @@ struct RestoreCandidate {
     source: PathBuf,
     original_config_path: Option<String>,
     category_index: Option<usize>,
+    desktop_icon_position: Option<DesktopIconPosition>,
+}
+
+#[derive(Debug, Default)]
+struct ExitDesktopRestoreOutcome {
+    restored: usize,
+    icon_positions: Vec<(PathBuf, DesktopIconPosition)>,
+    restore_errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -282,6 +291,8 @@ struct RestartCategoryMarker {
 struct RestartItemMarker {
     source_path: String,
     desktop_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    desktop_icon_position: Option<DesktopIconPosition>,
 }
 
 trait DesktopOrganizationRestartPersistence {
@@ -710,12 +721,27 @@ fn add_items_to_category_impl(index: usize, paths: Vec<String>) -> Result<usize,
             if path.trim().is_empty() || !Path::new(&path).exists() {
                 continue;
             }
+            let desktop_icon_position =
+                desktop_icon_position_for_path(&config.desktop_icon_positions, &path)
+                    .or_else(|| capture_desktop_icon_position(Path::new(&path)));
             let archived_path = archive_item_path(&store, &category_name, &path)?;
 
             for category in &mut config.desktop_categories {
                 category.item_paths.retain(|item_path| {
                     !same_path_text(item_path, &path) && !same_path_text(item_path, &archived_path)
                 });
+            }
+            remove_desktop_icon_position_for_path(&mut config.desktop_icon_positions, &path);
+            remove_desktop_icon_position_for_path(
+                &mut config.desktop_icon_positions,
+                &archived_path,
+            );
+            if let Some(position) = desktop_icon_position {
+                set_desktop_icon_position_for_path(
+                    &mut config.desktop_icon_positions,
+                    archived_path.clone(),
+                    position,
+                );
             }
 
             config.desktop_categories[index]
@@ -771,7 +797,8 @@ fn restore_item_to_desktop_impl(
     path: String,
     position: Option<DesktopDropPosition>,
 ) -> Result<String, String> {
-    let restored_path = with_config_mutation(|| {
+    let requested_icon_position = desktop_drop_position_to_icon_position(position);
+    let (restored_path, stored_icon_position) = with_config_mutation(|| {
         let path = normalize_path_input(&path)?;
         let store = AppStore::open().map_err(to_message)?;
         clear_desktop_organization_restart_marker(&AppDesktopOrganizationRestartPersistence)?;
@@ -782,12 +809,27 @@ fn restore_item_to_desktop_impl(
         fs::create_dir_all(&desktop).map_err(to_message)?;
         let source = recover_existing_path_from_corrupted_text(&path)
             .unwrap_or_else(|| PathBuf::from(&path));
+        let stored_icon_position =
+            desktop_icon_position_for_path(&config.desktop_icon_positions, &path).or_else(|| {
+                desktop_icon_position_for_path(
+                    &config.desktop_icon_positions,
+                    &source.display().to_string(),
+                )
+            });
         let restored_path = restore_path_to_desktop(&source, &desktop)?;
         remove_category_path_from_config(&mut config, index, &path)?;
+        remove_desktop_icon_position_for_path(&mut config.desktop_icon_positions, &path);
+        remove_desktop_icon_position_for_path(
+            &mut config.desktop_icon_positions,
+            &source.display().to_string(),
+        );
         store.save_config(&config).map_err(to_message)?;
-        Ok(restored_path)
+        Ok((restored_path, stored_icon_position))
     })?;
-    position_desktop_icon(&restored_path, position);
+    position_desktop_icon_at(
+        &restored_path,
+        requested_icon_position.or(stored_icon_position),
+    );
     emit_desktop_cards_changed(app);
     Ok(restored_path.display().to_string())
 }
@@ -1060,6 +1102,11 @@ fn classify_desktop_items_with_progress(
             let category_name = config.desktop_categories[category_index].name.clone();
             let work_estimate = estimate_transfer_work(Path::new(&original_path));
             candidates.push(ClassifyCandidate {
+                desktop_icon_position: desktop_icon_position_for_path(
+                    &config.desktop_icon_positions,
+                    &original_path,
+                )
+                .or_else(|| capture_desktop_icon_position(Path::new(&original_path))),
                 original_path,
                 category_index,
                 category_name,
@@ -1216,6 +1263,21 @@ fn classify_desktop_items_with_progress(
                                 !same_path_text(item_path, &candidate.original_path)
                                     && !same_path_text(item_path, &archived_path)
                             });
+                        }
+                        remove_desktop_icon_position_for_path(
+                            &mut config.desktop_icon_positions,
+                            &candidate.original_path,
+                        );
+                        remove_desktop_icon_position_for_path(
+                            &mut config.desktop_icon_positions,
+                            &archived_path,
+                        );
+                        if let Some(position) = candidate.desktop_icon_position {
+                            set_desktop_icon_position_for_path(
+                                &mut config.desktop_icon_positions,
+                                archived_path.clone(),
+                                position,
+                            );
                         }
 
                         push_unique_text_path(
@@ -2530,7 +2592,8 @@ fn restore_desktop_organization_for_exit_with_progress(
             &desktop,
             &persistence,
             &mut on_progress,
-        );
+        )
+        .and_then(|outcome| finish_exit_desktop_restore_outcome(outcome, true));
 
         // Cross-volume directory moves commit before their quarantine cleanup. Do not let the
         // process exit while a newly restored desktop destination still has an active journal.
@@ -2557,6 +2620,25 @@ fn restore_desktop_organization_for_exit_core(
         persistence,
         &mut |_, _, _| {},
     )
+    .and_then(|outcome| finish_exit_desktop_restore_outcome(outcome, false))
+}
+
+fn finish_exit_desktop_restore_outcome(
+    outcome: ExitDesktopRestoreOutcome,
+    apply_icon_positions: bool,
+) -> Result<usize, String> {
+    if apply_icon_positions {
+        position_desktop_icons(&outcome.icon_positions);
+    }
+    if outcome.restore_errors.is_empty() {
+        Ok(outcome.restored)
+    } else {
+        Err(format!(
+            "有 {} 个收纳项目未能还原到桌面：{}",
+            outcome.restore_errors.len(),
+            outcome.restore_errors.join("；")
+        ))
+    }
 }
 
 fn restore_desktop_organization_for_exit_core_with_progress(
@@ -2564,7 +2646,7 @@ fn restore_desktop_organization_for_exit_core_with_progress(
     desktop: &Path,
     persistence: &impl DesktopOrganizationRestartPersistence,
     on_progress: &mut impl FnMut(usize, usize, &Path),
-) -> Result<usize, String> {
+) -> Result<ExitDesktopRestoreOutcome, String> {
     store.ensure_runtime_dirs().map_err(to_message)?;
     fs::create_dir_all(desktop).map_err(to_message)?;
     let mut config = store.load_config_strict().map_err(to_message)?;
@@ -2576,7 +2658,7 @@ fn restore_desktop_organization_for_exit_core_with_progress(
     if marker.is_empty() {
         clear_desktop_organization_restart_marker(persistence)?;
         store.save_config(&config).map_err(to_message)?;
-        return Ok(0);
+        return Ok(ExitDesktopRestoreOutcome::default());
     }
 
     // The complete intent is durable before the first physical move.
@@ -2584,6 +2666,7 @@ fn restore_desktop_organization_for_exit_core_with_progress(
     let organizer_root = store.organizer_root();
     let mut restored_sources = Vec::<String>::new();
     let mut restore_errors = Vec::<String>::new();
+    let mut icon_positions = Vec::<(PathBuf, DesktopIconPosition)>::new();
     let mut restored = 0usize;
     let total = marker
         .categories
@@ -2636,6 +2719,12 @@ fn restore_desktop_organization_for_exit_core_with_progress(
                 match move_path(&source, &destination) {
                     Ok(()) => {
                         notify_shell_path_moved(&source, &destination);
+                        if let Some(position) = marker.categories[category_index].items[item_index]
+                            .desktop_icon_position
+                            .clone()
+                        {
+                            icon_positions.push((destination.clone(), position));
+                        }
                         restored_sources.push(source.display().to_string());
                         restored += 1;
                         on_progress(restored, total, &destination);
@@ -2686,17 +2775,16 @@ fn restore_desktop_organization_for_exit_core_with_progress(
                 .any(|source| same_path_text(source, item_path))
         });
     }
+    for source in &restored_sources {
+        remove_desktop_icon_position_for_path(&mut config.desktop_icon_positions, source);
+    }
     store.save_config(&config).map_err(to_message)?;
     cleanup_empty_organizer_dirs(&organizer_root);
-    if restore_errors.is_empty() {
-        Ok(restored)
-    } else {
-        Err(format!(
-            "有 {} 个收纳项目未能还原到桌面：{}",
-            restore_errors.len(),
-            restore_errors.join("；")
-        ))
-    }
+    Ok(ExitDesktopRestoreOutcome {
+        restored,
+        icon_positions,
+        restore_errors,
+    })
 }
 
 fn recollect_desktop_organization_from_restart_marker_with_progress(
@@ -2782,7 +2870,7 @@ fn recollect_desktop_organization_from_restart_marker_core_with_progress(
             restart_category_index(&mut config, &category_marker, &mut claimed_category_indices);
         let mut failed_items = Vec::new();
 
-        for item in category_marker.items {
+        for mut item in category_marker.items {
             processed += 1;
             let source = PathBuf::from(&item.source_path);
             let desktop_path = item.desktop_path.as_deref().map(PathBuf::from);
@@ -2790,6 +2878,13 @@ fn recollect_desktop_organization_from_restart_marker_core_with_progress(
             let desktop_source = desktop_path
                 .as_ref()
                 .filter(|path| valid_restart_desktop_path(path, desktop));
+            let desktop_icon_position = item
+                .desktop_icon_position
+                .clone()
+                .or_else(|| desktop_source.and_then(|path| capture_desktop_icon_position(path)));
+            if item.desktop_icon_position.is_none() {
+                item.desktop_icon_position = desktop_icon_position.clone();
+            }
 
             if source_exists && desktop_source.is_some() {
                 // Paths alone cannot distinguish a destination race from an externally recreated
@@ -2813,6 +2908,13 @@ fn recollect_desktop_organization_from_restart_marker_core_with_progress(
                     &mut config.desktop_categories[target_category_index].item_paths,
                     source.display().to_string(),
                 );
+                if let Some(position) = desktop_icon_position {
+                    set_desktop_icon_position_for_path(
+                        &mut config.desktop_icon_positions,
+                        source.display().to_string(),
+                        position,
+                    );
+                }
                 recollected += 1;
                 on_progress(processed, total, &source);
                 continue;
@@ -2829,8 +2931,15 @@ fn recollect_desktop_organization_from_restart_marker_core_with_progress(
                         );
                         push_unique_text_path(
                             &mut config.desktop_categories[target_category_index].item_paths,
-                            archived_path,
+                            archived_path.clone(),
                         );
+                        if let Some(position) = desktop_icon_position {
+                            set_desktop_icon_position_for_path(
+                                &mut config.desktop_icon_positions,
+                                archived_path,
+                                position,
+                            );
+                        }
                         recollected += 1;
                         on_progress(processed, total, &archived_path_buf);
                     }
@@ -2928,12 +3037,19 @@ fn prepare_exit_restart_marker(
                     });
                     marker.categories.len() - 1
                 });
+            let source_path = source.display().to_string();
+            let mut marker_item = existing_item.unwrap_or_else(|| RestartItemMarker {
+                source_path: source_path.clone(),
+                desktop_path: None,
+                desktop_icon_position: None,
+            });
+            if marker_item.desktop_icon_position.is_none() {
+                marker_item.desktop_icon_position =
+                    desktop_icon_position_for_path(&config.desktop_icon_positions, &source_path);
+            }
             marker.categories[marker_category_index]
                 .items
-                .push(existing_item.unwrap_or_else(|| RestartItemMarker {
-                    source_path: source.display().to_string(),
-                    desktop_path: None,
-                }));
+                .push(marker_item);
         }
     }
 
@@ -3089,7 +3205,7 @@ fn restore_all_organized_items_to_desktop_with_progress(
 fn restore_all_organized_items_to_desktop_impl(
     mut on_progress: impl FnMut(usize, usize, &Path),
 ) -> Result<usize, String> {
-    let (restored, desktop, organizer_root) = with_config_mutation(|| {
+    let restore_result = with_config_mutation(|| {
         let store = AppStore::open().map_err(to_message)?;
         clear_desktop_organization_restart_marker(&AppDesktopOrganizationRestartPersistence)?;
         store.ensure_runtime_dirs().map_err(to_message)?;
@@ -3107,6 +3223,7 @@ fn restore_all_organized_items_to_desktop_impl(
         let total = restore_candidate_count(&config, &organizer_root, &desktop);
         let mut seen_paths = Vec::<String>::new();
         let mut candidates = Vec::<RestoreCandidate>::new();
+        let stored_icon_positions = config.desktop_icon_positions.clone();
 
         for (category_index, category) in config.desktop_categories.iter_mut().enumerate() {
             let old_paths = std::mem::take(&mut category.item_paths);
@@ -3126,10 +3243,19 @@ fn restore_all_organized_items_to_desktop_impl(
                     let normalized = normalize_path_for_compare(&source);
                     if !seen_paths.iter().any(|path| path == &normalized) {
                         seen_paths.push(normalized);
+                        let desktop_icon_position =
+                            desktop_icon_position_for_path(&stored_icon_positions, &item_path)
+                                .or_else(|| {
+                                    desktop_icon_position_for_path(
+                                        &stored_icon_positions,
+                                        &source.display().to_string(),
+                                    )
+                                });
                         candidates.push(RestoreCandidate {
                             source,
                             original_config_path: Some(item_path),
                             category_index: Some(category_index),
+                            desktop_icon_position,
                         });
                     }
                 } else {
@@ -3151,6 +3277,10 @@ fn restore_all_organized_items_to_desktop_impl(
             }
             seen_paths.push(normalized);
             candidates.push(RestoreCandidate {
+                desktop_icon_position: desktop_icon_position_for_path(
+                    &stored_icon_positions,
+                    &path.display().to_string(),
+                ),
                 source: path,
                 original_config_path: None,
                 category_index: None,
@@ -3161,6 +3291,7 @@ fn restore_all_organized_items_to_desktop_impl(
         let queue = Arc::new(Mutex::new(VecDeque::from(candidates)));
         let (sender, receiver) = mpsc::channel();
         let mut restored = 0usize;
+        let mut restored_icon_positions = Vec::<(PathBuf, DesktopIconPosition)>::new();
 
         std::thread::scope(|scope| -> Result<(), String> {
             for _ in 0..worker_count {
@@ -3197,6 +3328,19 @@ fn restore_all_organized_items_to_desktop_impl(
 
                 match restore_result {
                     Ok(restored_path) => {
+                        remove_desktop_icon_position_for_path(
+                            &mut config.desktop_icon_positions,
+                            &candidate.source.display().to_string(),
+                        );
+                        if let Some(original_path) = candidate.original_config_path.as_deref() {
+                            remove_desktop_icon_position_for_path(
+                                &mut config.desktop_icon_positions,
+                                original_path,
+                            );
+                        }
+                        if let Some(position) = candidate.desktop_icon_position {
+                            restored_icon_positions.push((restored_path.clone(), position));
+                        }
                         restored += 1;
                         on_progress(restored, total, &restored_path);
                     }
@@ -3222,11 +3366,18 @@ fn restore_all_organized_items_to_desktop_impl(
 
         cleanup_empty_organizer_dirs(&organizer_root);
         config.desktop_layout.split_category_indices.clear();
+        retain_desktop_icon_positions_for_categories(&mut config);
         if config_is_writable {
             store.save_config(&config).map_err(to_message)?;
         }
-        Ok((restored, desktop, organizer_root))
+        Ok((restored, desktop, organizer_root, restored_icon_positions))
     })?;
+    let (restored, desktop, organizer_root, restored_icon_positions) = restore_result;
+
+    if restored > 0 {
+        notify_shell_directory_updated(&desktop);
+    }
+    position_desktop_icons(&restored_icon_positions);
 
     if restored > 0 {
         std::thread::spawn(move || {
@@ -3419,29 +3570,9 @@ fn notify_shell_desktop_restore(path: &Path, desktop: &Path) {
     notify_shell_directory_updated(desktop);
 }
 
-#[cfg(windows)]
-fn position_desktop_icon(path: &Path, position: Option<DesktopDropPosition>) {
-    let Some((screen_x, screen_y)) = desktop_drop_position_to_physical(position) else {
-        return;
-    };
-
-    for _ in 0..12 {
-        if let Some(listview) = desktop_listview_window() {
-            if let Some(index) = desktop_listview_find_item(listview, path) {
-                if desktop_listview_set_item_position(listview, index, screen_x, screen_y) {
-                    return;
-                }
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(60));
-    }
-}
-
-#[cfg(not(windows))]
-fn position_desktop_icon(_path: &Path, _position: Option<DesktopDropPosition>) {}
-
-#[cfg(windows)]
-fn desktop_drop_position_to_physical(position: Option<DesktopDropPosition>) -> Option<(i32, i32)> {
+fn desktop_drop_position_to_icon_position(
+    position: Option<DesktopDropPosition>,
+) -> Option<DesktopIconPosition> {
     let position = position?;
     if !position.screen_x.is_finite() || !position.screen_y.is_finite() {
         return None;
@@ -3453,11 +3584,17 @@ fn desktop_drop_position_to_physical(position: Option<DesktopDropPosition>) -> O
         .unwrap_or(1.0);
     let x = (position.screen_x * scale_factor).round();
     let y = (position.screen_y * scale_factor).round();
-
-    Some((f64_to_i32_saturating(x), f64_to_i32_saturating(y)))
+    let screen_x = f64_to_i32_saturating(x);
+    let screen_y = f64_to_i32_saturating(y);
+    #[cfg(windows)]
+    let monitors = windows_desktop_monitor_work_areas();
+    #[cfg(not(windows))]
+    let monitors = Vec::new();
+    Some(desktop_icon_position_from_screen_point(
+        screen_x, screen_y, &monitors,
+    ))
 }
 
-#[cfg(windows)]
 fn f64_to_i32_saturating(value: f64) -> i32 {
     if value < i32::MIN as f64 {
         i32::MIN
@@ -3466,6 +3603,205 @@ fn f64_to_i32_saturating(value: f64) -> i32 {
     } else {
         value as i32
     }
+}
+
+fn desktop_icon_position_from_screen_point(
+    screen_x: i32,
+    screen_y: i32,
+    monitors: &[DesktopMonitorWorkArea],
+) -> DesktopIconPosition {
+    let monitor = monitors
+        .iter()
+        .find(|monitor| desktop_monitor_contains_point(monitor, screen_x, screen_y));
+    DesktopIconPosition {
+        screen_x,
+        screen_y,
+        monitor_name: monitor.and_then(|monitor| monitor.name.clone()),
+        monitor_offset_x: monitor.map(|monitor| screen_x.saturating_sub(monitor.x)),
+        monitor_offset_y: monitor.map(|monitor| screen_y.saturating_sub(monitor.y)),
+    }
+}
+
+fn resolve_desktop_icon_position(
+    position: DesktopIconPosition,
+    monitors: &[DesktopMonitorWorkArea],
+) -> (i32, i32) {
+    if let (Some(monitor_name), Some(offset_x), Some(offset_y)) = (
+        position.monitor_name.as_deref(),
+        position.monitor_offset_x,
+        position.monitor_offset_y,
+    ) {
+        if let Some(monitor) = monitors.iter().find(|monitor| {
+            monitor
+                .name
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case(monitor_name))
+        }) {
+            return clamp_desktop_icon_point_to_monitor(
+                monitor,
+                monitor.x.saturating_add(offset_x),
+                monitor.y.saturating_add(offset_y),
+            );
+        }
+    }
+
+    if monitors.iter().any(|monitor| {
+        desktop_monitor_contains_point(monitor, position.screen_x, position.screen_y)
+    }) {
+        return (position.screen_x, position.screen_y);
+    }
+
+    monitors
+        .iter()
+        .min_by_key(|monitor| {
+            let (x, y) =
+                clamp_desktop_icon_point_to_monitor(monitor, position.screen_x, position.screen_y);
+            let distance_x = i128::from(position.screen_x) - i128::from(x);
+            let distance_y = i128::from(position.screen_y) - i128::from(y);
+            distance_x * distance_x + distance_y * distance_y
+        })
+        .map(|monitor| {
+            clamp_desktop_icon_point_to_monitor(monitor, position.screen_x, position.screen_y)
+        })
+        .unwrap_or((position.screen_x, position.screen_y))
+}
+
+fn desktop_monitor_contains_point(
+    monitor: &DesktopMonitorWorkArea,
+    screen_x: i32,
+    screen_y: i32,
+) -> bool {
+    let right = i64::from(monitor.x) + i64::from(monitor.width);
+    let bottom = i64::from(monitor.y) + i64::from(monitor.height);
+    i64::from(screen_x) >= i64::from(monitor.x)
+        && i64::from(screen_x) < right
+        && i64::from(screen_y) >= i64::from(monitor.y)
+        && i64::from(screen_y) < bottom
+}
+
+fn clamp_desktop_icon_point_to_monitor(
+    monitor: &DesktopMonitorWorkArea,
+    screen_x: i32,
+    screen_y: i32,
+) -> (i32, i32) {
+    let right = (i64::from(monitor.x) + i64::from(monitor.width.saturating_sub(1)))
+        .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+    let bottom = (i64::from(monitor.y) + i64::from(monitor.height.saturating_sub(1)))
+        .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+    (
+        screen_x.clamp(monitor.x, right.max(monitor.x)),
+        screen_y.clamp(monitor.y, bottom.max(monitor.y)),
+    )
+}
+
+#[cfg(windows)]
+fn capture_desktop_icon_position(path: &Path) -> Option<DesktopIconPosition> {
+    let parent = path.parent()?;
+    if !desktop_roots()
+        .iter()
+        .any(|desktop| same_path_for_move(parent, desktop))
+    {
+        return None;
+    }
+
+    let listview = desktop_listview_window()?;
+    let index = desktop_listview_find_item(listview, path)?;
+    desktop_listview_get_item_position(listview, index)
+}
+
+#[cfg(not(windows))]
+fn capture_desktop_icon_position(_path: &Path) -> Option<DesktopIconPosition> {
+    None
+}
+
+#[cfg(windows)]
+fn position_desktop_icon_at(path: &Path, position: Option<DesktopIconPosition>) {
+    let Some(position) = position else {
+        return;
+    };
+    position_desktop_icons(&[(path.to_path_buf(), position)]);
+}
+
+#[cfg(not(windows))]
+fn position_desktop_icon_at(_path: &Path, _position: Option<DesktopIconPosition>) {}
+
+#[cfg(windows)]
+fn position_desktop_icons(items: &[(PathBuf, DesktopIconPosition)]) {
+    let monitors = windows_desktop_monitor_work_areas();
+    let mut pending = items.to_vec();
+    for _ in 0..16 {
+        if let Some(listview) = desktop_listview_window() {
+            pending.retain(|(path, position)| {
+                let Some(index) = desktop_listview_find_item(listview, path) else {
+                    return true;
+                };
+                let (screen_x, screen_y) =
+                    resolve_desktop_icon_position(position.clone(), &monitors);
+                !desktop_listview_set_item_position(listview, index, screen_x, screen_y)
+            });
+            if pending.is_empty() {
+                return;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(75));
+    }
+}
+
+#[cfg(not(windows))]
+fn position_desktop_icons(_items: &[(PathBuf, DesktopIconPosition)]) {}
+
+#[cfg(windows)]
+fn windows_desktop_monitor_work_areas() -> Vec<DesktopMonitorWorkArea> {
+    use std::{
+        mem::size_of,
+        ptr::{null, null_mut},
+    };
+
+    use windows_sys::Win32::Graphics::Gdi::{
+        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW,
+    };
+
+    unsafe extern "system" fn collect_monitor(
+        monitor: HMONITOR,
+        _hdc: HDC,
+        _rect: *mut windows_sys::Win32::Foundation::RECT,
+        data: windows_sys::Win32::Foundation::LPARAM,
+    ) -> windows_sys::core::BOOL {
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+        if unsafe { GetMonitorInfoW(monitor, &mut info.monitorInfo) } == 0 {
+            return 1;
+        }
+
+        let name_len = info
+            .szDevice
+            .iter()
+            .position(|character| *character == 0)
+            .unwrap_or(info.szDevice.len());
+        let name = (name_len > 0).then(|| String::from_utf16_lossy(&info.szDevice[..name_len]));
+        let work = info.monitorInfo.rcWork;
+        let monitors = unsafe { &mut *(data as *mut Vec<DesktopMonitorWorkArea>) };
+        monitors.push(DesktopMonitorWorkArea {
+            name,
+            x: work.left,
+            y: work.top,
+            width: work.right.saturating_sub(work.left) as u32,
+            height: work.bottom.saturating_sub(work.top) as u32,
+            scale_factor: 1.0,
+        });
+        1
+    }
+
+    let mut monitors = Vec::new();
+    unsafe {
+        EnumDisplayMonitors(
+            null_mut(),
+            null(),
+            Some(collect_monitor),
+            (&mut monitors as *mut Vec<DesktopMonitorWorkArea>) as isize,
+        );
+    }
+    monitors
 }
 
 #[cfg(windows)]
@@ -3561,6 +3897,92 @@ fn desktop_listview_find_item(
         }
     }
     None
+}
+
+#[cfg(windows)]
+fn desktop_listview_get_item_position(
+    listview: windows_sys::Win32::Foundation::HWND,
+    index: i32,
+) -> Option<DesktopIconPosition> {
+    use std::{
+        mem::size_of,
+        ptr::{null, null_mut},
+    };
+
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, POINT},
+        Graphics::Gdi::ClientToScreen,
+        System::{
+            Diagnostics::Debug::ReadProcessMemory,
+            Memory::{
+                VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
+            },
+            Threading::{
+                OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ,
+            },
+        },
+        UI::WindowsAndMessaging::{GetWindowThreadProcessId, SendMessageW},
+    };
+
+    const LVM_GETITEMPOSITION: u32 = 0x1000 + 16;
+
+    unsafe {
+        let mut process_id = 0u32;
+        GetWindowThreadProcessId(listview, &mut process_id);
+        if process_id == 0 {
+            return None;
+        }
+
+        let process = OpenProcess(
+            PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_READ,
+            0,
+            process_id,
+        );
+        if process.is_null() {
+            return None;
+        }
+
+        let point_size = size_of::<POINT>();
+        let remote_point = VirtualAllocEx(
+            process,
+            null(),
+            point_size,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE,
+        );
+        if remote_point.is_null() {
+            CloseHandle(process);
+            return None;
+        }
+
+        let result = SendMessageW(
+            listview,
+            LVM_GETITEMPOSITION,
+            index as usize,
+            remote_point as isize,
+        );
+        let mut point = POINT::default();
+        let read_position = result != 0
+            && ReadProcessMemory(
+                process,
+                remote_point,
+                (&mut point as *mut POINT).cast(),
+                point_size,
+                null_mut(),
+            ) != 0;
+
+        VirtualFreeEx(process, remote_point, 0, MEM_RELEASE);
+        CloseHandle(process);
+        if !read_position || ClientToScreen(listview, &mut point) == 0 {
+            return None;
+        }
+
+        Some(desktop_icon_position_from_screen_point(
+            point.x,
+            point.y,
+            &windows_desktop_monitor_work_areas(),
+        ))
+    }
 }
 
 #[cfg(windows)]
@@ -3776,20 +4198,22 @@ fn desktop_listview_set_item_position(
             point_size,
             null_mut(),
         ) != 0;
-        let result = if wrote_point {
+        let sent = if wrote_point {
+            // 该消息没有可用返回值，发送完成即表示请求已交给桌面列表处理。
             SendMessageW(
                 listview,
                 LVM_SETITEMPOSITION32,
                 index as usize,
                 remote_point as isize,
-            )
+            );
+            true
         } else {
-            0
+            false
         };
 
         VirtualFreeEx(process, remote_point, 0, MEM_RELEASE);
         CloseHandle(process);
-        result != 0
+        sent
     }
 }
 
@@ -4588,6 +5012,13 @@ fn rewrite_runtime_path_prefixes(
         }
     }
 
+    let previous_icon_positions = std::mem::take(&mut config.desktop_icon_positions);
+    for (path, position) in previous_icon_positions {
+        let next_path = rewrite_path_prefix(&path, replacements).unwrap_or_else(|| path.clone());
+        changed |= !same_path_text(&path, &next_path);
+        set_desktop_icon_position_for_path(&mut config.desktop_icon_positions, next_path, position);
+    }
+
     for search_path in &mut config.settings.search_paths {
         if let Some(next_path) = rewrite_path_prefix(search_path, replacements) {
             *search_path = next_path;
@@ -5118,6 +5549,50 @@ fn categories_contain_path(categories: &[DeskCategory], path: &str) -> bool {
     })
 }
 
+fn desktop_icon_position_for_path(
+    positions: &BTreeMap<String, DesktopIconPosition>,
+    path: &str,
+) -> Option<DesktopIconPosition> {
+    positions
+        .iter()
+        .find_map(|(candidate, position)| same_path_text(candidate, path).then(|| position.clone()))
+}
+
+fn remove_desktop_icon_position_for_path(
+    positions: &mut BTreeMap<String, DesktopIconPosition>,
+    path: &str,
+) -> Option<DesktopIconPosition> {
+    let key = positions
+        .keys()
+        .find(|candidate| same_path_text(candidate, path))
+        .cloned()?;
+    positions.remove(&key)
+}
+
+fn set_desktop_icon_position_for_path(
+    positions: &mut BTreeMap<String, DesktopIconPosition>,
+    path: String,
+    position: DesktopIconPosition,
+) {
+    remove_desktop_icon_position_for_path(positions, &path);
+    positions.insert(path, position);
+}
+
+fn retain_desktop_icon_positions_for_categories(config: &mut AppConfig) -> bool {
+    let organized_paths = config
+        .desktop_categories
+        .iter()
+        .flat_map(|category| category.item_paths.iter().cloned())
+        .collect::<Vec<_>>();
+    let previous_len = config.desktop_icon_positions.len();
+    config.desktop_icon_positions.retain(|path, _| {
+        organized_paths
+            .iter()
+            .any(|organized_path| same_path_text(organized_path, path))
+    });
+    config.desktop_icon_positions.len() != previous_len
+}
+
 fn has_any(value: &str, keywords: &[&str]) -> bool {
     keywords.iter().any(|keyword| value.contains(keyword))
 }
@@ -5363,6 +5838,8 @@ fn repair_category_item_paths_with_desktop_roots(
             changed = true;
         }
     }
+
+    changed |= retain_desktop_icon_positions_for_categories(config);
 
     if changed {
         store.save_config(config).map_err(to_message)?;
@@ -7649,6 +8126,45 @@ mod tests {
     }
 
     #[test]
+    fn desktop_icon_position_tracks_original_secondary_monitor() {
+        let original_monitors = vec![
+            desktop_test_work_area("DISPLAY1", 0, 0, 1707, 1019, 1.5),
+            desktop_test_work_area("DISPLAY5", -1920, 184, 1920, 1032, 1.0),
+        ];
+        let position = desktop_icon_position_from_screen_point(-1500, 300, &original_monitors);
+
+        assert_eq!(position.monitor_name.as_deref(), Some("DISPLAY5"));
+        assert_eq!(position.monitor_offset_x, Some(420));
+        assert_eq!(position.monitor_offset_y, Some(116));
+
+        let moved_monitors = vec![
+            desktop_test_work_area("DISPLAY1", 0, 0, 1707, 1019, 1.5),
+            desktop_test_work_area("DISPLAY5", 1707, 0, 1920, 1032, 1.0),
+        ];
+        assert_eq!(
+            resolve_desktop_icon_position(position, &moved_monitors),
+            (2127, 116)
+        );
+    }
+
+    #[test]
+    fn desktop_icon_position_falls_back_to_visible_monitor() {
+        let position = DesktopIconPosition {
+            screen_x: -1500,
+            screen_y: 300,
+            monitor_name: Some("DISPLAY5".to_owned()),
+            monitor_offset_x: Some(420),
+            monitor_offset_y: Some(116),
+        };
+        let available_monitors = vec![desktop_test_work_area("DISPLAY1", 0, 0, 1707, 1019, 1.5)];
+
+        assert_eq!(
+            resolve_desktop_icon_position(position, &available_monitors),
+            (0, 300)
+        );
+    }
+
+    #[test]
     fn desktop_layout_falls_back_when_saved_monitor_is_disconnected() {
         let work_areas = vec![desktop_test_work_area("DISPLAY1", 0, 0, 1920, 1040, 1.0)];
         let layout = DesktopWindowLayout {
@@ -7897,6 +8413,7 @@ mod tests {
         };
         let mut config = AppConfig {
             desktop_categories: vec![category("A"), category("B"), category("C"), category("D")],
+            desktop_icon_positions: BTreeMap::new(),
             settings: AppSettings::default(),
             desktop_layout: DesktopLayout {
                 split_category_indices: vec![0, 2],
@@ -8524,6 +9041,13 @@ mod tests {
         fs::create_dir_all(&category_dir).expect("create category");
         let source = category_dir.join("report.txt");
         let unmarked_desktop_item = desktop.join("report.txt");
+        let icon_position = DesktopIconPosition {
+            screen_x: -1440,
+            screen_y: 360,
+            monitor_name: Some(r"\\.\DISPLAY5".to_owned()),
+            monitor_offset_x: Some(480),
+            monitor_offset_y: Some(176),
+        };
         fs::write(&source, b"organized copy").expect("write organized source");
         fs::write(&unmarked_desktop_item, b"keep desktop copy").expect("write desktop collision");
         store
@@ -8533,14 +9057,23 @@ mod tests {
                     item_paths: vec![source.display().to_string()],
                     ..DeskCategory::default()
                 }],
+                desktop_icon_positions: BTreeMap::from([(
+                    source.display().to_string(),
+                    icon_position.clone(),
+                )]),
                 ..AppConfig::default()
             })
             .expect("save config");
         let persistence = MemoryRestartPersistence::default();
         restore_desktop_organization_for_exit_core(&store, &desktop, &persistence)
             .expect("exit restore");
+        let marker = persistence.current().expect("marker");
+        assert_eq!(
+            marker.categories[0].items[0].desktop_icon_position,
+            Some(icon_position.clone())
+        );
         let planned = PathBuf::from(
-            persistence.current().expect("marker").categories[0].items[0]
+            marker.categories[0].items[0]
                 .desktop_path
                 .clone()
                 .expect("planned path"),
@@ -8571,6 +9104,13 @@ mod tests {
             &config.desktop_categories[0].item_paths[0],
             &source.display().to_string()
         ));
+        assert_eq!(
+            desktop_icon_position_for_path(
+                &config.desktop_icon_positions,
+                &source.display().to_string(),
+            ),
+            Some(icon_position)
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -8644,6 +9184,7 @@ mod tests {
                     items: vec![RestartItemMarker {
                         source_path: ok_source.display().to_string(),
                         desktop_path: Some(ok_desktop.display().to_string()),
+                        desktop_icon_position: None,
                     }],
                 },
                 RestartCategoryMarker {
@@ -8652,6 +9193,7 @@ mod tests {
                     items: vec![RestartItemMarker {
                         source_path: blocked_source.display().to_string(),
                         desktop_path: Some(blocked_desktop.display().to_string()),
+                        desktop_icon_position: None,
                     }],
                 },
             ],
@@ -8741,6 +9283,7 @@ mod tests {
                         items: vec![RestartItemMarker {
                             source_path: source.display().to_string(),
                             desktop_path: (state != 0).then(|| desktop_path.display().to_string()),
+                            desktop_icon_position: None,
                         }],
                     }],
                 });
@@ -8792,6 +9335,7 @@ mod tests {
                 items: vec![RestartItemMarker {
                     source_path: source.display().to_string(),
                     desktop_path: Some(desktop_path.display().to_string()),
+                    desktop_icon_position: None,
                 }],
             }],
         });
@@ -8844,6 +9388,7 @@ mod tests {
                     items: vec![RestartItemMarker {
                         source_path: first_source.display().to_string(),
                         desktop_path: Some(first_desktop.display().to_string()),
+                        desktop_icon_position: None,
                     }],
                 },
                 RestartCategoryMarker {
@@ -8852,6 +9397,7 @@ mod tests {
                     items: vec![RestartItemMarker {
                         source_path: second_source.display().to_string(),
                         desktop_path: Some(second_desktop.display().to_string()),
+                        desktop_icon_position: None,
                     }],
                 },
             ],
@@ -8904,6 +9450,7 @@ mod tests {
                 items: vec![RestartItemMarker {
                     source_path: source.display().to_string(),
                     desktop_path: None,
+                    desktop_icon_position: None,
                 }],
             }],
         });
@@ -8930,6 +9477,7 @@ mod tests {
                 items: vec![RestartItemMarker {
                     source_path: r"C:\DesktopOrganizer\documents\item.txt".to_owned(),
                     desktop_path: Some(r"C:\Users\User\Desktop\item.txt".to_owned()),
+                    desktop_icon_position: None,
                 }],
             }],
         });
@@ -9384,6 +9932,7 @@ mod tests {
                 items: vec![RestartItemMarker {
                     source_path: source.display().to_string(),
                     desktop_path: Some(destination.display().to_string()),
+                    desktop_icon_position: None,
                 }],
             }],
         });

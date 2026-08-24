@@ -21,6 +21,14 @@ pub struct AppConfig {
     #[serde(rename = "DesktopCategories", default = "default_categories")]
     pub desktop_categories: Vec<DeskCategory>,
 
+    #[serde(
+        rename = "DesktopIconPositions",
+        alias = "desktop_icon_positions",
+        default,
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub desktop_icon_positions: BTreeMap<String, DesktopIconPosition>,
+
     #[serde(rename = "Settings", alias = "settings", default)]
     pub settings: AppSettings,
 
@@ -32,6 +40,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             desktop_categories: default_categories(),
+            desktop_icon_positions: BTreeMap::new(),
             settings: AppSettings::default(),
             desktop_layout: DesktopLayout::default(),
         }
@@ -76,6 +85,22 @@ pub struct DesktopWindowLayout {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub monitor_scale_factor: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopIconPosition {
+    pub screen_x: i32,
+    pub screen_y: i32,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitor_name: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitor_offset_x: Option<i32>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitor_offset_y: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

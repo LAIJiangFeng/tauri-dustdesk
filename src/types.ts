@@ -48,6 +48,10 @@ export interface DesktopWindowLayout {
   y: number
   width: number
   height: number
+  monitor_name?: string
+  monitor_offset_x?: number
+  monitor_offset_y?: number
+  monitor_scale_factor?: number
 }
 
 export interface DesktopLayout {

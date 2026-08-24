@@ -9,7 +9,7 @@ mod windows_show_desktop;
 
 use std::{
     cmp::Ordering as CmpOrdering,
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     env,
     ffi::OsString,
     fs::{self, File},
@@ -44,8 +44,8 @@ use tauri::{
     menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     utils::config::Color,
-    Emitter, Manager, PhysicalPosition, PhysicalSize, Position, Size, WebviewUrl, WebviewWindow,
-    WebviewWindowBuilder,
+    Emitter, Manager, Monitor, PhysicalPosition, PhysicalSize, Position, Size, WebviewUrl,
+    WebviewWindow, WebviewWindowBuilder,
 };
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
@@ -90,6 +90,7 @@ static REAL_EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 static EXIT_RESTORE_COMPLETED: AtomicBool = AtomicBool::new(false);
 static DESKTOP_OPERATION_RUNNING: AtomicBool = AtomicBool::new(false);
 static DESKTOP_WINDOW_SETTLE_SCHEDULED: AtomicBool = AtomicBool::new(false);
+static DESKTOP_MONITOR_WATCH_STARTED: AtomicBool = AtomicBool::new(false);
 static DESKTOP_WINDOW_SETTLE_GENERATION: AtomicU64 = AtomicU64::new(0);
 static DESKTOP_OPERATION_LAST: OnceLock<Mutex<Option<DesktopOperationPayload>>> = OnceLock::new();
 static TRAY_MENU_ITEMS: OnceLock<TrayMenuItems> = OnceLock::new();
@@ -112,6 +113,45 @@ struct DesktopFrameVisibility {
 struct DesktopWindowState {
     locked: bool,
     click_through: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct DesktopMonitorWorkArea {
+    name: Option<String>,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    scale_factor: f64,
+}
+
+struct DesktopMonitorTarget {
+    monitor: Monitor,
+    work_area: DesktopMonitorWorkArea,
+    stable_id: String,
+    is_primary: bool,
+}
+
+impl DesktopMonitorWorkArea {
+    fn from_monitor(monitor: &Monitor) -> Self {
+        let work_area = monitor.work_area();
+        Self {
+            name: monitor.name().cloned(),
+            x: work_area.position.x,
+            y: work_area.position.y,
+            width: work_area.size.width,
+            height: work_area.size.height,
+            scale_factor: valid_scale_factor(monitor.scale_factor()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DesktopWindowPlacement {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -505,9 +545,7 @@ fn reorder_category_impl(
     to_index: usize,
 ) -> Result<usize, String> {
     let desktop_organizer_was_visible = app.webview_windows().values().any(|window| {
-        window.is_visible().unwrap_or(false)
-            && (window.label() == "desktop-widget"
-                || desktop_category_index_from_label(window.label()).is_some())
+        window.is_visible().unwrap_or(false) && is_desktop_organizer_window_label(window.label())
     });
 
     let (categories, split_category_indices) = with_config_mutation(|| {
@@ -561,10 +599,7 @@ fn reconcile_reordered_category_windows(
         let category = categories
             .get(index)
             .ok_or_else(|| "分类不存在".to_owned())?;
-        let label = desktop_category_label(index);
-        let title = format!("DustDesk {}", category.name);
-        let url = desktop_card_url("category", Some(index));
-        show_or_create_desktop_card(app, &label, &title, &url, index)?;
+        show_desktop_category_on_all_monitors(app, index, category)?;
     }
     Ok(())
 }
@@ -599,12 +634,8 @@ fn reorder_category_config(
     config.desktop_layout.windows = previous_layouts
         .into_iter()
         .map(|(label, layout)| {
-            let mapped_label = desktop_category_index_from_label(&label)
-                .filter(|index| desktop_category_label(*index) == label)
-                .map(|index| {
-                    desktop_category_label(remap_category_index(index, from_index, to_index))
-                })
-                .unwrap_or(label);
+            let mapped_label =
+                remap_desktop_category_window_label(&label, from_index, to_index).unwrap_or(label);
             (mapped_label, layout)
         })
         .collect();
@@ -1869,7 +1900,7 @@ async fn toggle_desktop_organizer_frame(
         if visibility.organizer {
             hide_desktop_organizer_windows(&app);
         } else {
-            show_merged_desktop_widget(&app)?;
+            show_persisted_desktop_organizer(&app)?;
         }
         Ok(desktop_frame_visibility_impl(&app))
     })
@@ -1906,24 +1937,15 @@ async fn save_desktop_window_layout(app: tauri::AppHandle, label: String) -> Res
         if window.is_maximized().unwrap_or(false) {
             return Ok(());
         }
-        let position = window.outer_position().map_err(to_message)?;
-        let size = window.inner_size().map_err(to_message)?;
-        if size.width < 120 || size.height < 100 {
+        let layout = capture_desktop_window_layout(&window).map_err(to_message)?;
+        if !is_valid_desktop_window_layout(&layout) {
             return Ok(());
         }
 
         with_config_mutation(|| {
             let store = AppStore::open().map_err(to_message)?;
             let mut config = store.load_config_strict().map_err(to_message)?;
-            config.desktop_layout.windows.insert(
-                label,
-                DesktopWindowLayout {
-                    x: position.x,
-                    y: position.y,
-                    width: size.width,
-                    height: size.height,
-                },
-            );
+            config.desktop_layout.windows.insert(label, layout);
             store.save_config(&config).map_err(to_message)
         })
     })
@@ -1939,14 +1961,13 @@ async fn save_desktop_split_indices(indices: Vec<usize>) -> Result<Vec<usize>, S
 }
 
 fn show_merged_desktop_widget(app: &tauri::AppHandle) -> Result<(), String> {
-    let window = app
-        .get_webview_window("desktop-widget")
-        .ok_or_else(|| "桌面框窗口不存在".to_owned())?;
-    place_desktop_widget(&window).map_err(to_message)?;
-    show_desktop_background_window(&window)
+    for target in desktop_monitor_targets(app).map_err(to_message)? {
+        show_or_create_desktop_widget(app, &target)?;
+    }
+    Ok(())
 }
 
-fn show_persisted_desktop_layout(app: &tauri::AppHandle) -> Result<(), String> {
+fn show_persisted_desktop_organizer(app: &tauri::AppHandle) -> Result<(), String> {
     let store = AppStore::open().map_err(to_message)?;
     store.ensure_runtime_dirs().map_err(to_message)?;
     let config = store.load_config();
@@ -1959,22 +1980,27 @@ fn show_persisted_desktop_layout(app: &tauri::AppHandle) -> Result<(), String> {
     if split_indices.is_empty() {
         show_merged_desktop_widget(app)?;
     } else {
+        let hide_merged_after_split = split_indices.len() >= categories.len();
         if split_indices.len() < categories.len() {
             show_merged_desktop_widget(app)?;
-        } else if let Some(window) = app.get_webview_window("desktop-widget") {
-            let _ = window.hide();
         }
 
         for index in split_indices.iter().copied() {
             let Some(category) = categories.get(index) else {
                 continue;
             };
-            let label = desktop_category_label(index);
-            let title = format!("DustDesk {}", category.name);
-            let url = desktop_card_url("category", Some(index));
-            show_or_create_desktop_card(app, &label, &title, &url, index)?;
+            show_desktop_category_on_all_monitors(app, index, category)?;
+        }
+        if hide_merged_after_split {
+            hide_desktop_widget_windows(app);
         }
     }
+
+    Ok(())
+}
+
+fn show_persisted_desktop_layout(app: &tauri::AppHandle) -> Result<(), String> {
+    show_persisted_desktop_organizer(app)?;
 
     show_desktop_launcher(app)
 }
@@ -2011,10 +2037,7 @@ fn split_desktop_category_impl(app: &tauri::AppHandle, index: usize) -> Result<(
         Ok(category)
     })?;
 
-    let label = desktop_category_label(index);
-    let title = format!("DustDesk {}", category.name);
-    let url = desktop_card_url("category", Some(index));
-    show_or_create_desktop_card(app, &label, &title, &url, index)?;
+    show_desktop_category_on_all_monitors(app, index, &category)?;
     show_desktop_launcher(app)?;
     Ok(())
 }
@@ -2059,10 +2082,7 @@ fn show_split_desktop_widgets(app: &tauri::AppHandle) -> Result<Vec<usize>, Stri
         let Some(category) = categories.get(index) else {
             continue;
         };
-        let label = desktop_category_label(index);
-        let title = format!("DustDesk {}", category.name);
-        let url = desktop_card_url("category", Some(index));
-        if let Err(error) = show_or_create_desktop_card(app, &label, &title, &url, index) {
+        if let Err(error) = show_desktop_category_on_all_monitors(app, index, category) {
             for shown_index in shown_indices {
                 hide_desktop_category_windows(app, shown_index);
             }
@@ -2086,17 +2106,11 @@ fn show_split_desktop_widgets(app: &tauri::AppHandle) -> Result<Vec<usize>, Stri
         store.save_config(&config).map_err(to_message)
     })?;
 
-    if let Some(window) = app.get_webview_window("desktop-widget") {
-        let _ = window.hide();
-    }
+    hide_desktop_widget_windows(app);
 
     for window in app.webview_windows().values() {
         let label = window.label();
-        let is_legacy_category_window = label
-            .strip_prefix("desktop-category-")
-            .and_then(|suffix| suffix.split_once('-'))
-            .and_then(|(index, _)| index.parse::<usize>().ok())
-            .is_some();
+        let is_legacy_category_window = is_legacy_desktop_category_window_label(label);
         if is_legacy_category_window {
             let _ = window.hide();
         }
@@ -2152,7 +2166,7 @@ async fn merge_desktop_widgets(app: tauri::AppHandle) -> Result<(), String> {
         save_desktop_split_indices_impl(Vec::new())?;
         for window in app.webview_windows().values() {
             let label = window.label();
-            if label.starts_with("desktop-category-") || label == "desktop-launcher" {
+            if label.starts_with("desktop-category-") || is_desktop_launcher_window_label(label) {
                 let _ = window.hide();
             }
         }
@@ -7562,6 +7576,219 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    fn desktop_test_work_area(
+        name: &str,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        scale_factor: f64,
+    ) -> DesktopMonitorWorkArea {
+        DesktopMonitorWorkArea {
+            name: Some(name.to_owned()),
+            x,
+            y,
+            width,
+            height,
+            scale_factor,
+        }
+    }
+
+    fn desktop_test_layout(x: i32, y: i32, width: u32, height: u32) -> DesktopWindowLayout {
+        DesktopWindowLayout {
+            x,
+            y,
+            width,
+            height,
+            ..DesktopWindowLayout::default()
+        }
+    }
+
+    #[test]
+    fn desktop_layout_preserves_negative_coordinates_on_left_monitor() {
+        let work_areas = vec![
+            desktop_test_work_area("DISPLAY1", 0, 0, 1920, 1040, 1.0),
+            desktop_test_work_area("DISPLAY2", -2560, 0, 2560, 1400, 1.25),
+        ];
+        let layout = DesktopWindowLayout {
+            monitor_name: Some("DISPLAY2".to_owned()),
+            monitor_offset_x: Some(160),
+            monitor_offset_y: Some(100),
+            monitor_scale_factor: Some(1.25),
+            ..desktop_test_layout(-2400, 100, 600, 400)
+        };
+
+        let placement = resolve_desktop_window_placement(&layout, &work_areas, Some(0), 240, 160)
+            .expect("应恢复到左侧显示器");
+
+        assert_eq!(placement.x, -2400);
+        assert_eq!(placement.y, 100);
+        assert_eq!(placement.width, 600);
+        assert_eq!(placement.height, 400);
+    }
+
+    #[test]
+    fn desktop_layout_tracks_monitor_when_display_order_changes() {
+        let work_areas = vec![
+            desktop_test_work_area("DISPLAY2", -2560, 0, 2560, 1400, 1.0),
+            desktop_test_work_area("DISPLAY1", 0, 0, 1920, 1040, 1.0),
+        ];
+        let layout = DesktopWindowLayout {
+            monitor_name: Some("DISPLAY2".to_owned()),
+            monitor_offset_x: Some(120),
+            monitor_offset_y: Some(80),
+            monitor_scale_factor: Some(1.0),
+            ..desktop_test_layout(2040, 80, 600, 400)
+        };
+
+        let placement = resolve_desktop_window_placement(&layout, &work_areas, Some(1), 240, 160)
+            .expect("应按显示器相对坐标恢复");
+
+        assert_eq!(placement.x, -2440);
+        assert_eq!(placement.y, 80);
+    }
+
+    #[test]
+    fn desktop_layout_falls_back_when_saved_monitor_is_disconnected() {
+        let work_areas = vec![desktop_test_work_area("DISPLAY1", 0, 0, 1920, 1040, 1.0)];
+        let layout = DesktopWindowLayout {
+            monitor_name: Some("DISPLAY2".to_owned()),
+            monitor_offset_x: Some(150),
+            monitor_offset_y: Some(120),
+            monitor_scale_factor: Some(1.5),
+            ..desktop_test_layout(2070, 120, 720, 480)
+        };
+
+        let placement = resolve_desktop_window_placement(&layout, &work_areas, Some(0), 240, 160)
+            .expect("应回退到主显示器");
+
+        assert_eq!(placement.x, 100);
+        assert_eq!(placement.y, 80);
+        assert_eq!(placement.width, 480);
+        assert_eq!(placement.height, 320);
+    }
+
+    #[test]
+    fn desktop_layout_scales_for_target_monitor_dpi() {
+        let work_areas = vec![desktop_test_work_area("DISPLAY2", 1920, 0, 2560, 1400, 1.5)];
+        let layout = DesktopWindowLayout {
+            monitor_name: Some("DISPLAY2".to_owned()),
+            monitor_offset_x: Some(100),
+            monitor_offset_y: Some(80),
+            monitor_scale_factor: Some(1.0),
+            ..desktop_test_layout(2020, 80, 360, 260)
+        };
+
+        let placement = resolve_desktop_window_placement(&layout, &work_areas, Some(0), 240, 160)
+            .expect("应按目标显示器 DPI 缩放");
+
+        assert_eq!(placement.x, 2070);
+        assert_eq!(placement.y, 120);
+        assert_eq!(placement.width, 540);
+        assert_eq!(placement.height, 390);
+    }
+
+    #[test]
+    fn inherited_desktop_layout_fills_a_wider_monitor_proportionally() {
+        let source = desktop_test_work_area("DISPLAY1", 0, 0, 1700, 1000, 1.5);
+        let target = desktop_test_work_area("DISPLAY5", 2560, 0, 1920, 1200, 1.0);
+        let layout = DesktopWindowLayout {
+            monitor_offset_x: Some(850),
+            monitor_offset_y: Some(250),
+            ..desktop_test_layout(850, 250, 680, 500)
+        };
+
+        let placement =
+            map_desktop_window_layout_between_work_areas(&layout, &source, &target, 240, 160);
+
+        assert_eq!(placement.x, 3520);
+        assert_eq!(placement.y, 300);
+        assert_eq!(placement.width, 768);
+        assert_eq!(placement.height, 600);
+    }
+
+    #[test]
+    fn legacy_desktop_layout_is_kept_on_secondary_monitor_and_clamped_if_missing() {
+        let dual_work_areas = vec![
+            desktop_test_work_area("DISPLAY1", 0, 0, 1920, 1040, 1.0),
+            desktop_test_work_area("DISPLAY2", -1920, 0, 1920, 1040, 1.0),
+        ];
+        let secondary_layout = desktop_test_layout(-1800, 100, 600, 400);
+        let placement = resolve_desktop_window_placement(
+            &secondary_layout,
+            &dual_work_areas,
+            Some(0),
+            240,
+            160,
+        )
+        .expect("旧布局应保留在副屏");
+        assert_eq!(placement.x, -1800);
+
+        let missing_layout = desktop_test_layout(5000, 5000, 600, 400);
+        let placement = resolve_desktop_window_placement(
+            &missing_layout,
+            &dual_work_areas[..1],
+            Some(0),
+            240,
+            160,
+        )
+        .expect("失效旧布局应回到可见区域");
+        assert_eq!(placement.x, 1320);
+        assert_eq!(placement.y, 640);
+    }
+
+    #[test]
+    fn desktop_monitor_id_is_stable_when_named_monitor_moves() {
+        let original = desktop_test_work_area(r"\\.\DISPLAY5", 2560, 0, 1920, 1032, 1.0);
+        let moved = desktop_test_work_area(r"\\.\DISPLAY5", -1920, 120, 1920, 1032, 1.25);
+        let other = desktop_test_work_area(r"\\.\DISPLAY1", 0, 0, 1707, 1019, 1.5);
+
+        assert_eq!(
+            desktop_monitor_stable_id(&original),
+            desktop_monitor_stable_id(&moved)
+        );
+        assert_ne!(
+            desktop_monitor_stable_id(&original),
+            desktop_monitor_stable_id(&other)
+        );
+    }
+
+    #[test]
+    fn multi_monitor_desktop_labels_are_recognized_separately() {
+        assert!(is_desktop_widget_window_label(
+            "desktop-widget-monitor-a1b2"
+        ));
+        assert!(is_desktop_launcher_window_label(
+            "desktop-launcher-monitor-a1b2"
+        ));
+        assert_eq!(
+            desktop_category_index_from_label("desktop-category-3-monitor-a1b2"),
+            Some(3)
+        );
+        assert_eq!(
+            secondary_monitor_id_from_desktop_label("desktop-category-3-monitor-a1b2"),
+            Some("a1b2")
+        );
+        assert_eq!(
+            primary_desktop_window_label_for("desktop-widget-monitor-a1b2").as_deref(),
+            Some("desktop-widget")
+        );
+        assert_eq!(
+            primary_desktop_window_label_for("desktop-category-3-monitor-a1b2").as_deref(),
+            Some("desktop-category-3")
+        );
+        assert_eq!(
+            primary_desktop_window_label_for("desktop-launcher-monitor-a1b2").as_deref(),
+            Some("desktop-launcher")
+        );
+        assert!(!is_legacy_desktop_category_window_label(
+            "desktop-category-3-monitor-a1b2"
+        ));
+        assert!(is_legacy_desktop_category_window_label(
+            "desktop-category-3-legacy"
+        ));
+    }
+
     #[test]
     fn release_version_parsing_accepts_standard_tags() {
         assert_eq!(release_version_from_tag("v0.1.2"), Some("0.1.2".to_owned()));
@@ -7666,6 +7893,7 @@ mod tests {
             y: 0,
             width: 320,
             height: 240,
+            ..DesktopWindowLayout::default()
         };
         let mut config = AppConfig {
             desktop_categories: vec![category("A"), category("B"), category("C"), category("D")],
@@ -7676,7 +7904,9 @@ mod tests {
                 click_through: false,
                 windows: BTreeMap::from([
                     ("desktop-category-0".to_owned(), layout(10)),
+                    ("desktop-category-0-monitor-a1b2".to_owned(), layout(11)),
                     ("desktop-category-2".to_owned(), layout(30)),
+                    ("desktop-category-2-monitor-a1b2".to_owned(), layout(31)),
                     ("desktop-widget".to_owned(), layout(90)),
                 ]),
             },
@@ -7695,6 +7925,14 @@ mod tests {
         assert_eq!(config.desktop_layout.split_category_indices, vec![1, 2]);
         assert_eq!(config.desktop_layout.windows["desktop-category-1"].x, 30);
         assert_eq!(config.desktop_layout.windows["desktop-category-2"].x, 10);
+        assert_eq!(
+            config.desktop_layout.windows["desktop-category-1-monitor-a1b2"].x,
+            31
+        );
+        assert_eq!(
+            config.desktop_layout.windows["desktop-category-2-monitor-a1b2"].x,
+            11
+        );
         assert_eq!(config.desktop_layout.windows["desktop-widget"].x, 90);
     }
 
@@ -10610,56 +10848,122 @@ fn place_search_overlay(window: &WebviewWindow) -> tauri::Result<()> {
     Ok(())
 }
 
-fn place_desktop_widget(window: &WebviewWindow) -> tauri::Result<()> {
-    const MIN_WIDTH: u32 = 520;
-    const MIN_HEIGHT: u32 = 320;
-
-    if let Some(layout) = saved_desktop_window_layout("desktop-widget") {
-        let width = layout.width.max(MIN_WIDTH);
-        let height = layout.height.max(MIN_HEIGHT);
-        window.set_size(Size::Physical(PhysicalSize::new(width, height)))?;
-        window.set_position(Position::Physical(PhysicalPosition::new(
-            layout.x, layout.y,
-        )))?;
+fn place_desktop_widget(
+    window: &WebviewWindow,
+    label: &str,
+    target: &DesktopMonitorTarget,
+) -> tauri::Result<()> {
+    if apply_saved_desktop_window_layout_to_monitor(window, label, &target.work_area)
+        .map_err(|error| tauri::Error::Anyhow(anyhow::anyhow!(error)))?
+    {
         return Ok(());
     }
 
-    let Some(monitor) = window.current_monitor()?.or(window.primary_monitor()?) else {
-        return Ok(());
-    };
-
-    let work_area = monitor.work_area();
-    let margin = 28i32;
-    let default_panel_width = work_area.size.width.min(760).max(620);
-    let default_panel_height = work_area.size.height.min(520).max(360);
+    let work_area = target.monitor.work_area();
+    let target_scale = valid_scale_factor(target.monitor.scale_factor());
+    let source_scale = valid_scale_factor(window.scale_factor()?);
+    let margin = scale_i32(28, target_scale);
+    let min_width = scale_u32(520, target_scale).min(work_area.size.width);
+    let min_height = scale_u32(320, target_scale).min(work_area.size.height);
+    let default_panel_width = scale_u32(760, target_scale)
+        .min(work_area.size.width)
+        .max(min_width);
+    let default_panel_height = scale_u32(520, target_scale)
+        .min(work_area.size.height)
+        .max(min_height);
     let current_size = window.inner_size()?;
+    let current_width = scale_u32(current_size.width, target_scale / source_scale);
+    let current_height = scale_u32(current_size.height, target_scale / source_scale);
     let max_panel_width = work_area
         .size
         .width
         .saturating_sub((margin * 2) as u32)
-        .max(MIN_WIDTH);
+        .max(min_width);
     let max_panel_height = work_area
         .size
         .height
         .saturating_sub((margin * 2) as u32)
-        .max(MIN_HEIGHT);
-    let panel_width = if current_size.width >= MIN_WIDTH {
-        current_size.width.clamp(MIN_WIDTH, max_panel_width)
+        .max(min_height);
+    let panel_width = if current_width >= min_width {
+        current_width.clamp(min_width, max_panel_width)
     } else {
-        default_panel_width.clamp(MIN_WIDTH, max_panel_width)
+        default_panel_width.clamp(min_width, max_panel_width)
     };
-    let panel_height = if current_size.height >= MIN_HEIGHT {
-        current_size.height.clamp(MIN_HEIGHT, max_panel_height)
+    let panel_height = if current_height >= min_height {
+        current_height.clamp(min_height, max_panel_height)
     } else {
-        default_panel_height.clamp(MIN_HEIGHT, max_panel_height)
+        default_panel_height.clamp(min_height, max_panel_height)
     };
-    let x = work_area.position.x + work_area.size.width as i32 - panel_width as i32 - margin;
-    let y =
-        work_area.position.y + ((work_area.size.height.saturating_sub(panel_height)) / 4) as i32;
+    let desired_x = i64::from(work_area.position.x) + i64::from(work_area.size.width)
+        - i64::from(panel_width)
+        - i64::from(margin);
+    let desired_y = i64::from(work_area.position.y)
+        + i64::from(work_area.size.height.saturating_sub(panel_height) / 4);
+    let placement = fit_desktop_window_to_work_area(
+        desired_x,
+        desired_y,
+        panel_width,
+        panel_height,
+        min_width,
+        min_height,
+        &target.work_area,
+    );
 
-    window.set_size(Size::Physical(PhysicalSize::new(panel_width, panel_height)))?;
-    window.set_position(Position::Physical(PhysicalPosition::new(x, y)))?;
+    window.set_position(Position::Physical(PhysicalPosition::new(
+        placement.x,
+        placement.y,
+    )))?;
+    window.set_size(Size::Physical(PhysicalSize::new(
+        placement.width,
+        placement.height,
+    )))?;
     Ok(())
+}
+
+fn show_or_create_desktop_widget(
+    app: &tauri::AppHandle,
+    target: &DesktopMonitorTarget,
+) -> Result<(), String> {
+    let label = desktop_widget_label(target);
+    if let Some(window) = app.get_webview_window(&label) {
+        place_desktop_widget(&window, &label, target).map_err(to_message)?;
+        return show_desktop_background_window(&window);
+    }
+
+    let scale_factor = valid_scale_factor(target.monitor.scale_factor());
+    let work_area = target.monitor.work_area();
+    let initial_x = work_area.position.x as f64 / scale_factor;
+    let initial_y = work_area.position.y as f64 / scale_factor;
+    let window = with_webview_window_creation(|| {
+        if let Some(window) = app.get_webview_window(&label) {
+            return Ok(window);
+        }
+        WebviewWindowBuilder::new(
+            app,
+            &label,
+            WebviewUrl::App("index.html?dustdeskRoute=desktop-widget".into()),
+        )
+        .title("DustDesk Desktop Widget")
+        .inner_size(720.0, 460.0)
+        .min_inner_size(520.0, 320.0)
+        .position(initial_x, initial_y)
+        .resizable(true)
+        .maximizable(false)
+        .minimizable(false)
+        .decorations(false)
+        .transparent(true)
+        .shadow(false)
+        .background_color(Color(0, 0, 0, 0))
+        .skip_taskbar(true)
+        .always_on_top(false)
+        .always_on_bottom(true)
+        .focused(false)
+        .visible(true)
+        .build()
+        .map_err(to_message)
+    })?;
+    place_desktop_widget(&window, &label, target).map_err(to_message)?;
+    show_desktop_background_window(&window)
 }
 
 fn show_or_create_desktop_card(
@@ -10668,44 +10972,85 @@ fn show_or_create_desktop_card(
     title: &str,
     url: &str,
     index: usize,
+    target: &DesktopMonitorTarget,
 ) -> Result<(), String> {
     if let Some(window) = app.get_webview_window(label) {
         window.set_title(title).map_err(to_message)?;
-        if !apply_saved_desktop_window_layout(&window, label)? {
-            restore_desktop_card_size_if_collapsed(&window, label)?;
+        if !apply_saved_desktop_window_layout_to_monitor(&window, label, &target.work_area)? {
+            place_desktop_card_on_monitor(&window, label, index, target)?;
         }
         return show_desktop_background_window(&window);
     }
 
-    create_desktop_card(app, label, title, url, index)
+    create_desktop_card(app, label, title, url, index, target)
 }
 
-fn restore_desktop_card_size_if_collapsed(
+fn desktop_card_default_placement(
+    label: &str,
+    index: usize,
+    target: &DesktopMonitorTarget,
+) -> DesktopWindowPlacement {
+    let work_area = target.monitor.work_area();
+    let scale_factor = valid_scale_factor(target.monitor.scale_factor());
+    let logical_width = if is_desktop_launcher_window_label(label) {
+        320
+    } else {
+        360
+    };
+    let width = scale_u32(logical_width, scale_factor);
+    let height = scale_u32(260, scale_factor);
+    let gap = scale_u32(16, scale_factor);
+    let horizontal_margin = scale_u32(28, scale_factor);
+    let top_margin = scale_u32(72, scale_factor);
+    let available_width = work_area
+        .size
+        .width
+        .saturating_sub(horizontal_margin.saturating_mul(2));
+    let columns =
+        ((available_width.saturating_add(gap)) / width.saturating_add(gap)).max(1) as usize;
+    let column = index % columns;
+    let row = index / columns;
+    let desired_x = work_area.position.x as i64
+        + horizontal_margin as i64
+        + width.saturating_add(gap) as i64 * column as i64;
+    let desired_y = work_area.position.y as i64
+        + top_margin as i64
+        + height.saturating_add(gap) as i64 * row as i64;
+
+    fit_desktop_window_to_work_area(
+        desired_x,
+        desired_y,
+        width,
+        height,
+        scale_u32(240, scale_factor),
+        scale_u32(160, scale_factor),
+        &target.work_area,
+    )
+}
+
+fn place_desktop_card_on_monitor(
     window: &WebviewWindow,
     label: &str,
+    index: usize,
+    target: &DesktopMonitorTarget,
 ) -> Result<(), String> {
-    const MIN_WIDTH: u32 = 240;
-    const MIN_HEIGHT: u32 = 160;
-    const DEFAULT_CATEGORY_WIDTH: u32 = 360;
-    const DEFAULT_LAUNCHER_WIDTH: u32 = 320;
-    const DEFAULT_HEIGHT: u32 = 260;
-
+    let scale_factor = valid_scale_factor(target.monitor.scale_factor());
+    let placement = desktop_card_default_placement(label, index, target);
     let _ = window.set_min_size(Some(Size::Physical(PhysicalSize::new(
-        MIN_WIDTH, MIN_HEIGHT,
+        scale_u32(240, scale_factor),
+        scale_u32(160, scale_factor),
     ))));
-
-    let size = window.inner_size().map_err(to_message)?;
-    if size.height >= MIN_HEIGHT {
-        return Ok(());
-    }
-
-    let width = if label == "desktop-launcher" {
-        DEFAULT_LAUNCHER_WIDTH
-    } else {
-        DEFAULT_CATEGORY_WIDTH
-    };
     window
-        .set_size(Size::Physical(PhysicalSize::new(width, DEFAULT_HEIGHT)))
+        .set_position(Position::Physical(PhysicalPosition::new(
+            placement.x,
+            placement.y,
+        )))
+        .map_err(to_message)?;
+    window
+        .set_size(Size::Physical(PhysicalSize::new(
+            placement.width,
+            placement.height,
+        )))
         .map_err(to_message)
 }
 
@@ -10778,32 +11123,27 @@ fn create_desktop_card(
     title: &str,
     url: &str,
     index: usize,
+    target: &DesktopMonitorTarget,
 ) -> Result<(), String> {
-    let Some(monitor) = app.primary_monitor().map_err(to_message)? else {
-        return Err("没有找到显示器".to_owned());
-    };
-    let work_area = monitor.work_area();
-    let width = if label == "desktop-launcher" {
+    let scale_factor = valid_scale_factor(target.monitor.scale_factor());
+    let logical_width = if is_desktop_launcher_window_label(label) {
         320.0
     } else {
         360.0
     };
-    let height = 260.0;
-    let gap = 16.0;
-    let columns = 3usize;
-    let column = index % columns;
-    let row = index / columns;
-    let x = work_area.position.x as f64 + 28.0 + (width + gap) * column as f64;
-    let y = work_area.position.y as f64 + 72.0 + (height + gap) * row as f64;
+    let logical_height = 260.0;
+    let placement = desktop_card_default_placement(label, index, target);
+    let logical_x = placement.x as f64 / scale_factor;
+    let logical_y = placement.y as f64 / scale_factor;
     let window = with_webview_window_creation(|| {
         if let Some(window) = app.get_webview_window(label) {
             return Ok(window);
         }
         WebviewWindowBuilder::new(app, label, WebviewUrl::App(url.into()))
             .title(title)
-            .inner_size(width, height)
+            .inner_size(logical_width, logical_height)
             .min_inner_size(240.0, 160.0)
-            .position(x, y)
+            .position(logical_x, logical_y)
             .resizable(true)
             .maximizable(false)
             .minimizable(false)
@@ -10819,8 +11159,20 @@ fn create_desktop_card(
             .build()
             .map_err(to_message)
     })?;
-    if !apply_saved_desktop_window_layout(&window, label)? {
-        restore_desktop_card_size_if_collapsed(&window, label)?;
+    window
+        .set_position(Position::Physical(PhysicalPosition::new(
+            placement.x,
+            placement.y,
+        )))
+        .map_err(to_message)?;
+    window
+        .set_size(Size::Physical(PhysicalSize::new(
+            placement.width,
+            placement.height,
+        )))
+        .map_err(to_message)?;
+    if !apply_saved_desktop_window_layout_to_monitor(&window, label, &target.work_area)? {
+        place_desktop_card_on_monitor(&window, label, index, target)?;
     }
     show_desktop_background_window(&window)
 }
@@ -10837,17 +11189,54 @@ fn desktop_category_label(index: usize) -> String {
     format!("desktop-category-{index}")
 }
 
+fn desktop_widget_label(target: &DesktopMonitorTarget) -> String {
+    if target.is_primary {
+        "desktop-widget".to_owned()
+    } else {
+        format!("desktop-widget-monitor-{}", target.stable_id)
+    }
+}
+
+fn desktop_category_label_for_monitor(index: usize, target: &DesktopMonitorTarget) -> String {
+    if target.is_primary {
+        desktop_category_label(index)
+    } else {
+        format!("desktop-category-{index}-monitor-{}", target.stable_id)
+    }
+}
+
+fn desktop_launcher_label(target: &DesktopMonitorTarget) -> String {
+    if target.is_primary {
+        "desktop-launcher".to_owned()
+    } else {
+        format!("desktop-launcher-monitor-{}", target.stable_id)
+    }
+}
+
+fn show_desktop_category_on_all_monitors(
+    app: &tauri::AppHandle,
+    index: usize,
+    category: &DeskCategory,
+) -> Result<(), String> {
+    let title = format!("DustDesk {}", category.name);
+    let url = desktop_card_url("category", Some(index));
+    for target in desktop_monitor_targets(app).map_err(to_message)? {
+        let label = desktop_category_label_for_monitor(index, &target);
+        show_or_create_desktop_card(app, &label, &title, &url, index, &target)?;
+    }
+    Ok(())
+}
+
 fn show_desktop_launcher(app: &tauri::AppHandle) -> Result<(), String> {
     let store = AppStore::open().map_err(to_message)?;
     store.ensure_runtime_dirs().map_err(to_message)?;
     let index = store.load_config().desktop_categories.len();
-    show_or_create_desktop_card(
-        app,
-        "desktop-launcher",
-        "DustDesk 快捷启动",
-        &desktop_card_url("launcher", None),
-        index,
-    )
+    let url = desktop_card_url("launcher", None);
+    for target in desktop_monitor_targets(app).map_err(to_message)? {
+        let label = desktop_launcher_label(&target);
+        show_or_create_desktop_card(app, &label, "DustDesk 快捷启动", &url, index, &target)?;
+    }
+    Ok(())
 }
 
 fn hide_desktop_category_windows(app: &tauri::AppHandle, index: usize) {
@@ -10861,8 +11250,7 @@ fn hide_desktop_category_windows(app: &tauri::AppHandle, index: usize) {
 
 fn hide_desktop_organizer_windows(app: &tauri::AppHandle) {
     for window in app.webview_windows().values() {
-        let label = window.label();
-        if label == "desktop-widget" || label.starts_with("desktop-category-") {
+        if is_desktop_organizer_window_label(window.label()) {
             let _ = window.hide();
         }
     }
@@ -10870,8 +11258,19 @@ fn hide_desktop_organizer_windows(app: &tauri::AppHandle) {
 }
 
 fn hide_desktop_launcher_window(app: &tauri::AppHandle) {
-    if let Some(window) = app.get_webview_window("desktop-launcher") {
-        let _ = window.hide();
+    for window in app.webview_windows().values() {
+        if is_desktop_launcher_window_label(window.label()) {
+            let _ = window.hide();
+        }
+    }
+    sync_system_tray_menu(app);
+}
+
+fn hide_desktop_widget_windows(app: &tauri::AppHandle) {
+    for window in app.webview_windows().values() {
+        if is_desktop_widget_window_label(window.label()) {
+            let _ = window.hide();
+        }
     }
     sync_system_tray_menu(app);
 }
@@ -10894,10 +11293,90 @@ fn desktop_category_index_from_label(label: &str) -> Option<usize> {
         .ok()
 }
 
-fn is_desktop_card_window_label(label: &str) -> bool {
+fn desktop_category_monitor_id_from_label(label: &str) -> Option<&str> {
+    let index = desktop_category_index_from_label(label)?;
+    label
+        .strip_prefix(&format!("desktop-category-{index}-monitor-"))
+        .filter(|monitor_id| !monitor_id.is_empty())
+}
+
+fn primary_desktop_window_label_for(label: &str) -> Option<String> {
+    if label
+        .strip_prefix("desktop-widget-monitor-")
+        .is_some_and(|monitor_id| !monitor_id.is_empty())
+    {
+        return Some("desktop-widget".to_owned());
+    }
+    if label
+        .strip_prefix("desktop-launcher-monitor-")
+        .is_some_and(|monitor_id| !monitor_id.is_empty())
+    {
+        return Some("desktop-launcher".to_owned());
+    }
+
+    let index = desktop_category_index_from_label(label)?;
+    desktop_category_monitor_id_from_label(label).map(|_| desktop_category_label(index))
+}
+
+fn remap_desktop_category_window_label(
+    label: &str,
+    from_index: usize,
+    to_index: usize,
+) -> Option<String> {
+    let index = desktop_category_index_from_label(label)?;
+    let mapped_index = remap_category_index(index, from_index, to_index);
+    if label == desktop_category_label(index) {
+        return Some(desktop_category_label(mapped_index));
+    }
+
+    desktop_category_monitor_id_from_label(label)
+        .map(|monitor_id| format!("desktop-category-{mapped_index}-monitor-{monitor_id}"))
+}
+
+fn is_legacy_desktop_category_window_label(label: &str) -> bool {
+    let Some(index) = desktop_category_index_from_label(label) else {
+        return false;
+    };
+    label != desktop_category_label(index)
+        && desktop_category_monitor_id_from_label(label).is_none()
+}
+
+fn is_desktop_widget_window_label(label: &str) -> bool {
     label == "desktop-widget"
-        || label == "desktop-launcher"
-        || label.starts_with("desktop-category-")
+        || label
+            .strip_prefix("desktop-widget-monitor-")
+            .is_some_and(|monitor_id| !monitor_id.is_empty())
+}
+
+fn is_desktop_launcher_window_label(label: &str) -> bool {
+    label == "desktop-launcher"
+        || label
+            .strip_prefix("desktop-launcher-monitor-")
+            .is_some_and(|monitor_id| !monitor_id.is_empty())
+}
+
+fn is_desktop_organizer_window_label(label: &str) -> bool {
+    is_desktop_widget_window_label(label) || label.starts_with("desktop-category-")
+}
+
+fn is_primary_desktop_window_label(label: &str) -> bool {
+    if label == "desktop-widget" || label == "desktop-launcher" {
+        return true;
+    }
+    desktop_category_index_from_label(label)
+        .is_some_and(|index| label == desktop_category_label(index))
+}
+
+fn secondary_monitor_id_from_desktop_label(label: &str) -> Option<&str> {
+    label
+        .strip_prefix("desktop-widget-monitor-")
+        .or_else(|| label.strip_prefix("desktop-launcher-monitor-"))
+        .filter(|monitor_id| !monitor_id.is_empty())
+        .or_else(|| desktop_category_monitor_id_from_label(label))
+}
+
+fn is_desktop_card_window_label(label: &str) -> bool {
+    is_desktop_organizer_window_label(label) || is_desktop_launcher_window_label(label)
 }
 
 fn desktop_frame_visibility_impl(app: &tauri::AppHandle) -> DesktopFrameVisibility {
@@ -10911,9 +11390,9 @@ fn desktop_frame_visibility_impl(app: &tauri::AppHandle) -> DesktopFrameVisibili
         }
 
         let label = window.label();
-        if label == "desktop-widget" || label.starts_with("desktop-category-") {
+        if is_desktop_organizer_window_label(label) {
             organizer = true;
-        } else if label == "desktop-launcher" {
+        } else if is_desktop_launcher_window_label(label) {
             launcher = true;
         }
     }
@@ -11029,20 +11508,390 @@ fn saved_desktop_window_layout(label: &str) -> Option<DesktopWindowLayout> {
     is_valid_desktop_window_layout(&layout).then_some(layout)
 }
 
+fn primary_desktop_window_layout_template(
+    app: &tauri::AppHandle,
+    label: &str,
+) -> Option<(DesktopWindowLayout, DesktopMonitorWorkArea)> {
+    let primary_label = primary_desktop_window_label_for(label)?;
+    let primary = desktop_monitor_targets(app)
+        .ok()?
+        .into_iter()
+        .find(|target| target.is_primary)?;
+    if let Some(window) = app.get_webview_window(&primary_label) {
+        if let Ok(layout) = capture_desktop_window_layout(&window) {
+            if is_valid_desktop_window_layout(&layout) {
+                return Some((layout, primary.work_area));
+            }
+        }
+    }
+
+    let mut layout = saved_desktop_window_layout(&primary_label)?;
+    layout.monitor_name = primary.work_area.name.clone();
+    layout
+        .monitor_offset_x
+        .get_or_insert(layout.x.saturating_sub(primary.work_area.x));
+    layout
+        .monitor_offset_y
+        .get_or_insert(layout.y.saturating_sub(primary.work_area.y));
+    layout
+        .monitor_scale_factor
+        .get_or_insert(primary.work_area.scale_factor);
+    Some((layout, primary.work_area))
+}
+
+fn valid_scale_factor(scale_factor: f64) -> f64 {
+    if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    }
+}
+
+fn scale_u32(value: u32, scale_factor: f64) -> u32 {
+    ((value as f64 * valid_scale_factor(scale_factor)).round()).clamp(1.0, u32::MAX as f64) as u32
+}
+
+fn scale_i32(value: i32, scale_factor: f64) -> i32 {
+    ((value as f64 * valid_scale_factor(scale_factor)).round())
+        .clamp(i32::MIN as f64, i32::MAX as f64) as i32
+}
+
+fn desktop_window_min_logical_size(label: &str) -> (u32, u32) {
+    if is_desktop_widget_window_label(label) {
+        (520, 320)
+    } else {
+        (240, 160)
+    }
+}
+
+fn desktop_monitor_work_areas(monitors: &[Monitor]) -> Vec<DesktopMonitorWorkArea> {
+    monitors
+        .iter()
+        .map(DesktopMonitorWorkArea::from_monitor)
+        .collect()
+}
+
+fn monitor_work_area_index(
+    work_areas: &[DesktopMonitorWorkArea],
+    monitor: &Monitor,
+) -> Option<usize> {
+    let target = DesktopMonitorWorkArea::from_monitor(monitor);
+    work_areas
+        .iter()
+        .position(|work_area| match (&work_area.name, &target.name) {
+            (Some(left), Some(right)) => left == right,
+            _ => {
+                work_area.x == target.x
+                    && work_area.y == target.y
+                    && work_area.width == target.width
+                    && work_area.height == target.height
+            }
+        })
+}
+
+fn desktop_window_intersection_area(
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    work_area: &DesktopMonitorWorkArea,
+) -> u64 {
+    let left = i64::from(x).max(i64::from(work_area.x));
+    let top = i64::from(y).max(i64::from(work_area.y));
+    let right =
+        (i64::from(x) + i64::from(width)).min(i64::from(work_area.x) + i64::from(work_area.width));
+    let bottom = (i64::from(y) + i64::from(height))
+        .min(i64::from(work_area.y) + i64::from(work_area.height));
+
+    if right <= left || bottom <= top {
+        0
+    } else {
+        (right - left) as u64 * (bottom - top) as u64
+    }
+}
+
+fn best_intersecting_monitor_index(
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    work_areas: &[DesktopMonitorWorkArea],
+) -> Option<usize> {
+    work_areas
+        .iter()
+        .enumerate()
+        .map(|(index, work_area)| {
+            (
+                index,
+                desktop_window_intersection_area(x, y, width, height, work_area),
+            )
+        })
+        .filter(|(_, area)| *area > 0)
+        .max_by_key(|(_, area)| *area)
+        .map(|(index, _)| index)
+}
+
+fn select_desktop_monitor_index(
+    layout: &DesktopWindowLayout,
+    work_areas: &[DesktopMonitorWorkArea],
+    primary_index: Option<usize>,
+) -> Option<usize> {
+    if let Some(monitor_name) = layout.monitor_name.as_deref() {
+        if let Some(index) = work_areas
+            .iter()
+            .position(|work_area| work_area.name.as_deref() == Some(monitor_name))
+        {
+            return Some(index);
+        }
+    }
+
+    best_intersecting_monitor_index(layout.x, layout.y, layout.width, layout.height, work_areas)
+        .or(primary_index)
+        .or_else(|| (!work_areas.is_empty()).then_some(0))
+}
+
+fn fit_desktop_window_to_work_area(
+    desired_x: i64,
+    desired_y: i64,
+    width: u32,
+    height: u32,
+    min_width: u32,
+    min_height: u32,
+    work_area: &DesktopMonitorWorkArea,
+) -> DesktopWindowPlacement {
+    let available_width = work_area.width.max(1);
+    let available_height = work_area.height.max(1);
+    let width = width
+        .max(min_width.min(available_width))
+        .min(available_width);
+    let height = height
+        .max(min_height.min(available_height))
+        .min(available_height);
+    let min_x = i64::from(work_area.x);
+    let min_y = i64::from(work_area.y);
+    let max_x = min_x + i64::from(available_width) - i64::from(width);
+    let max_y = min_y + i64::from(available_height) - i64::from(height);
+    let x = desired_x.clamp(min_x, max_x) as i32;
+    let y = desired_y.clamp(min_y, max_y) as i32;
+
+    DesktopWindowPlacement {
+        x,
+        y,
+        width,
+        height,
+    }
+}
+
+fn resolve_desktop_window_placement(
+    layout: &DesktopWindowLayout,
+    work_areas: &[DesktopMonitorWorkArea],
+    primary_index: Option<usize>,
+    min_logical_width: u32,
+    min_logical_height: u32,
+) -> Option<DesktopWindowPlacement> {
+    let monitor_index = select_desktop_monitor_index(layout, work_areas, primary_index)?;
+    let work_area = work_areas.get(monitor_index)?;
+    let target_scale = valid_scale_factor(work_area.scale_factor);
+    let saved_scale = layout
+        .monitor_scale_factor
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(target_scale);
+    let scale_ratio = target_scale / saved_scale;
+    let width = scale_u32(layout.width, scale_ratio);
+    let height = scale_u32(layout.height, scale_ratio);
+    let desired_position = layout
+        .monitor_offset_x
+        .zip(layout.monitor_offset_y)
+        .map(|(offset_x, offset_y)| {
+            (
+                i64::from(work_area.x) + i64::from(scale_i32(offset_x, scale_ratio)),
+                i64::from(work_area.y) + i64::from(scale_i32(offset_y, scale_ratio)),
+            )
+        })
+        .unwrap_or((i64::from(layout.x), i64::from(layout.y)));
+
+    Some(fit_desktop_window_to_work_area(
+        desired_position.0,
+        desired_position.1,
+        width,
+        height,
+        scale_u32(min_logical_width, target_scale),
+        scale_u32(min_logical_height, target_scale),
+        work_area,
+    ))
+}
+
+fn map_desktop_window_layout_between_work_areas(
+    layout: &DesktopWindowLayout,
+    source: &DesktopMonitorWorkArea,
+    target: &DesktopMonitorWorkArea,
+    min_logical_width: u32,
+    min_logical_height: u32,
+) -> DesktopWindowPlacement {
+    let horizontal_ratio = f64::from(target.width.max(1)) / f64::from(source.width.max(1));
+    let vertical_ratio = f64::from(target.height.max(1)) / f64::from(source.height.max(1));
+    let offset_x = layout
+        .monitor_offset_x
+        .unwrap_or_else(|| layout.x.saturating_sub(source.x));
+    let offset_y = layout
+        .monitor_offset_y
+        .unwrap_or_else(|| layout.y.saturating_sub(source.y));
+    let desired_x = i64::from(target.x) + i64::from(scale_i32(offset_x, horizontal_ratio));
+    let desired_y = i64::from(target.y) + i64::from(scale_i32(offset_y, vertical_ratio));
+    let width = scale_u32(layout.width, horizontal_ratio);
+    let height = scale_u32(layout.height, vertical_ratio);
+    let target_scale = valid_scale_factor(target.scale_factor);
+
+    fit_desktop_window_to_work_area(
+        desired_x,
+        desired_y,
+        width,
+        height,
+        scale_u32(min_logical_width, target_scale),
+        scale_u32(min_logical_height, target_scale),
+        target,
+    )
+}
+
+fn capture_desktop_window_layout(window: &WebviewWindow) -> tauri::Result<DesktopWindowLayout> {
+    let position = window.outer_position()?;
+    let size = window.inner_size()?;
+    let monitors = window.available_monitors().unwrap_or_default();
+    let work_areas = desktop_monitor_work_areas(&monitors);
+    let current_index = window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .as_ref()
+        .and_then(|monitor| monitor_work_area_index(&work_areas, monitor));
+    let primary_index = window
+        .primary_monitor()
+        .ok()
+        .flatten()
+        .as_ref()
+        .and_then(|monitor| monitor_work_area_index(&work_areas, monitor));
+    let monitor_index = best_intersecting_monitor_index(
+        position.x,
+        position.y,
+        size.width,
+        size.height,
+        &work_areas,
+    )
+    .or(current_index)
+    .or(primary_index);
+    let monitor = monitor_index.and_then(|index| work_areas.get(index));
+
+    Ok(DesktopWindowLayout {
+        x: position.x,
+        y: position.y,
+        width: size.width,
+        height: size.height,
+        monitor_name: monitor.and_then(|work_area| work_area.name.clone()),
+        monitor_offset_x: monitor.map(|work_area| position.x.saturating_sub(work_area.x)),
+        monitor_offset_y: monitor.map(|work_area| position.y.saturating_sub(work_area.y)),
+        monitor_scale_factor: monitor.map(|work_area| work_area.scale_factor),
+    })
+}
+
+fn desktop_window_placement_for_layout(
+    window: &WebviewWindow,
+    label: &str,
+    layout: &DesktopWindowLayout,
+) -> DesktopWindowPlacement {
+    let monitors = window.available_monitors().unwrap_or_default();
+    let work_areas = desktop_monitor_work_areas(&monitors);
+    let primary_index = window
+        .primary_monitor()
+        .ok()
+        .flatten()
+        .as_ref()
+        .and_then(|monitor| monitor_work_area_index(&work_areas, monitor));
+    let (min_width, min_height) = desktop_window_min_logical_size(label);
+
+    resolve_desktop_window_placement(layout, &work_areas, primary_index, min_width, min_height)
+        .unwrap_or(DesktopWindowPlacement {
+            x: layout.x,
+            y: layout.y,
+            width: layout.width.max(min_width),
+            height: layout.height.max(min_height),
+        })
+}
+
 fn apply_saved_desktop_window_layout(window: &WebviewWindow, label: &str) -> Result<bool, String> {
     let Some(layout) = saved_desktop_window_layout(label) else {
         return Ok(false);
     };
 
+    let (min_width, min_height) = desktop_window_min_logical_size(label);
+    let placement = desktop_window_target_work_area(window.app_handle(), label)
+        .and_then(|work_area| {
+            resolve_desktop_window_placement(
+                &layout,
+                std::slice::from_ref(&work_area),
+                Some(0),
+                min_width,
+                min_height,
+            )
+        })
+        .unwrap_or_else(|| desktop_window_placement_for_layout(window, label, &layout));
     window
-        .set_size(Size::Physical(PhysicalSize::new(
-            layout.width,
-            layout.height,
+        .set_position(Position::Physical(PhysicalPosition::new(
+            placement.x,
+            placement.y,
         )))
         .map_err(to_message)?;
     window
+        .set_size(Size::Physical(PhysicalSize::new(
+            placement.width,
+            placement.height,
+        )))
+        .map_err(to_message)?;
+    Ok(true)
+}
+
+fn apply_saved_desktop_window_layout_to_monitor(
+    window: &WebviewWindow,
+    label: &str,
+    work_area: &DesktopMonitorWorkArea,
+) -> Result<bool, String> {
+    let (min_width, min_height) = desktop_window_min_logical_size(label);
+    let placement = if let Some(layout) = saved_desktop_window_layout(label) {
+        resolve_desktop_window_placement(
+            &layout,
+            std::slice::from_ref(work_area),
+            Some(0),
+            min_width,
+            min_height,
+        )
+        .unwrap_or(DesktopWindowPlacement {
+            x: work_area.x,
+            y: work_area.y,
+            width: layout.width.max(min_width),
+            height: layout.height.max(min_height),
+        })
+    } else if let Some((layout, source_work_area)) =
+        primary_desktop_window_layout_template(window.app_handle(), label)
+    {
+        map_desktop_window_layout_between_work_areas(
+            &layout,
+            &source_work_area,
+            work_area,
+            min_width,
+            min_height,
+        )
+    } else {
+        return Ok(false);
+    };
+    window
         .set_position(Position::Physical(PhysicalPosition::new(
-            layout.x, layout.y,
+            placement.x,
+            placement.y,
+        )))
+        .map_err(to_message)?;
+    window
+        .set_size(Size::Physical(PhysicalSize::new(
+            placement.width,
+            placement.height,
         )))
         .map_err(to_message)?;
     Ok(true)
@@ -11050,6 +11899,185 @@ fn apply_saved_desktop_window_layout(window: &WebviewWindow, label: &str) -> Res
 
 fn is_valid_desktop_window_layout(layout: &DesktopWindowLayout) -> bool {
     layout.width >= 120 && layout.height >= 100
+}
+
+fn desktop_monitor_stable_id(work_area: &DesktopMonitorWorkArea) -> String {
+    let identity = work_area
+        .name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .map(|name| format!("name:{}", name.to_lowercase()))
+        .unwrap_or_else(|| {
+            format!(
+                "area:{}:{}:{}:{}",
+                work_area.x, work_area.y, work_area.width, work_area.height
+            )
+        });
+    let hash = identity
+        .as_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        });
+    format!("{hash:016x}")
+}
+
+fn desktop_monitor_targets(app: &tauri::AppHandle) -> tauri::Result<Vec<DesktopMonitorTarget>> {
+    let monitors = app.available_monitors()?;
+    if monitors.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let primary_work_area = app
+        .primary_monitor()?
+        .as_ref()
+        .map(DesktopMonitorWorkArea::from_monitor);
+    let primary_index = primary_work_area
+        .as_ref()
+        .and_then(|primary| {
+            monitors.iter().position(|monitor| {
+                let candidate = DesktopMonitorWorkArea::from_monitor(monitor);
+                match (&primary.name, &candidate.name) {
+                    (Some(left), Some(right)) => left == right,
+                    _ => primary == &candidate,
+                }
+            })
+        })
+        .unwrap_or(0);
+
+    let mut targets = monitors
+        .into_iter()
+        .enumerate()
+        .map(|(index, monitor)| {
+            let work_area = DesktopMonitorWorkArea::from_monitor(&monitor);
+            DesktopMonitorTarget {
+                stable_id: desktop_monitor_stable_id(&work_area),
+                monitor,
+                work_area,
+                is_primary: index == primary_index,
+            }
+        })
+        .collect::<Vec<_>>();
+    targets.sort_by(|left, right| {
+        right
+            .is_primary
+            .cmp(&left.is_primary)
+            .then(left.work_area.x.cmp(&right.work_area.x))
+            .then(left.work_area.y.cmp(&right.work_area.y))
+            .then(left.stable_id.cmp(&right.stable_id))
+    });
+    Ok(targets)
+}
+
+fn desktop_window_target_work_area(
+    app: &tauri::AppHandle,
+    label: &str,
+) -> Option<DesktopMonitorWorkArea> {
+    let targets = desktop_monitor_targets(app).ok()?;
+    if is_primary_desktop_window_label(label) {
+        return targets
+            .into_iter()
+            .find(|target| target.is_primary)
+            .map(|target| target.work_area);
+    }
+
+    let monitor_id = secondary_monitor_id_from_desktop_label(label)?;
+    targets
+        .into_iter()
+        .find(|target| !target.is_primary && target.stable_id == monitor_id)
+        .map(|target| target.work_area)
+}
+
+fn desktop_monitor_signature(app: &tauri::AppHandle) -> Option<Vec<DesktopMonitorWorkArea>> {
+    let monitors = app.available_monitors().ok()?;
+    let mut work_areas = desktop_monitor_work_areas(&monitors);
+    work_areas.sort_by(|left, right| {
+        left.x
+            .cmp(&right.x)
+            .then(left.y.cmp(&right.y))
+            .then(left.width.cmp(&right.width))
+            .then(left.height.cmp(&right.height))
+            .then(left.name.cmp(&right.name))
+    });
+    Some(work_areas)
+}
+
+fn destroy_disconnected_desktop_monitor_windows(
+    app: &tauri::AppHandle,
+    targets: &[DesktopMonitorTarget],
+) {
+    let active_secondary_ids = targets
+        .iter()
+        .filter(|target| !target.is_primary)
+        .map(|target| target.stable_id.as_str())
+        .collect::<BTreeSet<_>>();
+    for window in app.webview_windows().values() {
+        let Some(monitor_id) = secondary_monitor_id_from_desktop_label(window.label()) else {
+            continue;
+        };
+        if !active_secondary_ids.contains(monitor_id) {
+            let _ = window.destroy();
+        }
+    }
+}
+
+fn repair_desktop_windows_after_monitor_change(app: &tauri::AppHandle) -> Result<(), String> {
+    let visibility = desktop_frame_visibility_impl(app);
+    let targets = desktop_monitor_targets(app).map_err(to_message)?;
+    destroy_disconnected_desktop_monitor_windows(app, &targets);
+
+    if visibility.organizer {
+        show_persisted_desktop_organizer(app)?;
+    }
+    if visibility.launcher {
+        show_desktop_launcher(app)?;
+    }
+    for window in app.webview_windows().values() {
+        if is_desktop_card_window_label(window.label()) {
+            keep_desktop_window_behind_apps(window);
+        }
+    }
+    Ok(())
+}
+
+fn start_desktop_monitor_watch(app: tauri::AppHandle) {
+    if DESKTOP_MONITOR_WATCH_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    if let Err(error) = std::thread::Builder::new()
+        .name("dustdesk-monitor-layout".to_owned())
+        .spawn(move || {
+            let mut previous_signature = desktop_monitor_signature(&app);
+            while !REAL_EXIT_REQUESTED.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_secs(1));
+                let Some(current_signature) = desktop_monitor_signature(&app) else {
+                    continue;
+                };
+
+                if previous_signature
+                    .as_ref()
+                    .is_some_and(|previous| previous != &current_signature)
+                {
+                    std::thread::sleep(Duration::from_millis(300));
+                    if let Err(error) = with_lazy_window_operation(|| {
+                        repair_desktop_windows_after_monitor_change(&app)
+                    }) {
+                        eprintln!("无法同步桌面框多显示器实例：{error}");
+                    }
+                    append_desktop_diagnostic(
+                        "desktop_monitor_topology_changed",
+                        &format!("monitor_count={}", current_signature.len()),
+                    );
+                }
+                previous_signature = Some(current_signature);
+            }
+            DESKTOP_MONITOR_WATCH_STARTED.store(false, Ordering::SeqCst);
+        })
+    {
+        DESKTOP_MONITOR_WATCH_STARTED.store(false, Ordering::SeqCst);
+        eprintln!("无法启动桌面框显示器监控：{error}");
+    }
 }
 
 fn cleanup_desktop_card_windows_impl(app: &tauri::AppHandle) {
@@ -11404,6 +12432,7 @@ fn main() {
             setup_system_tray(&app_handle)?;
             #[cfg(windows)]
             windows_show_desktop::start(app_handle.clone());
+            start_desktop_monitor_watch(app_handle.clone());
             let show_main_on_start = !is_startup_launch_invocation();
             let handle = app.handle().clone();
             tauri::async_runtime::spawn_blocking(move || {

@@ -64,6 +64,18 @@ pub struct DesktopWindowLayout {
     pub y: i32,
     pub width: u32,
     pub height: u32,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitor_name: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitor_offset_x: Option<i32>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitor_offset_y: Option<i32>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitor_scale_factor: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

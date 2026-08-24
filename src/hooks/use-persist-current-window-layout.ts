@@ -1,11 +1,12 @@
 import { useEffect } from "react"
-import { desktopWindowLayoutUserChangeEvent, listenCurrentWindowMove, listenCurrentWindowResize } from "@/lib/tauri-window"
+import { desktopWindowLayoutUserChangeEvent, listenCurrentWindowMove, listenCurrentWindowResize, safeCurrentWindow } from "@/lib/tauri-window"
 import { useDustDeskStore } from "@/stores/dustdesk-store"
 
-export function usePersistCurrentWindowLayout(label: string) {
+export function usePersistCurrentWindowLayout(fallbackLabel: string) {
   const saveDesktopWindowLayout = useDustDeskStore((state) => state.saveDesktopWindowLayout)
 
   useEffect(() => {
+    const label = safeCurrentWindow()?.label || fallbackLabel
     if (!label) return
 
     let saveTimer: number | undefined
@@ -55,5 +56,5 @@ export function usePersistCurrentWindowLayout(label: string) {
       unlistenMove?.()
       unlistenResize?.()
     }
-  }, [label, saveDesktopWindowLayout])
+  }, [fallbackLabel, saveDesktopWindowLayout])
 }

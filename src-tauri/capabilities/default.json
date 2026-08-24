@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "DeskNest main window permissions",
-  "windows": ["main", "clipboard", "search", "desktop-widget", "desktop-category-*", "desktop-launcher"],
+  "windows": ["main", "clipboard", "search", "desktop-widget", "desktop-widget-monitor-*", "desktop-category-*", "desktop-launcher", "desktop-launcher-monitor-*"],
   "permissions": [
     "core:default",
     "core:app:allow-set-app-theme",

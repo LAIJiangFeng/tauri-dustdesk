@@ -335,7 +335,25 @@ function normalizeDesktopWindowLayout(value: unknown): DesktopWindowLayout | nul
   if (![x, y, width, height].every(Number.isFinite) || width < 120 || height < 100) {
     return null
   }
-  return { x, y, width, height }
+
+  const monitorNameValue = raw.monitor_name ?? raw.MonitorName
+  const monitorName = typeof monitorNameValue === "string" && monitorNameValue.trim() ? monitorNameValue : undefined
+  const monitorOffsetXValue = Number(raw.monitor_offset_x ?? raw.MonitorOffsetX)
+  const monitorOffsetYValue = Number(raw.monitor_offset_y ?? raw.MonitorOffsetY)
+  const monitorScaleFactorValue = Number(raw.monitor_scale_factor ?? raw.MonitorScaleFactor)
+
+  return {
+    x,
+    y,
+    width,
+    height,
+    ...(monitorName ? { monitor_name: monitorName } : {}),
+    ...(Number.isFinite(monitorOffsetXValue) ? { monitor_offset_x: Math.round(monitorOffsetXValue) } : {}),
+    ...(Number.isFinite(monitorOffsetYValue) ? { monitor_offset_y: Math.round(monitorOffsetYValue) } : {}),
+    ...(Number.isFinite(monitorScaleFactorValue) && monitorScaleFactorValue > 0
+      ? { monitor_scale_factor: monitorScaleFactorValue }
+      : {}),
+  }
 }
 
 function normalizeDesktopLayout(value: unknown): DesktopLayout {

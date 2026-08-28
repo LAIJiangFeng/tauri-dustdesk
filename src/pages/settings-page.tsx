@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react"
 import type { KeyboardEvent as ReactKeyboardEvent } from "react"
-import { ArrowsClockwise, Desktop, DownloadSimple, FolderOpen, GearSix, HardDrives, Keyboard, MagnifyingGlass, PlayCircle, Plus, X } from "@phosphor-icons/react"
+import { ArrowsClockwise, Copy, Desktop, DownloadSimple, FolderOpen, GearSix, HardDrives, Keyboard, MagnifyingGlass, PlayCircle, Plus, X } from "@phosphor-icons/react"
 import { open } from "@tauri-apps/plugin-dialog"
 import { DesktopFrameControlPanel } from "@/components/dustdesk/desktop-frame-control-panel"
 import { Badge } from "@/components/ui/badge"
@@ -39,6 +39,7 @@ export function SettingsPage() {
   const openSpecial = useDustDeskStore((state) => state.openSpecial)
   const updateRuntimeDirectory = useDustDeskStore((state) => state.updateRuntimeDirectory)
   const updateClipboardShortcut = useDustDeskStore((state) => state.updateClipboardShortcut)
+  const updateClipboardHistoryLimit = useDustDeskStore((state) => state.updateClipboardHistoryLimit)
   const updateSearchSettings = useDustDeskStore((state) => state.updateSearchSettings)
   const updateLaunchOnStartup = useDustDeskStore((state) => state.updateLaunchOnStartup)
   const checkForUpdates = useDustDeskStore((state) => state.checkForUpdates)
@@ -50,6 +51,10 @@ export function SettingsPage() {
   const [isSavingShortcut, setIsSavingShortcut] = useState(false)
   const [shortcutError, setShortcutError] = useState("")
   const [shortcutSuccess, setShortcutSuccess] = useState("")
+  const [historyLimitDraft, setHistoryLimitDraft] = useState(String(snapshot.settings.clipboard_history_limit))
+  const [isSavingHistoryLimit, setIsSavingHistoryLimit] = useState(false)
+  const [historyLimitError, setHistoryLimitError] = useState("")
+  const [historyLimitSuccess, setHistoryLimitSuccess] = useState("")
   const [searchEnabledDraft, setSearchEnabledDraft] = useState(snapshot.settings.search_enabled)
   const [searchShortcutDraft, setSearchShortcutDraft] = useState(snapshot.settings.search_shortcut)
   const [searchPathsDraft, setSearchPathsDraft] = useState(snapshot.settings.search_paths)
@@ -104,6 +109,10 @@ export function SettingsPage() {
   }, [isRecordingShortcut, snapshot.settings.clipboard_shortcut])
 
   useEffect(() => {
+    setHistoryLimitDraft(String(snapshot.settings.clipboard_history_limit))
+  }, [snapshot.settings.clipboard_history_limit])
+
+  useEffect(() => {
     if (!isRecordingSearchShortcut) {
       setSearchShortcutDraft(snapshot.settings.search_shortcut)
     }
@@ -143,6 +152,28 @@ export function SettingsPage() {
       setShortcutError(reason instanceof Error ? reason.message : String(reason))
     } finally {
       setIsSavingShortcut(false)
+    }
+  }
+
+  const saveHistoryLimit = async () => {
+    const limit = Number(historyLimitDraft)
+    if (!Number.isInteger(limit) || limit < 1 || limit > 1000) {
+      setHistoryLimitError("请输入 1 到 1000 之间的整数")
+      setHistoryLimitSuccess("")
+      return
+    }
+
+    setIsSavingHistoryLimit(true)
+    setHistoryLimitError("")
+    setHistoryLimitSuccess("")
+    try {
+      const settings = await updateClipboardHistoryLimit(limit)
+      setHistoryLimitDraft(String(settings.clipboard_history_limit))
+      setHistoryLimitSuccess(`最多保留 ${settings.clipboard_history_limit} 条剪贴记录`)
+    } catch (reason) {
+      setHistoryLimitError(reason instanceof Error ? reason.message : String(reason))
+    } finally {
+      setIsSavingHistoryLimit(false)
     }
   }
 
@@ -324,7 +355,7 @@ export function SettingsPage() {
         <div>
           <CardTitle>设置中心</CardTitle>
         </div>
-        <Badge variant="outline">{rows.length + 5} 项</Badge>
+        <Badge variant="outline">{rows.length + 6} 项</Badge>
       </CardHeader>
       <CardContent className="min-h-0">
         <ScrollArea className="h-full pr-2">
@@ -385,6 +416,61 @@ export function SettingsPage() {
                     取消
                   </Button>
                 </div>
+              </CardContent>
+            </Card>
+          </div>
+
+          <div className="mb-3 grid gap-3 xl:grid-cols-[minmax(0,1.15fr)_minmax(0,1.85fr)]">
+            <Card>
+              <CardContent className="flex min-h-48 flex-col gap-4 p-5">
+                <div className="flex size-11 items-center justify-center rounded-lg bg-muted text-muted-foreground">
+                  <Copy className="size-5" weight="duotone" />
+                </div>
+                <div>
+                  <h3 className="font-heading text-base font-medium">剪贴板历史容量</h3>
+                  <p className="mt-2 text-sm leading-6 text-muted-foreground">按你的使用习惯设置最大保留条数，不再受固定 30 条限制。</p>
+                </div>
+                <Badge className="mt-auto w-fit" variant="outline">
+                  当前上限：{snapshot.settings.clipboard_history_limit} 条
+                </Badge>
+              </CardContent>
+            </Card>
+
+            <Card>
+              <CardContent className="flex min-h-48 flex-col gap-4 p-5">
+                <div>
+                  <h3 className="font-heading text-base font-medium">最大保留条数</h3>
+                  <p className="mt-2 text-sm leading-6 text-muted-foreground">可设置 1–1000 条。调小后，超出新上限的最旧记录会立即清理。</p>
+                </div>
+                <form
+                  className="mt-auto flex flex-wrap items-end gap-3"
+                  onSubmit={(event) => {
+                    event.preventDefault()
+                    void saveHistoryLimit()
+                  }}
+                >
+                  <label className="grid min-w-48 flex-1 gap-1.5 text-sm font-medium">
+                    保留条数
+                    <Input
+                      aria-label="剪贴板历史最大保留条数"
+                      type="number"
+                      min={1}
+                      max={1000}
+                      step={1}
+                      value={historyLimitDraft}
+                      onChange={(event) => {
+                        setHistoryLimitDraft(event.target.value)
+                        setHistoryLimitError("")
+                        setHistoryLimitSuccess("")
+                      }}
+                    />
+                  </label>
+                  <Button type="submit" disabled={isSavingHistoryLimit || !historyLimitDraft.trim()}>
+                    {isSavingHistoryLimit ? "保存中" : "保存条数"}
+                  </Button>
+                </form>
+                {historyLimitSuccess ? <p className="text-xs leading-5 text-emerald-600 dark:text-emerald-400">{historyLimitSuccess}</p> : null}
+                {historyLimitError ? <p className="text-xs leading-5 text-destructive">{historyLimitError}</p> : null}
               </CardContent>
             </Card>
           </div>

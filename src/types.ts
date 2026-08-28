@@ -3,6 +3,7 @@ export type AppPage = "home" | "organizer" | "launcher" | "search" | "clipboard"
 export interface DeskCategory {
   name: string
   is_collapsed: boolean
+  sort_by_name: boolean
   item_paths: string[]
   item_details: DesktopItem[]
 }
@@ -133,6 +134,7 @@ export interface SearchOverlayData {
 
 export interface AppSettings {
   clipboard_shortcut: string
+  clipboard_history_limit: number
   search_enabled: boolean
   search_shortcut: string
   search_paths: string[]

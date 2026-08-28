@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core"
 import { create } from "zustand"
 import { immer } from "zustand/middleware/immer"
-import type { DesktopDropPosition } from "@/lib/dustdesk-dnd"
+import type { DesktopDropPosition, InternalPathDragOutcome } from "@/lib/dustdesk-dnd"
 import { displayPathName, displayWindowsEntryName, extensionFromPath } from "@/lib/utils"
 import type {
   AppPage,
@@ -23,6 +23,7 @@ import type {
 
 const defaultSettings: AppSettings = {
   clipboard_shortcut: "Ctrl+Tab",
+  clipboard_history_limit: 30,
   search_enabled: true,
   search_shortcut: "Ctrl+Space",
   search_paths: [],
@@ -149,11 +150,11 @@ const demoSnapshot: AppSnapshot = {
   settings: defaultSettings,
   desktop_layout: emptyDesktopLayout,
   categories: [
-    { name: "开发", is_collapsed: false, item_paths: [], item_details: [] },
-    { name: "工具", is_collapsed: false, item_paths: [], item_details: [] },
-    { name: "文档", is_collapsed: false, item_paths: [], item_details: [] },
-    { name: "社交", is_collapsed: false, item_paths: [], item_details: [] },
-    { name: "游戏", is_collapsed: false, item_paths: [], item_details: [] },
+    { name: "开发", is_collapsed: false, sort_by_name: false, item_paths: [], item_details: [] },
+    { name: "工具", is_collapsed: false, sort_by_name: false, item_paths: [], item_details: [] },
+    { name: "文档", is_collapsed: false, sort_by_name: false, item_paths: [], item_details: [] },
+    { name: "社交", is_collapsed: false, sort_by_name: false, item_paths: [], item_details: [] },
+    { name: "游戏", is_collapsed: false, sort_by_name: false, item_paths: [], item_details: [] },
   ],
   desktop_items: [
     {
@@ -216,6 +217,12 @@ async function call<T>(command: string, args?: InvokeArgs): Promise<T> {
         clipboard_shortcut: asString(args?.shortcut, defaultSettings.clipboard_shortcut),
       }) as T
     }
+    if (command === "update_clipboard_history_limit") {
+      return normalizeSettings({
+        ...defaultSettings,
+        clipboard_history_limit: Number(args?.limit) || defaultSettings.clipboard_history_limit,
+      }) as T
+    }
     if (command === "update_search_settings") {
       return normalizeSettings({
         ...defaultSettings,
@@ -257,6 +264,14 @@ async function call<T>(command: string, args?: InvokeArgs): Promise<T> {
     }
     if (command === "restore_item_to_desktop") {
       return asPathString(args?.path) as T
+    }
+    if (command === "complete_internal_path_drag") {
+      return {
+        action: "restored_to_desktop",
+        target_category_index: null,
+        affected: 1,
+        restored_path: asPathString(args?.path),
+      } as T
     }
     if (command === "start_classify_desktop_items_task" || command === "start_restore_all_to_desktop_task") {
       return undefined as T
@@ -310,6 +325,11 @@ function stripWindowsVerbatimPrefix(value: string) {
 
 function asBoolean(value: unknown, fallback = false) {
   return typeof value === "boolean" ? value : fallback
+}
+
+function asBoundedInteger(value: unknown, fallback: number, min: number, max: number) {
+  const parsed = Math.round(Number(value))
+  return Number.isFinite(parsed) ? Math.min(max, Math.max(min, parsed)) : fallback
 }
 
 function asArray(value: unknown): unknown[] {
@@ -414,6 +434,12 @@ function normalizeSettings(value: unknown): AppSettings {
   const raw = asRecord(value)
   return {
     clipboard_shortcut: asString(raw.clipboard_shortcut ?? raw.ClipboardShortcut, defaultSettings.clipboard_shortcut),
+    clipboard_history_limit: asBoundedInteger(
+      raw.clipboard_history_limit ?? raw.ClipboardHistoryLimit,
+      defaultSettings.clipboard_history_limit,
+      1,
+      1000,
+    ),
     search_enabled: asBoolean(raw.search_enabled ?? raw.SearchEnabled, defaultSettings.search_enabled),
     search_shortcut: asString(raw.search_shortcut ?? raw.SearchShortcut, defaultSettings.search_shortcut),
     search_paths: asArray(raw.search_paths ?? raw.SearchPaths)
@@ -434,6 +460,7 @@ function normalizeCategory(value: unknown): DeskCategory {
   return {
     name: asString(raw.name ?? raw.Name, "未命名分类"),
     is_collapsed: asBoolean(raw.is_collapsed ?? raw.IsCollapsed),
+    sort_by_name: asBoolean(raw.sort_by_name ?? raw.SortByName),
     item_paths: itemPaths,
     item_details: itemDetails.length > 0 ? itemDetails : itemPaths.map(pathToDesktopItem),
   }
@@ -830,6 +857,7 @@ interface DustDeskState {
   renameCategory: () => Promise<void>
   deleteCategory: () => Promise<void>
   toggleCategory: () => Promise<void>
+  setCategorySortByName: (index: number, enabled: boolean) => Promise<void>
   reorderCategory: (fromIndex: number, toIndex: number) => Promise<void>
   reorderCategoryLight: (fromIndex: number, toIndex: number) => Promise<void>
   addItemToCategory: (index: number, path: string) => Promise<void>
@@ -838,6 +866,7 @@ interface DustDeskState {
   removeItemFromCategory: (index: number, path: string) => Promise<void>
   restoreItemToDesktop: (index: number, path: string, position?: DesktopDropPosition) => Promise<string>
   restoreItemToDesktopLight: (index: number, path: string, position?: DesktopDropPosition) => Promise<string>
+  completeInternalPathDragLight: (sourceIndex: number, path: string, position: DesktopDropPosition) => Promise<InternalPathDragOutcome>
   restoreAllToDesktop: () => Promise<number>
   restoreAllToDesktopLight: () => Promise<number>
   startRestoreAllToDesktopTask: () => Promise<void>
@@ -873,6 +902,7 @@ interface DustDeskState {
   clipboardImageBase64: (id: string) => Promise<string>
   hideClipboardOverlay: () => Promise<void>
   updateClipboardShortcut: (shortcut: string) => Promise<AppSettings>
+  updateClipboardHistoryLimit: (limit: number) => Promise<AppSettings>
   loadSearchOverlay: () => Promise<SearchOverlayData>
   searchItems: (query: string) => Promise<SearchItem[]>
   openSearchItem: (item: SearchItem) => Promise<void>
@@ -1097,6 +1127,10 @@ export const useDustDeskStore = create<DustDeskState>()(
       await call("toggle_category", { index: get().selectedCategory })
       await get().load()
     },
+    setCategorySortByName: async (index, enabled) => {
+      await call("set_category_sort_by_name", { index, enabled })
+      await get().loadDesktopSnapshot({ force: true, preserveDesktopItems: true })
+    },
     reorderCategory: async (fromIndex, toIndex) => {
       if (fromIndex === toIndex) return
       await call("reorder_category", { fromIndex, toIndex })
@@ -1146,6 +1180,16 @@ export const useDustDeskStore = create<DustDeskState>()(
       })
       void get().loadDesktopSnapshot({ force: true })
       return restored
+    },
+    completeInternalPathDragLight: async (sourceIndex, path, position) => {
+      const outcome = await call<InternalPathDragOutcome>("complete_internal_path_drag", {
+        sourceIndex,
+        path,
+        position,
+        dragSessionId: position.dragSessionId ?? null,
+      })
+      await get().loadDesktopSnapshot({ force: true })
+      return outcome
     },
     restoreAllToDesktop: async () => {
       const restored = Number(await call<number>("restore_all_to_desktop")) || 0
@@ -1334,6 +1378,15 @@ export const useDustDeskStore = create<DustDeskState>()(
         state.snapshot.settings = normalizeSettings(settings)
       })
       return normalizeSettings(settings)
+    },
+    updateClipboardHistoryLimit: async (limit) => {
+      const settings = await call<AppSettings>("update_clipboard_history_limit", { limit })
+      const normalized = normalizeSettings(settings)
+      set((state) => {
+        state.snapshot.settings = normalized
+        state.snapshot.clipboard = state.snapshot.clipboard.slice(0, normalized.clipboard_history_limit)
+      })
+      return normalized
     },
     loadSearchOverlay: async () => {
       const overlay = await call<SearchOverlayData>("load_search_overlay")

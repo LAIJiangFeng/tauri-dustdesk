@@ -3,6 +3,10 @@ use std::{collections::BTreeMap, path::Path};
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 
+pub const DEFAULT_CLIPBOARD_HISTORY_LIMIT: usize = 30;
+pub const MIN_CLIPBOARD_HISTORY_LIMIT: usize = 1;
+pub const MAX_CLIPBOARD_HISTORY_LIMIT: usize = 1_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSnapshot {
     pub data_dir: String,
@@ -113,6 +117,13 @@ pub struct AppSettings {
     pub clipboard_shortcut: String,
 
     #[serde(
+        rename = "ClipboardHistoryLimit",
+        alias = "clipboard_history_limit",
+        default = "default_clipboard_history_limit"
+    )]
+    pub clipboard_history_limit: usize,
+
+    #[serde(
         rename = "SearchEnabled",
         alias = "search_enabled",
         default = "default_search_enabled"
@@ -137,6 +148,7 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             clipboard_shortcut: default_clipboard_shortcut(),
+            clipboard_history_limit: default_clipboard_history_limit(),
             search_enabled: default_search_enabled(),
             search_shortcut: default_search_shortcut(),
             search_paths: Vec::new(),
@@ -152,6 +164,11 @@ impl AppSettings {
         } else {
             self.clipboard_shortcut.trim().to_owned()
         }
+    }
+
+    pub fn clipboard_history_limit_value(&self) -> usize {
+        self.clipboard_history_limit
+            .clamp(MIN_CLIPBOARD_HISTORY_LIMIT, MAX_CLIPBOARD_HISTORY_LIMIT)
     }
 
     pub fn search_shortcut_value(&self) -> String {
@@ -170,6 +187,9 @@ pub struct DeskCategory {
 
     #[serde(rename = "IsCollapsed", alias = "is_collapsed", default)]
     pub is_collapsed: bool,
+
+    #[serde(rename = "SortByName", alias = "sort_by_name", default)]
+    pub sort_by_name: bool,
 
     #[serde(rename = "ItemPaths", alias = "item_paths", default)]
     pub item_paths: Vec<String>,
@@ -388,15 +408,17 @@ fn default_categories() -> Vec<DeskCategory> {
     .into_iter()
     .map(|name| DeskCategory {
         name: name.to_owned(),
-        is_collapsed: false,
-        item_paths: Vec::new(),
-        item_details: Vec::new(),
+        ..DeskCategory::default()
     })
     .collect()
 }
 
 fn default_clipboard_shortcut() -> String {
     "Ctrl+Tab".to_owned()
+}
+
+fn default_clipboard_history_limit() -> usize {
+    DEFAULT_CLIPBOARD_HISTORY_LIMIT
 }
 
 fn default_search_enabled() -> bool {

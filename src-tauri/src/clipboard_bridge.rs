@@ -11,11 +11,13 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::Local;
 
 use crate::{
-    models::{ClipboardData, ClipboardHistoryItem, ClipboardHistoryKind},
+    models::{
+        ClipboardData, ClipboardHistoryItem, ClipboardHistoryKind, MAX_CLIPBOARD_HISTORY_LIMIT,
+        MIN_CLIPBOARD_HISTORY_LIMIT,
+    },
     store::AppStore,
 };
 
-const MAX_HISTORY_ITEMS: usize = 80;
 const MAX_TEXT_CHARS: usize = 20_000;
 const MAX_IMAGE_BASE64_CHARS: usize = 32_000_000;
 const THUMBNAIL_MAX_EDGE: u32 = 420;
@@ -229,6 +231,7 @@ fn store_text_history(text: String) -> Result<(), String> {
 fn store_text_history_locked(text: String) -> Result<(), String> {
     let normalized = limit_text(text);
     let store = AppStore::open().map_err(to_message)?;
+    let history_limit = configured_history_limit(&store);
     let mut clipboard = store.load_clipboard_strict().map_err(to_message)?;
     if clipboard
         .items
@@ -245,7 +248,7 @@ fn store_text_history_locked(text: String) -> Result<(), String> {
     {
         let item = clipboard.items.remove(index);
         clipboard.items.insert(0, item);
-        truncate_history(&mut clipboard);
+        truncate_history(&mut clipboard, history_limit);
         return store.save_clipboard(&clipboard).map_err(to_message);
     }
 
@@ -264,7 +267,7 @@ fn store_text_history_locked(text: String) -> Result<(), String> {
             is_pinned: false,
         },
     );
-    truncate_history(&mut clipboard);
+    truncate_history(&mut clipboard, history_limit);
     store.save_clipboard(&clipboard).map_err(to_message)
 }
 
@@ -282,6 +285,7 @@ fn store_image_history_locked(image_png_base64: String) -> Result<(), String> {
     }
 
     let store = AppStore::open().map_err(to_message)?;
+    let history_limit = configured_history_limit(&store);
     let mut clipboard = store.load_clipboard_strict().map_err(to_message)?;
     let image_hash = image_fingerprint(&normalized);
     if clipboard.items.first().is_some_and(|item| {
@@ -297,7 +301,7 @@ fn store_image_history_locked(image_png_base64: String) -> Result<(), String> {
     }) {
         let item = clipboard.items.remove(index);
         clipboard.items.insert(0, item);
-        truncate_history(&mut clipboard);
+        truncate_history(&mut clipboard, history_limit);
         return store.save_clipboard(&clipboard).map_err(to_message);
     }
 
@@ -318,14 +322,32 @@ fn store_image_history_locked(image_png_base64: String) -> Result<(), String> {
             is_pinned: false,
         },
     );
-    truncate_history(&mut clipboard);
+    truncate_history(&mut clipboard, history_limit);
     store.save_clipboard(&clipboard).map_err(to_message)
 }
 
-fn truncate_history(clipboard: &mut ClipboardData) {
-    if clipboard.items.len() > MAX_HISTORY_ITEMS {
-        clipboard.items.truncate(MAX_HISTORY_ITEMS);
+pub fn enforce_history_limit(max_items: usize) -> Result<(), String> {
+    with_clipboard_history_lock(|| {
+        let store = AppStore::open().map_err(to_message)?;
+        let mut clipboard = store.load_clipboard_strict().map_err(to_message)?;
+        if truncate_history(&mut clipboard, max_items) {
+            store.save_clipboard(&clipboard).map_err(to_message)?;
+        }
+        Ok(())
+    })
+}
+
+pub fn truncate_history(clipboard: &mut ClipboardData, max_items: usize) -> bool {
+    let max_items = max_items.clamp(MIN_CLIPBOARD_HISTORY_LIMIT, MAX_CLIPBOARD_HISTORY_LIMIT);
+    if clipboard.items.len() <= max_items {
+        return false;
     }
+    clipboard.items.truncate(max_items);
+    true
+}
+
+fn configured_history_limit(store: &AppStore) -> usize {
+    store.load_config().settings.clipboard_history_limit_value()
 }
 
 fn should_store_text(text: &str) -> bool {

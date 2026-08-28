@@ -36,7 +36,7 @@ use models::{
     AppConfig, AppSettings, AppSnapshot, CategoryClassifyCount, ClassifyResult,
     ClipboardHistoryItem, DeskCategory, DesktopIconPosition, DesktopItem, DesktopWindowLayout,
     LaunchItem, PathIconResult, SearchHistoryData, SearchHistoryItem, SearchItem, SearchItemKind,
-    SearchOverlayData,
+    SearchOverlayData, MAX_CLIPBOARD_HISTORY_LIMIT, MIN_CLIPBOARD_HISTORY_LIMIT,
 };
 use serde::{Deserialize, Serialize};
 use store::AppStore;
@@ -93,6 +93,9 @@ static DESKTOP_WINDOW_SETTLE_SCHEDULED: AtomicBool = AtomicBool::new(false);
 static DESKTOP_MONITOR_WATCH_STARTED: AtomicBool = AtomicBool::new(false);
 static DESKTOP_WINDOW_SETTLE_GENERATION: AtomicU64 = AtomicU64::new(0);
 static DESKTOP_OPERATION_LAST: OnceLock<Mutex<Option<DesktopOperationPayload>>> = OnceLock::new();
+static INTERNAL_PATH_DROP_ACCEPTANCES: OnceLock<Mutex<Vec<InternalPathDropAcceptance>>> =
+    OnceLock::new();
+static DESKTOP_DROP_CATEGORY_TARGETS: OnceLock<Mutex<BTreeMap<String, usize>>> = OnceLock::new();
 static TRAY_MENU_ITEMS: OnceLock<TrayMenuItems> = OnceLock::new();
 
 #[derive(Clone)]
@@ -339,6 +342,28 @@ struct DesktopDropPosition {
     scale_factor: Option<f64>,
 }
 
+#[derive(Debug)]
+struct InternalPathDropAcceptance {
+    path: String,
+    session_id: Option<String>,
+    accepted_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InternalPathDropTarget {
+    Category(usize),
+    Launcher,
+    Box,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct InternalPathDragOutcome {
+    action: String,
+    target_category_index: Option<usize>,
+    affected: usize,
+    restored_path: Option<String>,
+}
+
 fn wait_for_startup_recovery() -> Result<(), String> {
     let (state, ready) = STARTUP_RECOVERY_STATE.get_or_init(|| (Mutex::new(None), Condvar::new()));
     let mut result = state
@@ -409,9 +434,14 @@ fn load_snapshot_impl() -> Result<AppSnapshot, String> {
         repair_launchers(&store, &mut launchers)?;
         Ok(launchers)
     })?;
+    let clipboard_history_limit = config.settings.clipboard_history_limit_value();
     let clipboard = clipboard_bridge::with_clipboard_history_lock(|| {
         let mut clipboard = store.load_clipboard_strict().map_err(to_message)?;
-        if clipboard_bridge::normalize_clipboard_image_storage(&mut clipboard).unwrap_or(false) {
+        let images_changed =
+            clipboard_bridge::normalize_clipboard_image_storage(&mut clipboard).unwrap_or(false);
+        let history_changed =
+            clipboard_bridge::truncate_history(&mut clipboard, clipboard_history_limit);
+        if images_changed || history_changed {
             store.save_clipboard(&clipboard).map_err(to_message)?;
         }
         Ok(clipboard)
@@ -481,9 +511,7 @@ fn create_category(app: tauri::AppHandle, name: String) -> Result<(), String> {
     mutate_categories(|categories| {
         categories.push(DeskCategory {
             name: normalize_name(&name, categories.len() + 1),
-            is_collapsed: false,
-            item_paths: Vec::new(),
-            item_details: Vec::new(),
+            ..DeskCategory::default()
         });
         Ok(())
     })?;
@@ -531,6 +559,23 @@ fn toggle_category(app: tauri::AppHandle, index: usize) -> Result<(), String> {
             .get_mut(index)
             .ok_or_else(|| "分类不存在".to_owned())?;
         category.is_collapsed = !category.is_collapsed;
+        Ok(())
+    })?;
+    emit_desktop_cards_changed(&app);
+    Ok(())
+}
+
+#[tauri::command]
+fn set_category_sort_by_name(
+    app: tauri::AppHandle,
+    index: usize,
+    enabled: bool,
+) -> Result<(), String> {
+    mutate_categories(|categories| {
+        let category = categories
+            .get_mut(index)
+            .ok_or_else(|| "分类不存在".to_owned())?;
+        category.sort_by_name = enabled;
         Ok(())
     })?;
     emit_desktop_cards_changed(&app);
@@ -715,15 +760,41 @@ fn add_items_to_category_impl(index: usize, paths: Vec<String>) -> Result<usize,
             .get(index)
             .ok_or_else(|| "分类不存在".to_owned())?;
         let category_name = config.desktop_categories[index].name.clone();
+        let mut seen_source_paths = Vec::<String>::new();
+        let source_paths = paths
+            .into_iter()
+            .filter(|path| !path.trim().is_empty() && Path::new(path).exists())
+            .filter(|path| {
+                let normalized = normalize_path_for_compare(Path::new(path));
+                if seen_source_paths.iter().any(|item| item == &normalized) {
+                    return false;
+                }
+                seen_source_paths.push(normalized);
+                true
+            })
+            .collect::<Vec<_>>();
+        // Read the Explorer ListView text and coordinates before moving the first source. Exact
+        // text matching is required because LVM_FINDITEM treats names such as `QQ`/`QQ飞车` and
+        // `Tabbit`/`tabbit2api` as ambiguous prefix matches.
+        let mut captured_positions = capture_desktop_icon_positions(
+            &source_paths.iter().map(PathBuf::from).collect::<Vec<_>>(),
+        );
+        let paths_with_positions = source_paths
+            .into_iter()
+            .map(|path| {
+                let position =
+                    desktop_icon_position_for_path(&config.desktop_icon_positions, &path).or_else(
+                        || captured_positions.remove(&normalize_path_for_compare(Path::new(&path))),
+                    );
+                (path, position)
+            })
+            .collect::<Vec<_>>();
         let mut added = 0usize;
 
-        for path in paths {
-            if path.trim().is_empty() || !Path::new(&path).exists() {
+        for (path, desktop_icon_position) in paths_with_positions {
+            if !Path::new(&path).exists() {
                 continue;
             }
-            let desktop_icon_position =
-                desktop_icon_position_for_path(&config.desktop_icon_positions, &path)
-                    .or_else(|| capture_desktop_icon_position(Path::new(&path)));
             let archived_path = archive_item_path(&store, &category_name, &path)?;
 
             for category in &mut config.desktop_categories {
@@ -775,6 +846,170 @@ fn remove_item_from_category(
     })?;
     emit_desktop_cards_changed(&app);
     Ok(())
+}
+
+#[tauri::command]
+fn register_internal_path_drop_category(
+    window: WebviewWindow,
+    index: Option<usize>,
+) -> Result<(), String> {
+    let targets = DESKTOP_DROP_CATEGORY_TARGETS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut targets = targets
+        .lock()
+        .map_err(|_| "桌面框拖拽目标状态锁已损坏".to_owned())?;
+    if let Some(index) = index {
+        targets.insert(window.label().to_owned(), index);
+    } else {
+        targets.remove(window.label());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn mark_internal_path_drop_accepted(
+    paths: Vec<String>,
+    session_id: Option<String>,
+) -> Result<(), String> {
+    let now = Instant::now();
+    let acceptances = INTERNAL_PATH_DROP_ACCEPTANCES.get_or_init(|| Mutex::new(Vec::new()));
+    let mut acceptances = acceptances
+        .lock()
+        .map_err(|_| "内部项目拖拽状态锁已损坏".to_owned())?;
+    acceptances.retain(|acceptance| {
+        now.saturating_duration_since(acceptance.accepted_at) <= Duration::from_secs(3)
+    });
+    for path in paths {
+        let path = normalize_path_for_compare(Path::new(path.trim()));
+        if path.is_empty() {
+            continue;
+        }
+        acceptances.retain(|acceptance| acceptance.path != path);
+        acceptances.push(InternalPathDropAcceptance {
+            path,
+            session_id: session_id.clone().filter(|value| !value.trim().is_empty()),
+            accepted_at: now,
+        });
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn complete_internal_path_drag(
+    app: tauri::AppHandle,
+    window: WebviewWindow,
+    source_index: usize,
+    path: String,
+    position: DesktopDropPosition,
+    drag_session_id: Option<String>,
+) -> Result<InternalPathDragOutcome, String> {
+    let source_label = window.label().to_owned();
+    tauri::async_runtime::spawn_blocking(move || {
+        complete_internal_path_drag_impl(
+            &app,
+            &source_label,
+            source_index,
+            path,
+            position,
+            drag_session_id,
+        )
+    })
+    .await
+    .map_err(to_message)?
+}
+
+fn complete_internal_path_drag_impl(
+    app: &tauri::AppHandle,
+    source_label: &str,
+    source_index: usize,
+    path: String,
+    position: DesktopDropPosition,
+    drag_session_id: Option<String>,
+) -> Result<InternalPathDragOutcome, String> {
+    if let Some(target) = internal_path_drop_target_at_position(app, source_label, position) {
+        return match target {
+            InternalPathDropTarget::Category(target_index) => {
+                let affected = if target_index == source_index {
+                    0
+                } else {
+                    let affected = add_items_to_category_impl(target_index, vec![path])?;
+                    emit_desktop_cards_changed(app);
+                    affected
+                };
+                Ok(InternalPathDragOutcome {
+                    action: "moved_to_category".to_owned(),
+                    target_category_index: Some(target_index),
+                    affected,
+                    restored_path: None,
+                })
+            }
+            InternalPathDropTarget::Launcher => {
+                let affected = add_launchers_impl(vec![path])?;
+                emit_desktop_cards_changed(app);
+                Ok(InternalPathDragOutcome {
+                    action: "added_to_launcher".to_owned(),
+                    target_category_index: None,
+                    affected,
+                    restored_path: None,
+                })
+            }
+            InternalPathDropTarget::Box => Ok(InternalPathDragOutcome {
+                action: "accepted_by_box".to_owned(),
+                target_category_index: None,
+                affected: 0,
+                restored_path: None,
+            }),
+        };
+    }
+
+    // A main-window drop can be accepted without exposing a native file payload to the source
+    // WebView. Give that target command a short window to acknowledge before restoring to Desktop.
+    for attempt in 0..6 {
+        if take_recent_internal_path_drop_acceptance(&path, drag_session_id.as_deref())? {
+            return Ok(InternalPathDragOutcome {
+                action: "accepted_by_box".to_owned(),
+                target_category_index: None,
+                affected: 0,
+                restored_path: None,
+            });
+        }
+        if attempt < 5 {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    let restored = restore_item_to_desktop_impl(app, source_index, path, Some(position))?;
+    Ok(InternalPathDragOutcome {
+        action: "restored_to_desktop".to_owned(),
+        target_category_index: None,
+        affected: 1,
+        restored_path: Some(restored),
+    })
+}
+
+fn take_recent_internal_path_drop_acceptance(
+    path: &str,
+    session_id: Option<&str>,
+) -> Result<bool, String> {
+    let path = normalize_path_for_compare(Path::new(path.trim()));
+    let now = Instant::now();
+    let acceptances = INTERNAL_PATH_DROP_ACCEPTANCES.get_or_init(|| Mutex::new(Vec::new()));
+    let mut acceptances = acceptances
+        .lock()
+        .map_err(|_| "内部项目拖拽状态锁已损坏".to_owned())?;
+    acceptances.retain(|acceptance| {
+        now.saturating_duration_since(acceptance.accepted_at) <= Duration::from_secs(3)
+    });
+    let Some(index) = acceptances.iter().position(|acceptance| {
+        acceptance.path == path
+            && match session_id {
+                Some(session_id) => acceptance.session_id.as_deref() == Some(session_id),
+                None => true,
+            }
+    }) else {
+        return Ok(false);
+    };
+    acceptances.remove(index);
+    Ok(true)
 }
 
 #[tauri::command]
@@ -1081,6 +1316,12 @@ fn classify_desktop_items_with_progress(
         let mut skipped = 0usize;
         let mut candidates = Vec::new();
         let items = desktop_items(false);
+        let mut captured_positions = capture_desktop_icon_positions(
+            &items
+                .iter()
+                .map(|item| PathBuf::from(&item.path))
+                .collect::<Vec<_>>(),
+        );
         for item in items {
             if should_skip_desktop_classify_item(&item) {
                 skipped += 1;
@@ -1106,7 +1347,10 @@ fn classify_desktop_items_with_progress(
                     &config.desktop_icon_positions,
                     &original_path,
                 )
-                .or_else(|| capture_desktop_icon_position(Path::new(&original_path))),
+                .or_else(|| {
+                    captured_positions
+                        .remove(&normalize_path_for_compare(Path::new(&original_path)))
+                }),
                 original_path,
                 category_index,
                 category_name,
@@ -2468,6 +2712,32 @@ fn update_clipboard_shortcut(
 }
 
 #[tauri::command]
+async fn update_clipboard_history_limit(limit: usize) -> Result<AppSettings, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if !(MIN_CLIPBOARD_HISTORY_LIMIT..=MAX_CLIPBOARD_HISTORY_LIMIT).contains(&limit) {
+            return Err(format!(
+                "剪贴板最大保留条数必须在 {MIN_CLIPBOARD_HISTORY_LIMIT} 到 {MAX_CLIPBOARD_HISTORY_LIMIT} 之间"
+            ));
+        }
+
+        let settings = with_config_mutation(|| {
+            let store = AppStore::open().map_err(to_message)?;
+            let mut config = store.load_config_strict().map_err(to_message)?;
+            config.settings.clipboard_history_limit = limit;
+            store.save_config(&config).map_err(to_message)?;
+            Ok(config.settings)
+        })?;
+
+        // The config transaction has ended before taking the clipboard lock, so settings and
+        // history writes keep a consistent lock order.
+        clipboard_bridge::enforce_history_limit(settings.clipboard_history_limit_value())?;
+        Ok(settings)
+    })
+    .await
+    .map_err(to_message)?
+}
+
+#[tauri::command]
 fn update_search_settings(
     app: tauri::AppHandle,
     enabled: bool,
@@ -3573,7 +3843,17 @@ fn notify_shell_desktop_restore(path: &Path, desktop: &Path) {
 fn desktop_drop_position_to_icon_position(
     position: Option<DesktopDropPosition>,
 ) -> Option<DesktopIconPosition> {
-    let position = position?;
+    let (screen_x, screen_y) = desktop_drop_position_to_physical_point(position?)?;
+    #[cfg(windows)]
+    let monitors = windows_desktop_monitor_work_areas();
+    #[cfg(not(windows))]
+    let monitors = Vec::new();
+    Some(desktop_icon_position_from_screen_point(
+        screen_x, screen_y, &monitors,
+    ))
+}
+
+fn desktop_drop_position_to_physical_point(position: DesktopDropPosition) -> Option<(i32, i32)> {
     if !position.screen_x.is_finite() || !position.screen_y.is_finite() {
         return None;
     }
@@ -3582,16 +3862,9 @@ fn desktop_drop_position_to_icon_position(
         .scale_factor
         .filter(|value| value.is_finite() && *value > 0.0)
         .unwrap_or(1.0);
-    let x = (position.screen_x * scale_factor).round();
-    let y = (position.screen_y * scale_factor).round();
-    let screen_x = f64_to_i32_saturating(x);
-    let screen_y = f64_to_i32_saturating(y);
-    #[cfg(windows)]
-    let monitors = windows_desktop_monitor_work_areas();
-    #[cfg(not(windows))]
-    let monitors = Vec::new();
-    Some(desktop_icon_position_from_screen_point(
-        screen_x, screen_y, &monitors,
+    Some((
+        f64_to_i32_saturating((position.screen_x * scale_factor).round()),
+        f64_to_i32_saturating((position.screen_y * scale_factor).round()),
     ))
 }
 
@@ -3696,22 +3969,49 @@ fn clamp_desktop_icon_point_to_monitor(
 
 #[cfg(windows)]
 fn capture_desktop_icon_position(path: &Path) -> Option<DesktopIconPosition> {
-    let parent = path.parent()?;
-    if !desktop_roots()
-        .iter()
-        .any(|desktop| same_path_for_move(parent, desktop))
-    {
-        return None;
-    }
-
-    let listview = desktop_listview_window()?;
-    let index = desktop_listview_find_item(listview, path)?;
-    desktop_listview_get_item_position(listview, index)
+    let key = normalize_path_for_compare(path);
+    capture_desktop_icon_positions(&[path.to_path_buf()]).remove(&key)
 }
 
 #[cfg(not(windows))]
 fn capture_desktop_icon_position(_path: &Path) -> Option<DesktopIconPosition> {
     None
+}
+
+#[cfg(windows)]
+fn capture_desktop_icon_positions(paths: &[PathBuf]) -> BTreeMap<String, DesktopIconPosition> {
+    let Some(listview) = desktop_listview_window() else {
+        return BTreeMap::new();
+    };
+    let Some(item_texts) = desktop_listview_item_texts(listview) else {
+        return BTreeMap::new();
+    };
+    let desktop_roots = desktop_roots();
+    let mut positions = BTreeMap::new();
+    for path in paths {
+        let Some(parent) = path.parent() else {
+            continue;
+        };
+        if !desktop_roots
+            .iter()
+            .any(|desktop| same_path_for_move(parent, desktop))
+        {
+            continue;
+        }
+        let Some(index) = desktop_listview_find_item_in_texts(path, &item_texts) else {
+            continue;
+        };
+        let Some(position) = desktop_listview_get_item_position(listview, index) else {
+            continue;
+        };
+        positions.insert(normalize_path_for_compare(path), position);
+    }
+    positions
+}
+
+#[cfg(not(windows))]
+fn capture_desktop_icon_positions(_paths: &[PathBuf]) -> BTreeMap<String, DesktopIconPosition> {
+    BTreeMap::new()
 }
 
 #[cfg(windows)]
@@ -3727,23 +4027,65 @@ fn position_desktop_icon_at(_path: &Path, _position: Option<DesktopIconPosition>
 
 #[cfg(windows)]
 fn position_desktop_icons(items: &[(PathBuf, DesktopIconPosition)]) {
+    const MAX_ATTEMPTS: usize = 100;
+    const RETRY_DELAY: Duration = Duration::from_millis(100);
+
     let monitors = windows_desktop_monitor_work_areas();
     let mut pending = items.to_vec();
-    for _ in 0..16 {
+    for attempt in 0..MAX_ATTEMPTS {
         if let Some(listview) = desktop_listview_window() {
-            pending.retain(|(path, position)| {
-                let Some(index) = desktop_listview_find_item(listview, path) else {
-                    return true;
-                };
-                let (screen_x, screen_y) =
-                    resolve_desktop_icon_position(position.clone(), &monitors);
-                !desktop_listview_set_item_position(listview, index, screen_x, screen_y)
-            });
+            if let Some(item_texts) = desktop_listview_item_texts(listview) {
+                pending.retain(|(path, position)| {
+                    let Some(index) = desktop_listview_find_item_in_texts(path, &item_texts) else {
+                        return true;
+                    };
+                    let (screen_x, screen_y) =
+                        resolve_desktop_icon_position(position.clone(), &monitors);
+                    !desktop_listview_set_item_position(listview, index, screen_x, screen_y)
+                });
+            }
             if pending.is_empty() {
+                // Explorer can publish a large batch incrementally. Reapply after it settles so a
+                // late icon insertion cannot keep one of the already positioned shortcuts in the
+                // temporary slot Explorer selected while restoring the batch.
+                std::thread::sleep(Duration::from_millis(250));
+                position_visible_desktop_icons_once(listview, items, &monitors);
                 return;
             }
         }
-        std::thread::sleep(Duration::from_millis(75));
+        if attempt + 1 < MAX_ATTEMPTS {
+            std::thread::sleep(RETRY_DELAY);
+        }
+    }
+
+    // Apply every entry that eventually became visible even if a single Shell item never exposed
+    // its display text. The unresolved count is retained in stderr for field diagnostics.
+    if let Some(listview) = desktop_listview_window() {
+        position_visible_desktop_icons_once(listview, items, &monitors);
+    }
+    if !pending.is_empty() {
+        eprintln!(
+            "desktop icon positioning timed out with {} unresolved item(s)",
+            pending.len()
+        );
+    }
+}
+
+#[cfg(windows)]
+fn position_visible_desktop_icons_once(
+    listview: windows_sys::Win32::Foundation::HWND,
+    items: &[(PathBuf, DesktopIconPosition)],
+    monitors: &[DesktopMonitorWorkArea],
+) {
+    let Some(item_texts) = desktop_listview_item_texts(listview) else {
+        return;
+    };
+    for (path, position) in items {
+        let Some(index) = desktop_listview_find_item_in_texts(path, &item_texts) else {
+            continue;
+        };
+        let (screen_x, screen_y) = resolve_desktop_icon_position(position.clone(), monitors);
+        desktop_listview_set_item_position(listview, index, screen_x, screen_y);
     }
 }
 
@@ -3881,22 +4223,142 @@ unsafe fn desktop_listview_under_window(
     }
 }
 
-#[cfg(windows)]
-fn desktop_listview_find_item(
-    listview: windows_sys::Win32::Foundation::HWND,
-    path: &Path,
-) -> Option<i32> {
+fn desktop_listview_find_item_in_texts(path: &Path, item_texts: &[(i32, String)]) -> Option<i32> {
     let candidates = desktop_icon_name_candidates(path);
-    if candidates.is_empty() {
-        return None;
+    item_texts.iter().find_map(|(index, item_text)| {
+        candidates
+            .iter()
+            .any(|candidate| candidate.to_lowercase() == item_text.to_lowercase())
+            .then_some(*index)
+    })
+}
+
+#[cfg(windows)]
+fn desktop_listview_item_texts(
+    listview: windows_sys::Win32::Foundation::HWND,
+) -> Option<Vec<(i32, String)>> {
+    use std::{
+        ffi::c_void,
+        mem::size_of,
+        ptr::{null, null_mut},
+    };
+
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        System::{
+            Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory},
+            Memory::{
+                VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
+            },
+            Threading::{
+                OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ,
+                PROCESS_VM_WRITE,
+            },
+        },
+        UI::WindowsAndMessaging::{GetWindowThreadProcessId, SendMessageW},
+    };
+
+    const LVM_GETITEMCOUNT: u32 = 0x1000 + 4;
+    const LVM_GETITEMTEXTW: u32 = 0x1000 + 115;
+    const TEXT_CAPACITY: usize = 1024;
+
+    #[repr(C)]
+    struct LvItemTextW {
+        mask: u32,
+        item: i32,
+        sub_item: i32,
+        state: u32,
+        state_mask: u32,
+        text: *mut u16,
+        text_capacity: i32,
     }
 
-    for candidate in candidates {
-        if let Some(index) = desktop_listview_find_text(listview, &candidate) {
-            return Some(index);
+    unsafe {
+        let count = SendMessageW(listview, LVM_GETITEMCOUNT, 0, 0);
+        if count <= 0 || count > i32::MAX as isize {
+            return Some(Vec::new());
         }
+
+        let mut process_id = 0u32;
+        GetWindowThreadProcessId(listview, &mut process_id);
+        if process_id == 0 {
+            return None;
+        }
+
+        let process = OpenProcess(
+            PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE,
+            0,
+            process_id,
+        );
+        if process.is_null() {
+            return None;
+        }
+
+        let item_size = size_of::<LvItemTextW>();
+        let text_size = TEXT_CAPACITY * size_of::<u16>();
+        let remote_block = VirtualAllocEx(
+            process,
+            null(),
+            item_size + text_size,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE,
+        );
+        if remote_block.is_null() {
+            CloseHandle(process);
+            return None;
+        }
+        let remote_text = (remote_block as usize + item_size) as *mut u16;
+        let mut item_texts = Vec::with_capacity(count as usize);
+
+        for index in 0..count as i32 {
+            let item = LvItemTextW {
+                mask: 0,
+                item: index,
+                sub_item: 0,
+                state: 0,
+                state_mask: 0,
+                text: remote_text,
+                text_capacity: TEXT_CAPACITY as i32,
+            };
+            if WriteProcessMemory(
+                process,
+                remote_block,
+                (&item as *const LvItemTextW).cast::<c_void>(),
+                item_size,
+                null_mut(),
+            ) == 0
+            {
+                continue;
+            }
+
+            let characters = SendMessageW(
+                listview,
+                LVM_GETITEMTEXTW,
+                index as usize,
+                remote_block as isize,
+            );
+            if characters <= 0 {
+                continue;
+            }
+            let characters = (characters as usize).min(TEXT_CAPACITY.saturating_sub(1));
+            let mut text = vec![0u16; characters];
+            if ReadProcessMemory(
+                process,
+                remote_text.cast(),
+                text.as_mut_ptr().cast(),
+                characters * size_of::<u16>(),
+                null_mut(),
+            ) == 0
+            {
+                continue;
+            }
+            item_texts.push((index, String::from_utf16_lossy(&text)));
+        }
+
+        VirtualFreeEx(process, remote_block, 0, MEM_RELEASE);
+        CloseHandle(process);
+        Some(item_texts)
     }
-    None
 }
 
 #[cfg(windows)]
@@ -3985,7 +4447,6 @@ fn desktop_listview_get_item_position(
     }
 }
 
-#[cfg(windows)]
 fn desktop_icon_name_candidates(path: &Path) -> Vec<String> {
     let mut candidates = Vec::new();
     if let Some(file_name) = path
@@ -4003,125 +4464,11 @@ fn desktop_icon_name_candidates(path: &Path) -> Vec<String> {
     candidates
 }
 
-#[cfg(windows)]
 fn push_unique_string(values: &mut Vec<String>, value: String) {
     if value.is_empty() || values.iter().any(|existing| existing == &value) {
         return;
     }
     values.push(value);
-}
-
-#[cfg(windows)]
-fn desktop_listview_find_text(
-    listview: windows_sys::Win32::Foundation::HWND,
-    text: &str,
-) -> Option<i32> {
-    use std::{
-        ffi::c_void,
-        mem::{size_of, zeroed},
-        ptr::{null, null_mut},
-    };
-
-    use windows_sys::Win32::{
-        Foundation::CloseHandle,
-        System::{
-            Diagnostics::Debug::WriteProcessMemory,
-            Memory::{
-                VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
-            },
-            Threading::{
-                OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_WRITE,
-            },
-        },
-        UI::WindowsAndMessaging::{GetWindowThreadProcessId, SendMessageW},
-    };
-
-    const LVFI_STRING: u32 = 0x0002;
-    const LVM_FINDITEMW: u32 = 0x1000 + 83;
-
-    #[repr(C)]
-    struct LvFindInfoW {
-        flags: u32,
-        psz: *const u16,
-        l_param: isize,
-        pt: windows_sys::Win32::Foundation::POINT,
-        vk_direction: u32,
-    }
-
-    unsafe {
-        let mut process_id = 0u32;
-        GetWindowThreadProcessId(listview, &mut process_id);
-        if process_id == 0 {
-            return None;
-        }
-
-        let process = OpenProcess(
-            PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_WRITE,
-            0,
-            process_id,
-        );
-        if process.is_null() {
-            return None;
-        }
-
-        let wide_text = text
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect::<Vec<_>>();
-        let find_info_size = size_of::<LvFindInfoW>();
-        let text_size = wide_text.len() * size_of::<u16>();
-        let block_size = find_info_size + text_size;
-        let remote_block = VirtualAllocEx(
-            process,
-            null(),
-            block_size,
-            MEM_COMMIT | MEM_RESERVE,
-            PAGE_READWRITE,
-        );
-        if remote_block.is_null() {
-            CloseHandle(process);
-            return None;
-        }
-
-        let remote_text = (remote_block as usize + find_info_size) as *mut c_void;
-        let find_info = LvFindInfoW {
-            flags: LVFI_STRING,
-            psz: remote_text.cast(),
-            l_param: 0,
-            pt: zeroed(),
-            vk_direction: 0,
-        };
-
-        let wrote_info = WriteProcessMemory(
-            process,
-            remote_block,
-            (&find_info as *const LvFindInfoW).cast(),
-            find_info_size,
-            null_mut(),
-        ) != 0;
-        let wrote_text = WriteProcessMemory(
-            process,
-            remote_text,
-            wide_text.as_ptr().cast(),
-            text_size,
-            null_mut(),
-        ) != 0;
-
-        let result = if wrote_info && wrote_text {
-            SendMessageW(listview, LVM_FINDITEMW, usize::MAX, remote_block as isize)
-        } else {
-            -1
-        };
-
-        VirtualFreeEx(process, remote_block, 0, MEM_RELEASE);
-        CloseHandle(process);
-
-        if result >= 0 {
-            Some(result as i32)
-        } else {
-            None
-        }
-    }
 }
 
 #[cfg(windows)]
@@ -4336,6 +4683,15 @@ fn categories_with_item_details(
             .iter()
             .map(|path| desktop_item_for_path(Path::new(path), include_icons))
             .collect();
+        if category.sort_by_name {
+            category.item_details.sort_by(|left, right| {
+                left.name
+                    .to_lowercase()
+                    .cmp(&right.name.to_lowercase())
+                    .then_with(|| left.name.cmp(&right.name))
+                    .then_with(|| left.path.to_lowercase().cmp(&right.path.to_lowercase()))
+            });
+        }
     }
     categories
 }
@@ -8082,6 +8438,75 @@ mod tests {
     }
 
     #[test]
+    fn category_name_sorting_is_independent_per_box() {
+        let categories = vec![
+            DeskCategory {
+                name: "sorted".to_owned(),
+                sort_by_name: true,
+                item_paths: vec![
+                    r"C:\Desktop\zeta.txt".to_owned(),
+                    r"C:\Desktop\Alpha.txt".to_owned(),
+                ],
+                ..DeskCategory::default()
+            },
+            DeskCategory {
+                name: "original".to_owned(),
+                item_paths: vec![
+                    r"C:\Desktop\zeta.txt".to_owned(),
+                    r"C:\Desktop\Alpha.txt".to_owned(),
+                ],
+                ..DeskCategory::default()
+            },
+        ];
+
+        let categories = categories_with_item_details(categories, false);
+        assert_eq!(
+            categories[0]
+                .item_details
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Alpha", "zeta"]
+        );
+        assert_eq!(
+            categories[1]
+                .item_details
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["zeta", "Alpha"]
+        );
+    }
+
+    #[test]
+    fn clipboard_history_limit_defaults_and_truncates() {
+        let settings: AppSettings =
+            serde_json::from_str("{}").expect("legacy settings should load");
+        assert_eq!(settings.clipboard_history_limit_value(), 30);
+
+        let mut clipboard = models::ClipboardData {
+            items: (0..5)
+                .map(|index| ClipboardHistoryItem {
+                    id: index.to_string(),
+                    kind: models::ClipboardHistoryKind::Text,
+                    text: index.to_string(),
+                    image_png_base64: String::new(),
+                    image_path: String::new(),
+                    image_thumb_path: String::new(),
+                    image_hash: String::new(),
+                    created_at: String::new(),
+                    is_locked: false,
+                    is_pinned: false,
+                })
+                .collect(),
+        };
+        assert!(clipboard_bridge::truncate_history(&mut clipboard, 3));
+        assert_eq!(clipboard.items.len(), 3);
+        assert_eq!(clipboard.items[2].text, "2");
+        assert!(!clipboard_bridge::truncate_history(&mut clipboard, 3));
+    }
+
+    #[test]
     fn desktop_layout_preserves_negative_coordinates_on_left_monitor() {
         let work_areas = vec![
             desktop_test_work_area("DISPLAY1", 0, 0, 1920, 1040, 1.0),
@@ -8123,6 +8548,29 @@ mod tests {
 
         assert_eq!(placement.x, -2440);
         assert_eq!(placement.y, 80);
+    }
+
+    #[test]
+    fn desktop_icon_lookup_requires_an_exact_visible_name() {
+        let item_texts = vec![
+            (3, "tabbit2api".to_owned()),
+            (7, "Tabbit".to_owned()),
+            (9, "QQ飞车".to_owned()),
+            (12, "QQ".to_owned()),
+        ];
+
+        assert_eq!(
+            desktop_listview_find_item_in_texts(Path::new("Tabbit.lnk"), &item_texts),
+            Some(7)
+        );
+        assert_eq!(
+            desktop_listview_find_item_in_texts(Path::new("QQ.lnk"), &item_texts),
+            Some(12)
+        );
+        assert_eq!(
+            desktop_listview_find_item_in_texts(Path::new("QQ.lnk"), &[(9, "QQ飞车".to_owned())],),
+            None
+        );
     }
 
     #[test]
@@ -8400,9 +8848,7 @@ mod tests {
     fn category_reorder_remaps_split_indices_and_window_layouts() {
         let category = |name: &str| DeskCategory {
             name: name.to_owned(),
-            is_collapsed: false,
-            item_paths: Vec::new(),
-            item_details: Vec::new(),
+            ..DeskCategory::default()
         };
         let layout = |x| DesktopWindowLayout {
             x,
@@ -8736,6 +9182,36 @@ mod tests {
         assert!(is_path_within(&archived, &organizer.join("documents")));
         assert_eq!(
             fs::read(&archived).expect("read archived item"),
+            b"important data"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn archive_item_path_moves_an_item_between_category_boxes() {
+        let root = unique_test_dir("dustdesk-archive-between-categories");
+        let data = root.join("data");
+        let organizer = root.join("organizer");
+        let launchers = root.join("launchers");
+        let source_category = organizer.join("source");
+        fs::create_dir_all(&data).expect("create data root");
+        fs::create_dir_all(&source_category).expect("create source category");
+        fs::create_dir_all(&launchers).expect("create launcher root");
+        let source = source_category.join("important.txt");
+        fs::write(&source, b"important data").expect("write source");
+        let store = AppStore::for_test(data, organizer.clone(), launchers);
+
+        let archived = archive_item_path(&store, "target", &source.display().to_string())
+            .expect("move item between categories");
+        let archived = PathBuf::from(archived);
+
+        assert!(
+            !source.exists(),
+            "the old category must no longer contain the item"
+        );
+        assert!(is_path_within(&archived, &organizer.join("target")));
+        assert_eq!(
+            fs::read(&archived).expect("read moved item"),
             b"important data"
         );
         let _ = fs::remove_dir_all(root);
@@ -11928,6 +12404,114 @@ fn is_desktop_card_window_label(label: &str) -> bool {
     is_desktop_organizer_window_label(label) || is_desktop_launcher_window_label(label)
 }
 
+fn internal_path_drop_target_at_position(
+    app: &tauri::AppHandle,
+    source_label: &str,
+    position: DesktopDropPosition,
+) -> Option<InternalPathDropTarget> {
+    let point = desktop_drop_position_to_physical_point(position)?;
+    let target_label = desktop_card_window_label_at_point(app, source_label, point)?;
+    if is_desktop_launcher_window_label(&target_label) {
+        return Some(InternalPathDropTarget::Launcher);
+    }
+    if let Some(index) = desktop_category_index_from_label(&target_label) {
+        return Some(InternalPathDropTarget::Category(index));
+    }
+    if is_desktop_widget_window_label(&target_label) {
+        let targets = DESKTOP_DROP_CATEGORY_TARGETS.get_or_init(|| Mutex::new(BTreeMap::new()));
+        return targets
+            .lock()
+            .ok()
+            .and_then(|targets| targets.get(&target_label).copied())
+            .map(InternalPathDropTarget::Category)
+            .or(Some(InternalPathDropTarget::Box));
+    }
+    Some(InternalPathDropTarget::Box)
+}
+
+#[cfg(windows)]
+fn desktop_card_window_label_at_point(
+    app: &tauri::AppHandle,
+    source_label: &str,
+    point: (i32, i32),
+) -> Option<String> {
+    use windows_sys::Win32::{
+        Foundation::POINT,
+        UI::WindowsAndMessaging::{GetAncestor, IsWindowVisible, WindowFromPoint, GA_ROOT},
+    };
+
+    let hit = unsafe {
+        let hit = WindowFromPoint(POINT {
+            x: point.0,
+            y: point.1,
+        });
+        if hit.is_null() {
+            return None;
+        }
+        GetAncestor(hit, GA_ROOT)
+    };
+    if hit.is_null() {
+        return None;
+    }
+
+    if let Some(label) = app.webview_windows().values().find_map(|window| {
+        if window.label() == source_label || !is_desktop_card_window_label(window.label()) {
+            return None;
+        }
+        let hwnd = window.hwnd().ok()?.0;
+        (hwnd == hit && unsafe { IsWindowVisible(hwnd) } != 0).then(|| window.label().to_owned())
+    }) {
+        return Some(label);
+    }
+
+    // WebView2 may place a transient drag-image/OLE window under the pointer. In that case
+    // WindowFromPoint cannot see the underlying Box even though the release point is inside its
+    // physical bounds, so use those bounds as the definitive fallback requested by the UI.
+    app.webview_windows().values().find_map(|window| {
+        if window.label() == source_label
+            || !is_desktop_card_window_label(window.label())
+            || !window.is_visible().unwrap_or(false)
+        {
+            return None;
+        }
+        let position = window.outer_position().ok()?;
+        let size = window.outer_size().ok()?;
+        point_in_physical_window(point, position, size).then(|| window.label().to_owned())
+    })
+}
+
+#[cfg(not(windows))]
+fn desktop_card_window_label_at_point(
+    app: &tauri::AppHandle,
+    source_label: &str,
+    point: (i32, i32),
+) -> Option<String> {
+    app.webview_windows().values().find_map(|window| {
+        if window.label() == source_label
+            || !is_desktop_card_window_label(window.label())
+            || !window.is_visible().unwrap_or(false)
+        {
+            return None;
+        }
+        let position = window.outer_position().ok()?;
+        let size = window.outer_size().ok()?;
+        point_in_physical_window(point, position, size).then(|| window.label().to_owned())
+    })
+}
+
+fn point_in_physical_window(
+    point: (i32, i32),
+    position: PhysicalPosition<i32>,
+    size: PhysicalSize<u32>,
+) -> bool {
+    let right = i64::from(position.x) + i64::from(size.width);
+    let bottom = i64::from(position.y) + i64::from(size.height);
+    i64::from(point.0) >= i64::from(position.x)
+        && i64::from(point.0) < right
+        && i64::from(point.1) >= i64::from(position.y)
+        && i64::from(point.1) < bottom
+}
+
 fn desktop_frame_visibility_impl(app: &tauri::AppHandle) -> DesktopFrameVisibility {
     let mut organizer = false;
     let mut launcher = false;
@@ -13145,10 +13729,14 @@ fn main() {
             rename_category,
             delete_category,
             toggle_category,
+            set_category_sort_by_name,
             reorder_category,
             add_item_to_category,
             add_items_to_category,
             remove_item_from_category,
+            register_internal_path_drop_category,
+            mark_internal_path_drop_accepted,
+            complete_internal_path_drag,
             restore_item_to_desktop,
             restore_all_to_desktop,
             start_restore_all_to_desktop_task,
@@ -13194,6 +13782,7 @@ fn main() {
             paste_clipboard_item,
             hide_clipboard_overlay,
             update_clipboard_shortcut,
+            update_clipboard_history_limit,
             update_search_settings,
             update_launch_on_startup
         ])

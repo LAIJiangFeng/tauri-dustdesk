@@ -1,5 +1,5 @@
 import { useDeferredValue, useEffect, useRef, useState, type DragEvent as ReactDragEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from "react"
-import { Archive, ArrowsClockwise, CaretRight, CheckCircle, Columns, Desktop, DotsSixVertical, FolderOpen, MagnifyingGlass, PencilSimple, Plus, RocketLaunch, Trash, X } from "@phosphor-icons/react"
+import { Archive, ArrowsClockwise, CaretRight, CheckCircle, Columns, Desktop, DotsSixVertical, FolderOpen, MagnifyingGlass, PencilSimple, Plus, RocketLaunch, SortAscending, Trash, X } from "@phosphor-icons/react"
 import { EmptyState } from "@/components/dustdesk/empty-state"
 import { DesktopWidgetViewModeControl } from "@/components/dustdesk/desktop-widget-view-mode-control"
 import { FileIcon } from "@/components/dustdesk/file-icon"
@@ -14,8 +14,10 @@ import {
   didDragEndOutsideWindow,
   hasDustDeskPathDrag,
   hasPathLikeDrag,
+  markDustDeskPathDropAccepted,
   readDustDeskPathDrag,
   type DesktopDropPosition,
+  waitForDustDeskPathDropAcceptance,
   writeDustDeskPathDrag,
 } from "@/lib/dustdesk-dnd"
 import { desktopWidgetCategoryViewScope } from "@/lib/desktop-widget-settings"
@@ -24,7 +26,7 @@ import { cn, displayPathName } from "@/lib/utils"
 import { useDustDeskStore } from "@/stores/dustdesk-store"
 import type { DesktopItem, DesktopOperationEvent } from "@/types"
 
-const organizerCategoryDropZone = "organizer-category"
+const organizerCategoryDropZonePrefix = "organizer-category:"
 const splitCategoriesStorageKey = "dustdesk-desktop-widget-split-categories"
 
 export function OrganizerPage() {
@@ -35,13 +37,14 @@ export function OrganizerPage() {
   const renameCategory = useDustDeskStore((state) => state.renameCategory)
   const deleteCategory = useDustDeskStore((state) => state.deleteCategory)
   const reorderCategory = useDustDeskStore((state) => state.reorderCategory)
+  const setCategorySortByName = useDustDeskStore((state) => state.setCategorySortByName)
   const openSpecial = useDustDeskStore((state) => state.openSpecial)
   const loadDesktopSnapshot = useDustDeskStore((state) => state.loadDesktopSnapshot)
   const startClassifyDesktopItemsTask = useDustDeskStore((state) => state.startClassifyDesktopItemsTask)
   const startRestoreAllToDesktopTask = useDustDeskStore((state) => state.startRestoreAllToDesktopTask)
   const getDesktopOperationStatus = useDustDeskStore((state) => state.getDesktopOperationStatus)
   const addItemsToCategoryLight = useDustDeskStore((state) => state.addItemsToCategoryLight)
-  const restoreItemToDesktop = useDustDeskStore((state) => state.restoreItemToDesktop)
+  const completeInternalPathDragLight = useDustDeskStore((state) => state.completeInternalPathDragLight)
   const mergeDesktopWidgets = useDustDeskStore((state) => state.mergeDesktopWidgets)
   const [query, setQuery] = useState("")
   const [notice, setNotice] = useState<string | null>(null)
@@ -51,6 +54,7 @@ export function OrganizerPage() {
   const [isReorderingCategory, setIsReorderingCategory] = useState(false)
   const [draggingCategoryIndex, setDraggingCategoryIndex] = useState<number | null>(null)
   const [categoryDropTargetIndex, setCategoryDropTargetIndex] = useState<number | null>(null)
+  const [pathDropTargetIndex, setPathDropTargetIndex] = useState<number | null>(null)
   const [dropOperationLabel, setDropOperationLabel] = useState("")
   const categoryScrollAreaRef = useRef<HTMLDivElement>(null)
   const categoryPointerRef = useRef<{
@@ -168,23 +172,40 @@ export function OrganizerPage() {
     let unlisten: (() => void) | undefined
     void safeCurrentWebviewDragDropEvent((event) => {
       const payload = event.payload
-      if (payload.type !== "drop") return
-      if (dropZoneFromPoint(payload.position.x, payload.position.y) !== organizerCategoryDropZone) {
-        setNotice("已接收到桌面拖拽，正在收纳到当前分类")
+      if (payload.type === "leave") {
+        setPathDropTargetIndex(null)
+        return
       }
-      void addPathsToSelectedCategory(payload.paths)
+      const targetIndex = categoryIndexFromDropZone(dropZoneFromPoint(payload.position.x, payload.position.y)) ?? selectedCategory
+      if (payload.type === "enter" || payload.type === "over") {
+        setPathDropTargetIndex(targetIndex)
+        return
+      }
+      if (payload.type !== "drop") return
+      setPathDropTargetIndex(null)
+      markDustDeskPathDropAccepted(null, payload.paths)
+      void addPathsToCategory(targetIndex, payload.paths)
     }).then((value) => {
       unlisten = value
     })
     return () => unlisten?.()
-  }, [addItemsToCategoryLight, selectedCategory])
+  }, [addItemsToCategoryLight, selectedCategory, snapshot.categories])
 
-  async function addPathsToSelectedCategory(paths: string[]) {
+  async function addPathsToCategory(targetIndex: number, paths: string[]) {
     if (paths.length === 0) return
+    const targetCategory = snapshot.categories[targetIndex]
+    if (!targetCategory) return
+    const movedBetweenCategories = paths.some((path) =>
+      snapshot.categories.some(
+        (candidate, candidateIndex) =>
+          candidateIndex !== targetIndex && candidate.item_paths.some((itemPath) => sameDragPath(itemPath, path)),
+      ),
+    )
+    const action = movedBetweenCategories ? "移动" : "收纳"
     try {
-      setDropOperationLabel(`正在收纳 ${paths.length} 项到「${category?.name ?? "当前分类"}」...`)
-      const added = await addItemsToCategoryLight(selectedCategory, paths)
-      setNotice(countNotice("已收纳", added, paths.length, "没有新增收纳项目"))
+      setDropOperationLabel(`正在${action} ${paths.length} 项到「${targetCategory.name}」...`)
+      const added = await addItemsToCategoryLight(targetIndex, paths)
+      setNotice(countNotice(movedBetweenCategories ? "已移动" : "已收纳", added, paths.length, "没有新增收纳项目"))
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error))
     } finally {
@@ -194,9 +215,18 @@ export function OrganizerPage() {
 
   async function handleCategoryRestoreDragOut(categoryIndex: number, path: string, position: DesktopDropPosition) {
     try {
-      setDropOperationLabel(`正在移回桌面：${displayPathName(path)}`)
-      await restoreItemToDesktop(categoryIndex, path, position)
-      setNotice(`已移回桌面：${displayPathName(path)}`)
+      setDropOperationLabel(`正在识别拖拽目标：${displayPathName(path)}`)
+      const outcome = await completeInternalPathDragLight(categoryIndex, path, position)
+      if (outcome.action === "moved_to_category") {
+        const targetName = snapshot.categories[outcome.target_category_index ?? -1]?.name ?? "目标分类"
+        setNotice(`已移动到「${targetName}」：${displayPathName(path)}`)
+      } else if (outcome.action === "added_to_launcher") {
+        setNotice(`已加入快捷启动：${displayPathName(path)}`)
+      } else if (outcome.action === "restored_to_desktop") {
+        setNotice(`已移回桌面：${displayPathName(outcome.restored_path ?? path)}`)
+      } else {
+        setNotice(`目标 Box 已接收：${displayPathName(path)}`)
+      }
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error))
     } finally {
@@ -427,20 +457,38 @@ export function OrganizerPage() {
   function handleCategoryDragOver(event: ReactDragEvent<HTMLElement>) {
     if (!hasPathLikeDrag(event.dataTransfer)) return
     event.preventDefault()
-    event.dataTransfer.dropEffect = "copy"
+    const targetIndex = categoryIndexFromDropTarget(event.target) ?? selectedCategory
+    setPathDropTargetIndex(targetIndex)
+    event.dataTransfer.dropEffect = hasDustDeskPathDrag(event.dataTransfer) ? "move" : "copy"
+  }
+
+  function handleCategoryDragLeave(event: ReactDragEvent<HTMLElement>) {
+    const nextTarget = event.relatedTarget
+    if (nextTarget instanceof Node && event.currentTarget.contains(nextTarget)) return
+    setPathDropTargetIndex(null)
   }
 
   function handleCategoryDrop(event: ReactDragEvent<HTMLElement>) {
     if (!hasPathLikeDrag(event.dataTransfer)) return
     event.preventDefault()
+    const targetIndex = categoryIndexFromDropTarget(event.target) ?? selectedCategory
+    setPathDropTargetIndex(null)
     if (hasDustDeskPathDrag(event.dataTransfer)) {
-      void addPathsToSelectedCategory(readDustDeskPathDrag(event.dataTransfer))
+      const paths = readDustDeskPathDrag(event.dataTransfer)
+      markDustDeskPathDropAccepted(event.dataTransfer, paths)
+      void addPathsToCategory(targetIndex, paths)
     }
   }
 
   return (
     <div className="grid h-full min-h-0 gap-4 xl:grid-cols-[290px_minmax(0,1fr)_390px]">
-      <Card className="min-h-0" data-path-drop-zone={organizerCategoryDropZone} onDragOver={handleCategoryDragOver} onDrop={handleCategoryDrop}>
+      <Card
+        className="min-h-0"
+        data-path-drop-zone={categoryDropZone(selectedCategory)}
+        onDragOver={handleCategoryDragOver}
+        onDragLeave={handleCategoryDragLeave}
+        onDrop={handleCategoryDrop}
+      >
         <CardHeader>
           <div>
             <CardTitle>分类</CardTitle>
@@ -466,7 +514,12 @@ export function OrganizerPage() {
           <ScrollArea ref={categoryScrollAreaRef} className="min-h-0 flex-1 pr-2">
             <div className="grid gap-2">
               {snapshot.categories.map((item, index) => (
-                <div key={`${item.name}-${index}`} data-category-index={index} className="relative">
+                <div
+                  key={`${item.name}-${index}`}
+                  data-category-index={index}
+                  data-path-drop-zone={categoryDropZone(index)}
+                  className={cn("relative rounded-xl transition-colors", pathDropTargetIndex === index && "bg-emerald-500/10 ring-2 ring-emerald-400/70")}
+                >
                   {categoryDropTargetIndex === index && draggingCategoryIndex !== index ? (
                     <span
                       className={cn(
@@ -566,13 +619,37 @@ export function OrganizerPage() {
         {desktopOperationLabel ? <DesktopOperationOverlay label={desktopOperationLabel} /> : null}
       </Card>
 
-      <Card className="min-h-0">
+      <Card
+        className={cn("min-h-0 transition-colors", pathDropTargetIndex === selectedCategory && "ring-2 ring-emerald-400/70")}
+        data-path-drop-zone={categoryDropZone(selectedCategory)}
+        onDragOver={handleCategoryDragOver}
+        onDragLeave={handleCategoryDragLeave}
+        onDrop={handleCategoryDrop}
+      >
         <CardHeader>
           <div>
             <CardTitle>{category?.name ?? "分类内容"}</CardTitle>
           </div>
           <div className="flex flex-wrap items-center gap-2">
             {category ? <DesktopWidgetViewModeControl scope={desktopWidgetCategoryViewScope(category.name, selectedCategory)} label={`${category.name}桌面框排版`} /> : null}
+            {category ? (
+              <Button
+                type="button"
+                size="sm"
+                variant={category.sort_by_name ? "secondary" : "outline"}
+                title={category.sort_by_name ? "恢复原收纳顺序" : "按名称升序排列当前分类"}
+                onClick={() => {
+                  const enabled = !category.sort_by_name
+                  setNotice(null)
+                  void setCategorySortByName(selectedCategory, enabled)
+                    .then(() => setNotice(enabled ? `「${category.name}」已按名称排序` : `「${category.name}」已恢复原收纳顺序`))
+                    .catch((reason) => setNotice(reason instanceof Error ? reason.message : String(reason)))
+                }}
+              >
+                <SortAscending className="size-3.5" weight="duotone" />
+                {category.sort_by_name ? "名称排序中" : "按名称排序"}
+              </Button>
+            ) : null}
             <Badge variant="secondary">{category?.item_paths.length ?? 0} 项</Badge>
           </div>
         </CardHeader>
@@ -791,7 +868,11 @@ function DesktopItemShell({
       }}
       onDragEnd={(event: ReactDragEvent<HTMLDivElement>) => {
         if (!dragPath || !onDragEndOutside || !didDragEndOutsideWindow(event)) return
-        void Promise.resolve(onDragEndOutside(desktopDropPositionFromDragEnd(event))).catch(() => undefined)
+        const position = desktopDropPositionFromDragEnd(event)
+        void waitForDustDeskPathDropAcceptance(event.dataTransfer, dragPath).then((accepted) => {
+          if (accepted) return
+          return Promise.resolve(onDragEndOutside(position)).catch(() => undefined)
+        })
       }}
       onDoubleClick={(event) => {
         if (isInteractiveTarget(event.target)) return
@@ -812,10 +893,31 @@ function isInteractiveTarget(target: EventTarget | null) {
   return target instanceof HTMLElement && Boolean(target.closest("button,input,a,[role='menuitem']"))
 }
 
+function categoryDropZone(index: number) {
+  return `${organizerCategoryDropZonePrefix}${index}`
+}
+
+function categoryIndexFromDropZone(zone: string) {
+  if (!zone.startsWith(organizerCategoryDropZonePrefix)) return null
+  const index = Number(zone.slice(organizerCategoryDropZonePrefix.length))
+  return Number.isInteger(index) && index >= 0 ? index : null
+}
+
+function categoryIndexFromDropTarget(target: EventTarget | null) {
+  if (!(target instanceof Element)) return null
+  const zone = target.closest<HTMLElement>("[data-path-drop-zone]")?.dataset.pathDropZone ?? ""
+  return categoryIndexFromDropZone(zone)
+}
+
 function dropZoneFromPoint(physicalX: number, physicalY: number) {
   const ratio = globalThis.devicePixelRatio || 1
   const element = document.elementFromPoint(physicalX / ratio, physicalY / ratio)
   return element?.closest<HTMLElement>("[data-path-drop-zone]")?.dataset.pathDropZone ?? ""
+}
+
+function sameDragPath(left: string, right: string) {
+  const normalize = (value: string) => value.trim().replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase()
+  return normalize(left) === normalize(right)
 }
 
 function isLaunchable(item: DesktopItem) {

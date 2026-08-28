@@ -31,6 +31,7 @@ import {
   PencilSimple,
   Plus,
   RocketLaunch,
+  SortAscending,
   SquaresFour,
   Trash,
   UsersThree,
@@ -46,7 +47,7 @@ import { Button } from "@/components/ui/button"
 import { usePersistCurrentWindowLayout } from "@/hooks/use-persist-current-window-layout"
 import { useDesktopWindowState } from "@/hooks/use-desktop-window-state"
 import { useTheme } from "@/hooks/use-theme"
-import { allowPathLikeDrag, desktopDropPositionFromDragEnd, didDragEndOutsideWindow, readDustDeskPathDrag, type DesktopDropPosition, writeDustDeskPathDrag } from "@/lib/dustdesk-dnd"
+import { allowPathLikeDrag, desktopDropPositionFromDragEnd, didDragEndOutsideWindow, hasDustDeskPathDrag, markDustDeskPathDropAccepted, readDustDeskPathDrag, registerDustDeskDropCategory, type DesktopDropPosition, waitForDustDeskPathDropAcceptance, writeDustDeskPathDrag } from "@/lib/dustdesk-dnd"
 import {
   desktopWidgetBackgroundColor,
   desktopWidgetCategoryViewScope,
@@ -108,12 +109,14 @@ export function DesktopWidgetPage() {
   const renameCategory = useDustDeskStore((state) => state.renameCategory)
   const deleteCategory = useDustDeskStore((state) => state.deleteCategory)
   const reorderCategoryLight = useDustDeskStore((state) => state.reorderCategoryLight)
+  const setCategorySortByName = useDustDeskStore((state) => state.setCategorySortByName)
   const selectCategory = useDustDeskStore((state) => state.selectCategory)
   const openPath = useDustDeskStore((state) => state.openPath)
   const addItemsToCategoryLight = useDustDeskStore((state) => state.addItemsToCategoryLight)
   const addLaunchersLight = useDustDeskStore((state) => state.addLaunchersLight)
   const removeLauncher = useDustDeskStore((state) => state.removeLauncher)
   const restoreItemToDesktopLight = useDustDeskStore((state) => state.restoreItemToDesktopLight)
+  const completeInternalPathDragLight = useDustDeskStore((state) => state.completeInternalPathDragLight)
   const startRestoreAllToDesktopTask = useDustDeskStore((state) => state.startRestoreAllToDesktopTask)
   const showPathInFolder = useDustDeskStore((state) => state.showPathInFolder)
   const startClassifyDesktopItemsTask = useDustDeskStore((state) => state.startClassifyDesktopItemsTask)
@@ -183,6 +186,10 @@ export function DesktopWidgetPage() {
   const viewScope = desktopWidgetCategoryViewScope(activeCategory?.label ?? "", activeCategory?.index ?? 0)
   const viewMode = viewModes[viewScope] ?? "grid"
   const itemSettings: WidgetItemSettings = { ...settings, viewMode }
+
+  useEffect(() => {
+    registerDustDeskDropCategory(activeCategory?.index ?? null)
+  }, [activeCategory?.index])
 
   useEffect(() => {
     document.documentElement.classList.add("desktop-widget-root")
@@ -310,7 +317,11 @@ export function DesktopWidgetPage() {
   useEffect(() => {
     const onDragOver = (event: DragEvent) => {
       if (!allowPathLikeDrag(event)) return
-      setHoverZone(dropZoneFromClientPoint(event.clientX, event.clientY))
+      const zone = dropZoneFromClientPoint(event.clientX, event.clientY)
+      if (event.dataTransfer && hasDustDeskPathDrag(event.dataTransfer) && zone !== "launcher") {
+        event.dataTransfer.dropEffect = "move"
+      }
+      setHoverZone(zone)
     }
     const onDrop = (event: DragEvent) => {
       if (!allowPathLikeDrag(event)) return
@@ -321,6 +332,7 @@ export function DesktopWidgetPage() {
       if (paths.length === 0) return
       const target = parseDropTarget(dropZoneFromClientPoint(event.clientX, event.clientY) || activeCategory?.id || "category:0")
       if (!target) return
+      markDustDeskPathDropAccepted(dataTransfer, paths)
       void handleDroppedPaths(target, paths)
     }
 
@@ -349,6 +361,7 @@ export function DesktopWidgetPage() {
       setHoverZone("")
       const target = parseDropTarget(zone || activeCategory?.id || "category:0")
       if (!target) return
+      markDustDeskPathDropAccepted(null, payload.paths)
       void handleDroppedPaths(target, payload.paths)
     }).then((value) => {
       unlisten = value
@@ -410,10 +423,17 @@ export function DesktopWidgetPage() {
         const added = await addLaunchersLight(paths)
         setNotice(countNotice("已加入快捷启动", added, paths.length, "没有新增启动项"))
       } else {
-        setDropOperationLabel(`正在收纳 ${paths.length} 项到「${snapshot.categories[target.index]?.name ?? "分类"}」...`)
+        const targetName = snapshot.categories[target.index]?.name ?? "分类"
+        const movedBetweenCategories = paths.some((path) =>
+          snapshot.categories.some(
+            (category, categoryIndex) =>
+              categoryIndex !== target.index && category.item_paths.some((itemPath) => sameDragPath(itemPath, path)),
+          ),
+        )
+        setDropOperationLabel(`正在${movedBetweenCategories ? "移动" : "收纳"} ${paths.length} 项到「${targetName}」...`)
         const added = await addItemsToCategoryLight(target.index, paths)
         setActiveCategoryId(`category:${target.index}`)
-        setNotice(countNotice(`已收纳到「${snapshot.categories[target.index]?.name ?? "分类"}」`, added, paths.length, "没有新增收纳项目"))
+        setNotice(countNotice(`${movedBetweenCategories ? "已移动" : "已收纳"}到「${targetName}」`, added, paths.length, "没有新增收纳项目"))
       }
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error))
@@ -424,9 +444,19 @@ export function DesktopWidgetPage() {
 
   async function handleRestoreDragOut(index: number, path: string, position: DesktopDropPosition) {
     try {
-      setDropOperationLabel(`正在移回桌面：${displayPathName(path)}`)
-      const restored = await restoreItemToDesktopLight(index, path, position)
-      setNotice(`已移回桌面：${displayPathName(restored)}`)
+      setDropOperationLabel(`正在识别拖拽目标：${displayPathName(path)}`)
+      const outcome = await completeInternalPathDragLight(index, path, position)
+      if (outcome.action === "moved_to_category") {
+        const targetName = snapshot.categories[outcome.target_category_index ?? -1]?.name ?? "目标分类"
+        setActiveCategoryId(`category:${outcome.target_category_index ?? index}`)
+        setNotice(`已移动到「${targetName}」：${displayPathName(path)}`)
+      } else if (outcome.action === "added_to_launcher") {
+        setNotice(`已加入快捷启动：${displayPathName(path)}`)
+      } else if (outcome.action === "restored_to_desktop") {
+        setNotice(`已移回桌面：${displayPathName(outcome.restored_path ?? path)}`)
+      } else {
+        setNotice(`目标 Box 已接收：${displayPathName(path)}`)
+      }
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error))
     } finally {
@@ -778,6 +808,19 @@ export function DesktopWidgetPage() {
     createCategory: handleCreateCategory,
     renameCategory: handleRenameActiveCategory,
     deleteCategory: handleDeleteActiveCategory,
+    categorySortByName: activeCategory ? snapshot.categories[activeCategory.index]?.sort_by_name ?? false : false,
+    onToggleCategorySort: async () => {
+      if (!activeCategory) return
+      const category = snapshot.categories[activeCategory.index]
+      if (!category) return
+      const enabled = !category.sort_by_name
+      try {
+        await setCategorySortByName(activeCategory.index, enabled)
+        setNotice(enabled ? `「${category.name}」已按名称排序` : `「${category.name}」已恢复原收纳顺序`)
+      } catch (error) {
+        setNotice(error instanceof Error ? error.message : String(error))
+      }
+    },
     updateSettings,
     updateViewMode,
     onToggleDesktopWindowLocked: handleToggleDesktopWindowLocked,
@@ -938,6 +981,8 @@ interface SettingsMenuProps {
   createCategory: () => Promise<void>
   renameCategory: () => Promise<void>
   deleteCategory: () => Promise<void>
+  categorySortByName: boolean
+  onToggleCategorySort: () => Promise<void>
   updateSettings: (settings: Partial<WidgetSettings>) => void
   updateViewMode: (viewMode: DesktopWidgetViewMode) => void
   onToggleDesktopWindowLocked: () => Promise<void>
@@ -1053,6 +1098,8 @@ function SettingsMenu({
   createCategory,
   renameCategory,
   deleteCategory,
+  categorySortByName,
+  onToggleCategorySort,
   updateSettings,
   updateViewMode,
   onToggleDesktopWindowLocked,
@@ -1079,6 +1126,7 @@ function SettingsMenu({
           <SettingsMenuSection title="分类管理">
             <MenuButton icon={Plus} label="新增分类" onClick={() => void createCategory()} />
             <MenuButton icon={PencilSimple} label="重命名当前分类" onClick={() => void renameCategory()} />
+            <MenuButton icon={SortAscending} label={categorySortByName ? "关闭名称排序" : "按名称排序"} onClick={() => void onToggleCategorySort()} />
             <MenuButton icon={Trash} label="删除当前分类" onClick={() => void deleteCategory()} />
           </SettingsMenuSection>
           <SettingsMenuSection title="桌面框布局">
@@ -1634,7 +1682,11 @@ function WidgetItem({
       }}
       onDragEnd={(event: ReactDragEvent<HTMLButtonElement>) => {
         if (!dragPath || !onDragEndOutside || !didDragEndOutsideWindow(event)) return
-        void Promise.resolve(onDragEndOutside(desktopDropPositionFromDragEnd(event))).catch(() => undefined)
+        const position = desktopDropPositionFromDragEnd(event)
+        void waitForDustDeskPathDropAcceptance(event.dataTransfer, dragPath).then((accepted) => {
+          if (accepted) return
+          return Promise.resolve(onDragEndOutside(position)).catch(() => undefined)
+        })
       }}
       onDoubleClick={() => void onOpen(path)}
       onContextMenu={(event) => {
@@ -1702,6 +1754,11 @@ function parseDropTarget(value: string): DropTarget | null {
   const index = Number(value.slice("category:".length))
   if (!Number.isFinite(index) || index < 0) return null
   return { type: "category", index }
+}
+
+function sameDragPath(left: string, right: string) {
+  const normalize = (value: string) => value.trim().replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase()
+  return normalize(left) === normalize(right)
 }
 
 function classifyResultNotice(result: { moved: number; skipped: number; category_counts: { name: string; count: number }[] }) {

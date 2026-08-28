@@ -20,6 +20,7 @@ const SHORTCUT_EVENT_GUARD_MS = 180
 const emptyOverlay: SearchOverlayData = {
   settings: {
     clipboard_shortcut: "Ctrl+Tab",
+    clipboard_history_limit: 30,
     search_enabled: true,
     search_shortcut: "Ctrl+Space",
     search_paths: [],

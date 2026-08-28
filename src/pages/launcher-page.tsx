@@ -10,7 +10,7 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { ScrollArea } from "@/components/ui/scroll-area"
-import { hasDustDeskPathDrag, hasPathLikeDrag, readDustDeskPathDrag } from "@/lib/dustdesk-dnd"
+import { hasDustDeskPathDrag, hasPathLikeDrag, markDustDeskPathDropAccepted, readDustDeskPathDrag } from "@/lib/dustdesk-dnd"
 import { safeCurrentWebviewDragDropEvent } from "@/lib/tauri-window"
 import { displayPathName, extensionFromPath } from "@/lib/utils"
 import { useDustDeskStore } from "@/stores/dustdesk-store"
@@ -28,6 +28,7 @@ export function LauncherPage() {
     let unlisten: (() => void) | undefined
     void safeCurrentWebviewDragDropEvent((event) => {
       if (event.payload.type !== "drop") return
+      markDustDeskPathDropAccepted(null, event.payload.paths)
       void addLauncherPaths(event.payload.paths)
     }).then((value) => {
       unlisten = value
@@ -68,7 +69,9 @@ export function LauncherPage() {
     if (!hasPathLikeDrag(event.dataTransfer)) return
     event.preventDefault()
     if (hasDustDeskPathDrag(event.dataTransfer)) {
-      void addLauncherPaths(readDustDeskPathDrag(event.dataTransfer))
+      const paths = readDustDeskPathDrag(event.dataTransfer)
+      markDustDeskPathDropAccepted(event.dataTransfer, paths)
+      void addLauncherPaths(paths)
     }
   }
 

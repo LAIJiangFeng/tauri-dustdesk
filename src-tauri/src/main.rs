@@ -458,7 +458,7 @@ fn load_snapshot_impl() -> Result<AppSnapshot, String> {
         categories: categories_with_item_details(config.desktop_categories, false),
         desktop_items: desktop_items(false),
         launchers: launchers_with_optional_icons(launchers.items, false),
-        clipboard: clipboard_preview(clipboard.items),
+        clipboard: clipboard_preview(clipboard.items, clipboard_history_limit),
     })
 }
 
@@ -10886,8 +10886,11 @@ mod tests {
     }
 }
 
-fn clipboard_preview(mut items: Vec<ClipboardHistoryItem>) -> Vec<ClipboardHistoryItem> {
-    items.truncate(30);
+fn clipboard_preview(
+    mut items: Vec<ClipboardHistoryItem>,
+    limit: usize,
+) -> Vec<ClipboardHistoryItem> {
+    items.truncate(limit);
     for item in &mut items {
         item.text = truncate_chars(&item.text, 500);
         if item.kind == models::ClipboardHistoryKind::Image && item.text.trim().is_empty() {

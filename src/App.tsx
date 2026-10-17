@@ -6,13 +6,15 @@ import { DesktopWidgetPage } from "@/pages/desktop-widget-page"
 import { safeCurrentWindow } from "@/lib/tauri-window"
 import { useDustDeskStore } from "@/stores/dustdesk-store"
 
+const overlayRoutes = new Set(["clipboard-overlay", "search-overlay", "screenshot-overlay", "screenshot-pin"])
+
 function App() {
   const load = useDustDeskStore((state) => state.load)
   const loadDesktopSnapshot = useDustDeskStore((state) => state.loadDesktopSnapshot)
   const routeParts = currentRouteParts()
   const directDesktopRoute = parseDirectDesktopRoute(routeParts)
   const isDesktopRoute = Boolean(directDesktopRoute)
-  const isOverlayRoute = routeParts[0] === "clipboard-overlay" || routeParts[0] === "search-overlay"
+  const isOverlayRoute = overlayRoutes.has(routeParts[0] ?? "")
   const desktopPage = directDesktopRoute?.page
   const desktopKind = directDesktopRoute?.kind
   const desktopIndex = directDesktopRoute?.index

@@ -139,6 +139,8 @@ export interface AppSettings {
   search_shortcut: string
   search_paths: string[]
   launch_on_startup: boolean
+  screenshot_shortcut: string
+  screenshot_hide_window: boolean
 }
 
 export interface AppSnapshot {
@@ -151,4 +153,53 @@ export interface AppSnapshot {
   desktop_items: DesktopItem[]
   launchers: LaunchItem[]
   clipboard: ClipboardHistoryItem[]
+}
+
+export interface ScreenshotMonitor {
+  index: number
+  x: number
+  y: number
+  width: number
+  height: number
+  scale_factor: number
+}
+
+export interface ScreenshotWindowRect {
+  x: number
+  y: number
+  width: number
+  height: number
+  title: string
+}
+
+export interface ScreenshotSession {
+  session_id: string
+  monitor: ScreenshotMonitor
+  image_url: string
+  windows: ScreenshotWindowRect[]
+}
+
+export interface ScreenshotStartEvent {
+  session_id: string
+  monitor_index: number
+}
+
+export interface OcrLine {
+  text: string
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+export interface OcrResult {
+  text: string
+  lines: OcrLine[]
+}
+
+export interface ScreenshotPinInfo {
+  pin_id: string
+  image_url: string
+  width: number
+  height: number
 }

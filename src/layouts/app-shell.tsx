@@ -1,6 +1,6 @@
 import { startTransition, useEffect, useRef } from "react"
 import { NavLink, Outlet, useLocation } from "react-router"
-import { ArrowsClockwise, Crosshair, Minus, MoonStars, Square, SunDim, Warning, X } from "@phosphor-icons/react"
+import { ArrowsClockwise, Camera, Crosshair, Minus, MoonStars, Square, SunDim, Warning, X } from "@phosphor-icons/react"
 import { DesktopFrameOperationMenu } from "@/components/dustdesk/desktop-frame-operation-menu"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -178,6 +178,7 @@ function TopBar({ activePage, theme, onToggleTheme }: { activePage: ReturnType<t
   const error = useDustDeskStore((state) => state.error)
   const refresh = useDustDeskStore((state) => state.refresh)
   const openSpecial = useDustDeskStore((state) => state.openSpecial)
+  const startScreenshot = useDustDeskStore((state) => state.startScreenshot)
   const meta = pageMeta[activePage]
 
   return (
@@ -202,6 +203,10 @@ function TopBar({ activePage, theme, onToggleTheme }: { activePage: ReturnType<t
           {theme === "dark" ? "白色" : "黑色"}
         </Button>
         <DesktopFrameOperationMenu />
+        <Button variant="secondary" size="lg" onClick={() => void startScreenshot().catch(() => undefined)}>
+          <Camera className="size-4" weight="duotone" />
+          截图
+        </Button>
         <Button variant="secondary" size="lg" onClick={() => void openSpecial("desktop")}>
           <Crosshair className="size-4" weight="duotone" />
           桌面

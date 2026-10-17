@@ -4,13 +4,13 @@
 //! All coordinates handled here are physical pixels in virtual-desktop space.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex, MutexGuard, OnceLock,
+        Arc, Condvar, Mutex, MutexGuard, OnceLock,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
@@ -37,6 +37,10 @@ const RECT_HEADER: &str = "x-dustshot-rect";
 const HIDEABLE_WINDOW_LABELS: [&str; 3] = ["main", "clipboard", "search"];
 const HIDE_WINDOW_SETTLE_DELAY: Duration = Duration::from_millis(180);
 const OFFSCREEN_POSITION: f64 = -32_000.0;
+/// Gap between the virtual desktop and the off-screen staging area for overlays.
+const OFFSCREEN_MARGIN: i32 = 4_000;
+/// Overlays are revealed anyway if the frontend has not reported its first frame by then.
+const OVERLAY_READY_TIMEOUT: Duration = Duration::from_millis(1_500);
 const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 
 /// True from the moment a capture starts until its session has fully ended, so repeated
@@ -47,6 +51,14 @@ static RESTORE_WINDOW_LABELS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 static PINS: OnceLock<Mutex<BTreeMap<u64, PinImage>>> = OnceLock::new();
 static NEXT_PIN_ID: AtomicU64 = AtomicU64::new(1);
+static OVERLAY_READY: OnceLock<(Mutex<OverlayReadyState>, Condvar)> = OnceLock::new();
+
+/// Overlays of the current session that still have to report their first painted frame.
+#[derive(Default)]
+struct OverlayReadyState {
+    session_id: Option<String>,
+    pending: BTreeSet<usize>,
+}
 
 struct CaptureSession {
     id: String,
@@ -155,6 +167,53 @@ fn session_slot() -> MutexGuard<'static, Option<CaptureSession>> {
         .get_or_init(|| Mutex::new(None))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn overlay_ready() -> &'static (Mutex<OverlayReadyState>, Condvar) {
+    OVERLAY_READY.get_or_init(|| (Mutex::new(OverlayReadyState::default()), Condvar::new()))
+}
+
+fn overlay_ready_state() -> MutexGuard<'static, OverlayReadyState> {
+    overlay_ready()
+        .0
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn begin_overlay_ready(session_id: &str, indices: impl IntoIterator<Item = usize>) {
+    let mut state = overlay_ready_state();
+    state.session_id = Some(session_id.to_owned());
+    state.pending = indices.into_iter().collect();
+}
+
+fn clear_overlay_ready() {
+    let mut state = overlay_ready_state();
+    state.session_id = None;
+    state.pending.clear();
+    overlay_ready().1.notify_all();
+}
+
+/// Blocks until every overlay of `session_id` reported ready, the session ended, or the timeout
+/// elapsed.
+fn wait_overlays_ready(session_id: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    let mut state = overlay_ready_state();
+    while state.session_id.as_deref() == Some(session_id) && !state.pending.is_empty() {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        state = overlay_ready()
+            .1
+            .wait_timeout(state, remaining)
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .0;
+    }
+}
+
+fn is_current_session(session_id: &str) -> bool {
+    session_slot()
+        .as_ref()
+        .is_some_and(|session| session.id == session_id)
 }
 
 fn restore_labels_slot() -> MutexGuard<'static, Vec<String>> {
@@ -335,29 +394,57 @@ fn start_session_inner(app: &AppHandle) -> Result<(), String> {
             windows: windows_for_monitor(&raw_windows, info),
         })
         .collect::<Vec<_>>();
+    // Registered before the session becomes readable, so an overlay page that picks the session
+    // up on mount can never report ready before it is waited for.
+    begin_overlay_ready(&session_id, infos.iter().map(|info| info.index));
     *session_slot() = Some(CaptureSession {
         id: session_id.clone(),
         monitors: captures,
     });
 
-    with_lazy_window_operation(|| show_overlays(app, &session_id, &infos))
+    let staged = with_lazy_window_operation(|| stage_overlays(app, &session_id, &infos))?;
+    // Waiting happens outside the window lock so cancelling or other windows never block on it.
+    wait_overlays_ready(&session_id, OVERLAY_READY_TIMEOUT);
+    if !is_current_session(&session_id) {
+        return Ok(());
+    }
+    with_lazy_window_operation(|| reveal_overlays(&infos, &staged))
 }
 
-fn show_overlays(app: &AppHandle, session_id: &str, infos: &[MonitorInfo]) -> Result<(), String> {
-    let mut shown = Vec::with_capacity(infos.len());
+/// Off-screen staging rect for an overlay: above the whole virtual desktop and horizontally
+/// aligned with its monitor, so the window keeps that monitor's DPI while the page loads and
+/// paints the capture out of sight.
+fn staging_rect(info: &MonitorInfo, infos: &[MonitorInfo]) -> PhysicalRect {
+    let desktop_top = infos.iter().map(|monitor| monitor.y).min().unwrap_or(0);
+    PhysicalRect {
+        x: info.x,
+        y: desktop_top
+            .saturating_sub(info.height as i32)
+            .saturating_sub(OFFSCREEN_MARGIN),
+        width: info.width,
+        height: info.height,
+    }
+}
+
+/// Shows every overlay off-screen at its final size and tells it which session to load. Overlays
+/// only move onto their monitors in `reveal_overlays`, after their first frame was painted, so the
+/// user never sees an empty or stale overlay.
+fn stage_overlays(
+    app: &AppHandle,
+    session_id: &str,
+    infos: &[MonitorInfo],
+) -> Result<Vec<WebviewWindow>, String> {
+    let mut staged = Vec::with_capacity(infos.len());
     for info in infos {
         let label = overlay_label(info.index);
         let window = match app.get_webview_window(&label) {
             Some(window) => window,
             None => create_overlay_window(app, &label, info.index)?,
         };
-        let rect = PhysicalRect {
-            x: info.x,
-            y: info.y,
-            width: info.width,
-            height: info.height,
-        };
-        place_window_physical(&window, rect)?;
+        // WebView2 does not paint or run animation frames for hidden windows, so the overlay is
+        // made visible while it is still off-screen.
+        place_window_physical(&window, staging_rect(info, infos))?;
+        window.show().map_err(to_message)?;
         let _ = app.emit_to(
             EventTarget::webview_window(label.as_str()),
             START_EVENT,
@@ -366,7 +453,7 @@ fn show_overlays(app: &AppHandle, session_id: &str, infos: &[MonitorInfo]) -> Re
                 monitor_index: info.index,
             },
         );
-        shown.push((window, rect));
+        staged.push(window);
     }
 
     // Overlays left over from a monitor that has since been disconnected stay hidden.
@@ -380,11 +467,20 @@ fn show_overlays(app: &AppHandle, session_id: &str, infos: &[MonitorInfo]) -> Re
             let _ = window.hide();
         }
     }
+    Ok(staged)
+}
 
-    for (window, rect) in &shown {
-        window.show().map_err(to_message)?;
+fn reveal_overlays(infos: &[MonitorInfo], staged: &[WebviewWindow]) -> Result<(), String> {
+    for (window, info) in staged.iter().zip(infos) {
+        let rect = PhysicalRect {
+            x: info.x,
+            y: info.y,
+            width: info.width,
+            height: info.height,
+        };
+        place_window_physical(window, rect)?;
         let _ = window.set_always_on_top(true);
-        ensure_window_physical(window, *rect);
+        ensure_window_physical(window, rect);
     }
 
     let cursor = platform::cursor_position();
@@ -399,7 +495,7 @@ fn show_overlays(app: &AppHandle, session_id: &str, infos: &[MonitorInfo]) -> Re
             })
         })
         .unwrap_or(0);
-    if let Some((window, _)) = shown.get(focus_index) {
+    if let Some(window) = staged.get(focus_index) {
         let _ = window.set_focus();
     }
     Ok(())
@@ -427,8 +523,10 @@ fn create_overlay_window(
         .always_on_top(true)
         .skip_taskbar(true)
         .focused(false)
-        .transparent(false)
-        .background_color(Color(0, 0, 0, 255))
+        // Transparent instead of an opaque placeholder: if an overlay is ever revealed before its
+        // first frame (ready timeout), the live desktop shows through rather than black.
+        .transparent(true)
+        .background_color(Color(0, 0, 0, 0))
         .visible(true)
         .build()
         .map_err(to_message)
@@ -438,6 +536,7 @@ fn create_overlay_window(
 /// Ends the current session: overlays are told to clear and hidden, capture memory is released
 /// and windows hidden for the capture are restored. Safe to call when no session is active.
 fn finish_session(app: &AppHandle) {
+    clear_overlay_ready();
     let _ = with_lazy_window_operation(|| {
         for window in overlay_windows(app) {
             let _ = app.emit_to(EventTarget::webview_window(window.label()), END_EVENT, ());
@@ -518,6 +617,22 @@ pub async fn get_screenshot_session(
             )),
             windows: capture.windows.clone(),
         }))
+}
+
+/// Called by an overlay page once the session's capture is decoded and its first frame painted.
+/// Reports for a session that already ended or was replaced are ignored.
+#[tauri::command]
+pub async fn screenshot_overlay_ready(
+    session_id: String,
+    monitor_index: usize,
+) -> Result<(), String> {
+    let mut state = overlay_ready_state();
+    if state.session_id.as_deref() == Some(session_id.as_str())
+        && state.pending.remove(&monitor_index)
+    {
+        overlay_ready().1.notify_all();
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------------------------

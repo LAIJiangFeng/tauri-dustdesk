@@ -18,6 +18,12 @@ export async function getScreenshotSession(monitorIndex: number) {
   return (await call<ScreenshotSession | null>("get_screenshot_session", { monitorIndex })) ?? null
 }
 
+/** Tells the backend this overlay painted its first frame for the session, so it may be moved on-screen. */
+export async function screenshotOverlayReady(sessionId: string, monitorIndex: number) {
+  if (!hasTauriRuntime()) return
+  await call<void>("screenshot_overlay_ready", { sessionId, monitorIndex })
+}
+
 export function screenshotCopy(png: Uint8Array) {
   return call<void>("screenshot_copy", png)
 }

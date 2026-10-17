@@ -13869,6 +13869,7 @@ fn main() {
             update_launch_on_startup,
             screenshot::start_screenshot,
             screenshot::get_screenshot_session,
+            screenshot::screenshot_overlay_ready,
             screenshot::screenshot_copy,
             screenshot::screenshot_save,
             screenshot::screenshot_pin,

@@ -20,6 +20,8 @@ const emptyOverlay: SearchOverlayData = {
     launch_on_startup: false,
     screenshot_shortcut: "Ctrl+Alt+A",
     screenshot_hide_window: false,
+    auto_check_updates: true,
+    skipped_update_version: "",
   },
   paths: [],
   recent: [],

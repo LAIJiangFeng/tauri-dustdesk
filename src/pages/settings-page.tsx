@@ -8,7 +8,8 @@ import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { ScrollArea } from "@/components/ui/scroll-area"
-import { useDustDeskStore } from "@/stores/dustdesk-store"
+import { safeListen } from "@/lib/tauri-window"
+import { normalizeUpdateNotice, useDustDeskStore } from "@/stores/dustdesk-store"
 import type { AppUpdateInfo } from "@/types"
 
 type RuntimeDirectoryTarget = "data" | "organizer" | "launchers"
@@ -23,6 +24,8 @@ export function SettingsPage() {
   const updateLaunchOnStartup = useDustDeskStore((state) => state.updateLaunchOnStartup)
   const checkForUpdates = useDustDeskStore((state) => state.checkForUpdates)
   const openUpdateDownload = useDustDeskStore((state) => state.openUpdateDownload)
+  const getUpdateNotice = useDustDeskStore((state) => state.getUpdateNotice)
+  const updateUpdateSettings = useDustDeskStore((state) => state.updateUpdateSettings)
   const { draft: shortcutDraft, setDraft: setShortcutDraft, resetDraft: resetShortcutDraft } = useShortcutDraft(snapshot.settings.clipboard_shortcut)
   const [isRecordingShortcut, setIsRecordingShortcut] = useState(false)
   const [isSavingShortcut, setIsSavingShortcut] = useState(false)
@@ -54,6 +57,7 @@ export function SettingsPage() {
   const [updateInfo, setUpdateInfo] = useState<AppUpdateInfo | null>(null)
   const [updateError, setUpdateError] = useState("")
   const [updateSuccess, setUpdateSuccess] = useState("")
+  const [isSavingAutoCheck, setIsSavingAutoCheck] = useState(false)
   const safeSearchPathsDraft = Array.isArray(searchPathsDraft) ? searchPathsDraft : []
   const effectiveSearchPaths = safeSearchPathsDraft.length > 0 ? safeSearchPathsDraft : [snapshot.organizer_root].filter(Boolean)
   const rows = [
@@ -91,6 +95,31 @@ export function SettingsPage() {
     setSearchEnabledDraft(snapshot.settings.search_enabled)
     setSearchPathsDraft(snapshot.settings.search_paths)
   }, [snapshot.settings.search_enabled, snapshot.settings.search_paths])
+
+  useEffect(() => {
+    let disposed = false
+    let unlisten: (() => void) | undefined
+    const applyBackgroundUpdate = (notice: AppUpdateInfo | null) => {
+      if (disposed || !notice) return
+      setUpdateInfo(notice)
+      setUpdateSuccess(`发现新版本 ${notice.latest_version}`)
+    }
+
+    void getUpdateNotice()
+      .then(applyBackgroundUpdate)
+      .catch(() => undefined)
+    void safeListen<unknown>("dustdesk://update-notice-changed", (event) => {
+      applyBackgroundUpdate(normalizeUpdateNotice(event.payload))
+    }).then((dispose) => {
+      if (disposed) dispose?.()
+      else unlisten = dispose
+    })
+
+    return () => {
+      disposed = true
+      unlisten?.()
+    }
+  }, [getUpdateNotice])
 
   const saveShortcut = async (shortcut: string) => {
     const nextShortcut = shortcut.trim()
@@ -245,6 +274,20 @@ export function SettingsPage() {
       setUpdateError(reason instanceof Error ? reason.message : String(reason))
     } finally {
       setIsCheckingUpdate(false)
+    }
+  }
+
+  const toggleAutoCheckUpdates = async () => {
+    setIsSavingAutoCheck(true)
+    setUpdateError("")
+    setUpdateSuccess("")
+    try {
+      const settings = await updateUpdateSettings({ autoCheckUpdates: !snapshot.settings.auto_check_updates })
+      setUpdateSuccess(settings.auto_check_updates ? "已开启自动检查更新" : "已关闭自动检查更新")
+    } catch (reason) {
+      setUpdateError(reason instanceof Error ? reason.message : String(reason))
+    } finally {
+      setIsSavingAutoCheck(false)
     }
   }
 
@@ -591,7 +634,9 @@ export function SettingsPage() {
                 <div className="grid gap-2">
                   <div className="flex flex-wrap items-center justify-between gap-3">
                     <h3 className="font-heading text-base font-medium">检查更新</h3>
-                    <Badge variant={updateInfo?.update_available ? "default" : "outline"}>{updateInfo?.update_available ? "有新版本" : "手动检查"}</Badge>
+                    <Badge variant={updateInfo?.update_available ? "default" : "outline"}>
+                      {updateInfo?.update_available ? "有新版本" : snapshot.settings.auto_check_updates ? "自动检查" : "手动检查"}
+                    </Badge>
                   </div>
                   <p className="text-sm leading-6 text-muted-foreground">
                     {updateInfo ? `最新版本：${updateInfo.latest_version || "未知"}${updateInfo.asset_name ? `，安装包：${updateInfo.asset_name}` : ""}` : "点击检查后会联网读取最新发布版本。"}
@@ -608,9 +653,18 @@ export function SettingsPage() {
                   {updateInfo?.update_available ? (
                     <Button type="button" variant="secondary" onClick={() => void downloadUpdate()}>
                       <DownloadSimple className="size-4" weight="bold" />
-                      下载更新
+                      立即更新
                     </Button>
                   ) : null}
+                  <Button
+                    type="button"
+                    variant="outline"
+                    aria-pressed={snapshot.settings.auto_check_updates}
+                    disabled={isSavingAutoCheck}
+                    onClick={() => void toggleAutoCheckUpdates()}
+                  >
+                    {isSavingAutoCheck ? "保存中" : snapshot.settings.auto_check_updates ? "自动检查更新：已开启" : "自动检查更新：已关闭"}
+                  </Button>
                 </div>
               </CardContent>
             </Card>

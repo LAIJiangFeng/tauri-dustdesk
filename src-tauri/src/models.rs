@@ -156,6 +156,20 @@ pub struct AppSettings {
         default
     )]
     pub screenshot_hide_window: bool,
+
+    #[serde(
+        rename = "AutoCheckUpdates",
+        alias = "auto_check_updates",
+        default = "default_auto_check_updates"
+    )]
+    pub auto_check_updates: bool,
+
+    #[serde(
+        rename = "SkippedUpdateVersion",
+        alias = "skipped_update_version",
+        default
+    )]
+    pub skipped_update_version: String,
 }
 
 impl Default for AppSettings {
@@ -169,6 +183,8 @@ impl Default for AppSettings {
             launch_on_startup: false,
             screenshot_shortcut: default_screenshot_shortcut(),
             screenshot_hide_window: false,
+            auto_check_updates: default_auto_check_updates(),
+            skipped_update_version: String::new(),
         }
     }
 }
@@ -446,6 +462,10 @@ fn default_clipboard_history_limit() -> usize {
 }
 
 fn default_search_enabled() -> bool {
+    true
+}
+
+fn default_auto_check_updates() -> bool {
     true
 }
 

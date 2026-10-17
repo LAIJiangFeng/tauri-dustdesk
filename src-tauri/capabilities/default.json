@@ -12,7 +12,8 @@
     "desktop-launcher",
     "desktop-launcher-monitor-*",
     "screenshot-overlay-*",
-    "screenshot-pin-*"
+    "screenshot-pin-*",
+    "update-notice"
   ],
   "permissions": [
     "core:default",

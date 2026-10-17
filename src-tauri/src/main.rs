@@ -5,6 +5,7 @@ mod models;
 mod screenshot;
 mod store;
 mod system_icon;
+mod update_notice;
 #[cfg(windows)]
 mod windows_show_desktop;
 
@@ -1701,10 +1702,14 @@ fn open_special(target: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn check_for_updates() -> Result<AppUpdateInfo, String> {
-    tauri::async_runtime::spawn_blocking(check_for_updates_impl)
-        .await
-        .map_err(to_message)?
+async fn check_for_updates(app: tauri::AppHandle) -> Result<AppUpdateInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let info = check_for_updates_impl()?;
+        update_notice::record_update(&app, &info);
+        Ok(info)
+    })
+    .await
+    .map_err(to_message)?
 }
 
 #[tauri::command]
@@ -1741,7 +1746,7 @@ fn check_for_updates_impl() -> Result<AppUpdateInfo, String> {
         .map_err(|error| format!("读取更新信息失败：{error}"))?;
     let latest_version = release_version_from_tag(&release.tag_name)
         .ok_or_else(|| format!("无法识别最新版本号：{}", release.tag_name))?;
-    let current_version = env!("CARGO_PKG_VERSION").to_owned();
+    let current_version = update_notice::current_version();
     let update_available = compare_semver_like(&latest_version, &current_version).is_gt();
     let asset = release
         .assets
@@ -13483,6 +13488,7 @@ fn setup_system_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
             &quit_item,
         ],
     )?;
+    update_notice::register_tray_menu(menu.clone());
 
     let _ = TRAY_MENU_ITEMS.set(TrayMenuItems {
         desktop_visible: desktop_visible_item,
@@ -13497,6 +13503,8 @@ fn setup_system_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
         .on_menu_event(|app, event| {
             if event.id() == TRAY_MENU_SHOW_MAIN {
                 show_main_window_from_tray_async(app.clone());
+            } else if event.id() == update_notice::TRAY_MENU_UPDATE {
+                update_notice::open_update_from_tray_async(app.clone());
             } else if event.id() == TRAY_MENU_SCREENSHOT {
                 screenshot::start_screenshot_async(app.clone(), TRAY_SCREENSHOT_DELAY);
             } else if event.id() == TRAY_MENU_DESKTOP_VISIBLE {
@@ -13648,6 +13656,7 @@ fn main() {
             windows_show_desktop::start(app_handle.clone());
             start_desktop_monitor_watch(app_handle.clone());
             screenshot::prewarm_overlays_async(app_handle.clone());
+            update_notice::start_auto_check(app_handle.clone());
             let show_main_on_start = !is_startup_launch_invocation();
             let handle = app.handle().clone();
             tauri::async_runtime::spawn_blocking(move || {
@@ -13834,6 +13843,9 @@ fn main() {
             update_runtime_directory,
             check_for_updates,
             open_update_download,
+            update_notice::get_update_notice,
+            update_notice::dismiss_update_notice,
+            update_notice::update_update_settings,
             open_path,
             open_path_as_administrator,
             start_all_launchers,

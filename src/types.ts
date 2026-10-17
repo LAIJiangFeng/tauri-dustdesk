@@ -141,6 +141,8 @@ export interface AppSettings {
   launch_on_startup: boolean
   screenshot_shortcut: string
   screenshot_hide_window: boolean
+  auto_check_updates: boolean
+  skipped_update_version: string
 }
 
 export interface AppSnapshot {

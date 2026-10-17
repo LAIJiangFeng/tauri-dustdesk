@@ -37,6 +37,7 @@ import {
   screenshotCancel,
   screenshotCopy,
   screenshotOcr,
+  screenshotOverlayReady,
   screenshotPin,
   screenshotSave,
 } from "@/lib/screenshot/api"
@@ -64,6 +65,7 @@ const HANDLE_HIT_CSS = 7
 const MIN_POINT_DISTANCE = 1.5
 const DIM_COLOR = "rgba(0, 0, 0, 0.45)"
 const ACCENT = "#1aad19"
+const FIRST_PAINT_TIMEOUT_MS = 300
 
 type Interaction =
   | { kind: "none" }
@@ -96,6 +98,11 @@ function waitForNextPaint() {
   return new Promise<void>((resolve) => {
     requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
   })
+}
+
+/** Two animation frames, capped in case the off-screen WebView throttles animation frames. */
+function waitForFirstPaint() {
+  return Promise.race([waitForNextPaint(), new Promise<void>((resolve) => window.setTimeout(resolve, FIRST_PAINT_TIMEOUT_MS))])
 }
 
 function isEditableTarget(target: EventTarget | null) {
@@ -256,7 +263,15 @@ export function ScreenshotOverlayPage() {
     if (!frameRef.current) frameRef.current = requestAnimationFrame(renderFrame)
   }
 
-  useEffect(() => () => cancelAnimationFrame(frameRef.current), [])
+  useEffect(
+    () => () => {
+      // Reset the id too: StrictMode remounts reuse these refs, and a stale non-zero id would make
+      // scheduleRender believe a frame is still pending forever, so nothing would ever render again.
+      cancelAnimationFrame(frameRef.current)
+      frameRef.current = 0
+    },
+    [],
+  )
 
   // ---------- annotations & history ----------
 
@@ -357,6 +372,19 @@ export function ScreenshotOverlayPage() {
     resetEditor()
   }, [resetEditor])
 
+  const reportReady = useCallback(
+    async (sessionId: string) => {
+      await waitForFirstPaint()
+      if (sessionIdRef.current !== sessionId) return
+      try {
+        await screenshotOverlayReady(sessionId, monitorIndex)
+      } catch {
+        // The backend reveals the overlay on its own after a timeout.
+      }
+    },
+    [monitorIndex],
+  )
+
   const loadSession = useCallback(
     async (expectedSessionId?: string) => {
       if (expectedSessionId && expectedSessionId === sessionIdRef.current) return
@@ -378,7 +406,11 @@ export function ScreenshotOverlayPage() {
       try {
         bitmap = await loadScreenshotBitmap(next.image_url)
       } catch (reason) {
-        if (loadToken === loadTokenRef.current) showNotice(`截图加载失败：${errorText(reason)}`, true)
+        if (loadToken === loadTokenRef.current) {
+          showNotice(`截图加载失败：${errorText(reason)}`, true)
+          // Still reveal the overlay so the error is visible and Esc can dismiss it.
+          void reportReady(next.session_id)
+        }
         return
       }
       if (loadToken !== loadTokenRef.current) {
@@ -405,7 +437,7 @@ export function ScreenshotOverlayPage() {
       setMagnifierSource({ image: bitmap, pixels, width: bitmap.width, height: bitmap.height, scale: next.monitor.scale_factor || 1 })
       scheduleRender(true)
     },
-    [clearSession, monitorIndex, showNotice],
+    [clearSession, monitorIndex, reportReady, showNotice],
   )
 
   useLayoutEffect(() => {
@@ -418,7 +450,12 @@ export function ScreenshotOverlayPage() {
     base.getContext("2d")?.drawImage(bitmap, 0, 0)
     overlay.width = bitmap.width
     overlay.height = bitmap.height
-    scheduleRender(true)
+    // Render the dim layer synchronously: the overlay is still off-screen and is only moved onto the
+    // monitor after this frame has been painted.
+    cancelAnimationFrame(frameRef.current)
+    annotationsDirtyRef.current = true
+    renderFrame()
+    void reportReady(session.session_id)
   }, [session])
 
   useEffect(() => {

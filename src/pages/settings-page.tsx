@@ -707,7 +707,6 @@ function ScreenshotSettingsSection() {
       resetDraft()
       setSuccess(successMessage)
     } catch (reason) {
-      resetDraft()
       setError(reason instanceof Error ? reason.message : String(reason))
     } finally {
       setIsSaving(false)

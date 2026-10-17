@@ -142,6 +142,20 @@ pub struct AppSettings {
 
     #[serde(rename = "LaunchOnStartup", alias = "launch_on_startup", default)]
     pub launch_on_startup: bool,
+
+    #[serde(
+        rename = "ScreenshotShortcut",
+        alias = "screenshot_shortcut",
+        default = "default_screenshot_shortcut"
+    )]
+    pub screenshot_shortcut: String,
+
+    #[serde(
+        rename = "ScreenshotHideWindow",
+        alias = "screenshot_hide_window",
+        default
+    )]
+    pub screenshot_hide_window: bool,
 }
 
 impl Default for AppSettings {
@@ -153,6 +167,8 @@ impl Default for AppSettings {
             search_shortcut: default_search_shortcut(),
             search_paths: Vec::new(),
             launch_on_startup: false,
+            screenshot_shortcut: default_screenshot_shortcut(),
+            screenshot_hide_window: false,
         }
     }
 }
@@ -176,6 +192,14 @@ impl AppSettings {
             default_search_shortcut()
         } else {
             self.search_shortcut.trim().to_owned()
+        }
+    }
+
+    pub fn screenshot_shortcut_value(&self) -> String {
+        if self.screenshot_shortcut.trim().is_empty() {
+            default_screenshot_shortcut()
+        } else {
+            self.screenshot_shortcut.trim().to_owned()
         }
     }
 }
@@ -427,6 +451,10 @@ fn default_search_enabled() -> bool {
 
 fn default_search_shortcut() -> String {
     "Ctrl+Space".to_owned()
+}
+
+fn default_screenshot_shortcut() -> String {
+    "Ctrl+Alt+A".to_owned()
 }
 
 fn display_name(path: &Path) -> String {

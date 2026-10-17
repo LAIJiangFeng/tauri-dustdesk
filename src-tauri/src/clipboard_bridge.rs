@@ -125,6 +125,27 @@ pub fn paste_history_item(id: &str, before_send: impl FnOnce()) -> Result<(), St
     }
 }
 
+/// Writes a PNG produced inside DustDesk (screenshots, pinned images) to the system clipboard
+/// and records it as exactly one image history item. The monitor is suppressed so the
+/// self-write is not picked up again as a second history entry.
+pub fn copy_png_to_clipboard_with_history(png_bytes: &[u8]) -> Result<(), String> {
+    if png_bytes.is_empty() {
+        return Err("图片数据为空".to_owned());
+    }
+    let image_png_base64 = BASE64.encode(png_bytes);
+    if image_png_base64.len() > MAX_IMAGE_BASE64_CHARS {
+        return Err("图片过大，无法写入剪贴板".to_owned());
+    }
+
+    suppress_clipboard_monitor_for(Duration::from_secs(4));
+    set_png_image_clipboard(png_bytes)?;
+    suppress_clipboard_monitor_for(Duration::from_secs(3));
+    if let Err(error) = store_image_history(image_png_base64) {
+        eprintln!("failed to record screenshot clipboard history: {error}");
+    }
+    Ok(())
+}
+
 pub fn image_base64(id: &str) -> Result<String, String> {
     let store = AppStore::open().map_err(to_message)?;
     let clipboard = store.load_clipboard();
@@ -588,6 +609,16 @@ fn paste_image_to_last_target(
     Err("当前平台暂不支持图片快速粘贴".to_owned())
 }
 
+#[cfg(not(windows))]
+fn set_png_image_clipboard(_png_bytes: &[u8]) -> Result<(), String> {
+    Err("当前平台暂不支持写入图片剪贴板".to_owned())
+}
+
+#[cfg(windows)]
+fn set_png_image_clipboard(png_bytes: &[u8]) -> Result<(), String> {
+    windows_clipboard::set_png_image(png_bytes)
+}
+
 #[cfg(windows)]
 fn system_clipboard_text() -> Option<String> {
     windows_clipboard::get_text()
@@ -721,6 +752,46 @@ mod windows_clipboard {
         }
         thread::sleep(ready_delay);
         send_ctrl_v()?;
+        Ok(())
+    }
+
+    /// Sets CF_DIB plus the registered "PNG" format so both legacy and PNG-aware apps paste it.
+    pub fn set_png_image(png_bytes: &[u8]) -> Result<(), String> {
+        let dib = png_base64_to_dib(&BASE64.encode(png_bytes))?;
+        let mut dib_handle = Some(global_alloc_bytes(&dib, "无法分配图片剪贴板内存")?);
+        let mut png_handle = Some(global_alloc_bytes(png_bytes, "无法分配 PNG 剪贴板内存")?);
+        let png_format_name: Vec<u16> = "PNG".encode_utf16().chain(std::iter::once(0)).collect();
+
+        unsafe {
+            if OpenClipboard(null_mut()) == 0 {
+                free_global_handle(&mut dib_handle);
+                free_global_handle(&mut png_handle);
+                return Err("无法打开系统剪贴板".to_owned());
+            }
+
+            EmptyClipboard();
+            let Some(dib) = dib_handle.take() else {
+                CloseClipboard();
+                free_global_handle(&mut png_handle);
+                return Err("图片剪贴板数据为空".to_owned());
+            };
+            if SetClipboardData(CF_DIB, dib).is_null() {
+                CloseClipboard();
+                GlobalFree(dib);
+                free_global_handle(&mut png_handle);
+                return Err("无法设置图片剪贴板".to_owned());
+            }
+
+            if let Some(handle) = png_handle.take() {
+                let format = RegisterClipboardFormatW(png_format_name.as_ptr());
+                if format == 0 || SetClipboardData(format, handle).is_null() {
+                    GlobalFree(handle);
+                }
+            }
+
+            CloseClipboard();
+        }
+
         Ok(())
     }
 

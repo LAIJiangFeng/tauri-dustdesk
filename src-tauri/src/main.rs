@@ -2,6 +2,7 @@
 
 mod clipboard_bridge;
 mod models;
+mod screenshot;
 mod store;
 mod system_icon;
 #[cfg(windows)]
@@ -63,7 +64,10 @@ const TRAY_MENU_SHOW_MAIN: &str = "show-main-window";
 const TRAY_MENU_DESKTOP_VISIBLE: &str = "desktop-frames-visible";
 const TRAY_MENU_DESKTOP_LOCKED: &str = "desktop-frames-locked";
 const TRAY_MENU_DESKTOP_CLICK_THROUGH: &str = "desktop-frames-click-through";
+const TRAY_MENU_SCREENSHOT: &str = "start-screenshot";
 const TRAY_MENU_QUIT: &str = "quit-app";
+// Lets the tray menu finish closing before the screen is captured.
+const TRAY_SCREENSHOT_DELAY: Duration = Duration::from_millis(220);
 const DESKTOP_OPERATION_EVENT: &str = "dustdesk://desktop-operation";
 const CATEGORY_ORDER_CHANGED_EVENT: &str = "dustdesk://category-order-changed";
 const DESKTOP_WINDOW_STATE_CHANGED_EVENT: &str = "dustdesk://desktop-window-state-changed";
@@ -2692,6 +2696,9 @@ fn update_clipboard_shortcut(
         if config.settings.search_enabled && shortcut == config.settings.search_shortcut_value() {
             return Err("剪贴板快捷键不能和搜索快捷键相同".to_owned());
         }
+        if shortcut == config.settings.screenshot_shortcut_value() {
+            return Err("剪贴板快捷键不能和截图快捷键相同".to_owned());
+        }
 
         let previous = config.settings.clipboard_shortcut_value();
 
@@ -2757,6 +2764,9 @@ fn update_search_settings(
         if enabled && shortcut == config.settings.clipboard_shortcut_value() {
             return Err("搜索快捷键不能和剪贴板快捷键相同".to_owned());
         }
+        if enabled && shortcut == config.settings.screenshot_shortcut_value() {
+            return Err("搜索快捷键不能和截图快捷键相同".to_owned());
+        }
 
         let previous_enabled = config.settings.search_enabled;
         let previous_shortcut = config.settings.search_shortcut_value();
@@ -2774,6 +2784,47 @@ fn update_search_settings(
             let rollback_next = enabled.then_some(config.settings.search_shortcut.as_str());
             let rollback_previous = previous_enabled.then_some(previous_shortcut.as_str());
             let _ = replace_global_shortcut(&app, rollback_next, rollback_previous);
+            return Err(to_message(error));
+        }
+
+        Ok(config.settings)
+    })
+}
+
+#[tauri::command]
+fn update_screenshot_settings(
+    app: tauri::AppHandle,
+    shortcut: String,
+    hide_window: bool,
+) -> Result<AppSettings, String> {
+    with_config_mutation(|| {
+        let shortcut = if shortcut.trim().is_empty() {
+            AppSettings::default().screenshot_shortcut
+        } else {
+            normalize_shortcut_input(&shortcut)?
+        };
+        let store = AppStore::open().map_err(to_message)?;
+        let mut config = store.load_config_strict().map_err(to_message)?;
+        if shortcut == config.settings.clipboard_shortcut_value() {
+            return Err("截图快捷键不能和剪贴板快捷键相同".to_owned());
+        }
+        if config.settings.search_enabled && shortcut == config.settings.search_shortcut_value() {
+            return Err("截图快捷键不能和搜索快捷键相同".to_owned());
+        }
+
+        let previous = config.settings.screenshot_shortcut_value();
+        replace_global_shortcut(&app, Some(&previous), Some(&shortcut)).map_err(|error| {
+            format!("{error}。该快捷键可能已被微信/QQ 等软件占用，请换一个组合")
+        })?;
+
+        config.settings.screenshot_shortcut = shortcut;
+        config.settings.screenshot_hide_window = hide_window;
+        if let Err(error) = store.save_config(&config) {
+            let _ = replace_global_shortcut(
+                &app,
+                Some(&config.settings.screenshot_shortcut),
+                Some(&previous),
+            );
             return Err(to_message(error));
         }
 
@@ -11558,13 +11609,26 @@ fn initialize_runtime_services(app: &tauri::AppHandle) {
         eprintln!("failed to register {clipboard_shortcut} shortcut: {error}");
     }
 
-    if settings.search_enabled {
-        let search_shortcut = settings.search_shortcut_value();
+    let search_shortcut = settings
+        .search_enabled
+        .then(|| settings.search_shortcut_value());
+    if let Some(search_shortcut) = search_shortcut.as_deref() {
         if search_shortcut != clipboard_shortcut {
-            if let Err(error) = app.global_shortcut().register(search_shortcut.as_str()) {
+            if let Err(error) = app.global_shortcut().register(search_shortcut) {
                 eprintln!("failed to register {search_shortcut} shortcut: {error}");
             }
         }
+    }
+
+    let screenshot_shortcut = settings.screenshot_shortcut_value();
+    if screenshot_shortcut == clipboard_shortcut
+        || search_shortcut.as_deref() == Some(screenshot_shortcut.as_str())
+    {
+        eprintln!(
+            "skipped {screenshot_shortcut} screenshot shortcut: conflicts with another shortcut"
+        );
+    } else if let Err(error) = app.global_shortcut().register(screenshot_shortcut.as_str()) {
+        eprintln!("failed to register {screenshot_shortcut} shortcut: {error}");
     }
 
     let launch_on_startup = settings.launch_on_startup;
@@ -13404,11 +13468,13 @@ fn setup_system_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     )?;
     let separator = PredefinedMenuItem::separator(app)?;
     let exit_separator = PredefinedMenuItem::separator(app)?;
+    let screenshot_item = MenuItem::with_id(app, TRAY_MENU_SCREENSHOT, "截图", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, TRAY_MENU_QUIT, "退出", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
         &[
             &show_item,
+            &screenshot_item,
             &separator,
             &desktop_visible_item,
             &desktop_locked_item,
@@ -13431,6 +13497,8 @@ fn setup_system_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
         .on_menu_event(|app, event| {
             if event.id() == TRAY_MENU_SHOW_MAIN {
                 show_main_window_from_tray_async(app.clone());
+            } else if event.id() == TRAY_MENU_SCREENSHOT {
+                screenshot::start_screenshot_async(app.clone(), TRAY_SCREENSHOT_DELAY);
             } else if event.id() == TRAY_MENU_DESKTOP_VISIBLE {
                 let app = app.clone();
                 tauri::async_runtime::spawn_blocking(move || {
@@ -13514,6 +13582,11 @@ fn main() {
                 .with_handler(|app, shortcut, event| {
                     if event.state() == ShortcutState::Pressed {
                         let settings = configured_settings();
+                        if shortcut_matches(shortcut, &settings.screenshot_shortcut_value()) {
+                            screenshot::start_screenshot_async(app.clone(), Duration::ZERO);
+                            return;
+                        }
+
                         if shortcut_matches(shortcut, &settings.search_shortcut_value()) {
                             if settings.search_enabled {
                                 show_search_overlay_async(app.clone());
@@ -13534,7 +13607,12 @@ fn main() {
                 })
                 .build(),
         )
+        .register_asynchronous_uri_scheme_protocol(
+            screenshot::URI_SCHEME,
+            |_ctx, request, responder| screenshot::handle_protocol_request(request, responder),
+        )
         .on_window_event(|window, event| {
+            screenshot::handle_window_event(window, event);
             if window.label() == "main" {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                     if !REAL_EXIT_REQUESTED.load(Ordering::SeqCst) {
@@ -13787,7 +13865,19 @@ fn main() {
             update_clipboard_shortcut,
             update_clipboard_history_limit,
             update_search_settings,
-            update_launch_on_startup
+            update_screenshot_settings,
+            update_launch_on_startup,
+            screenshot::start_screenshot,
+            screenshot::get_screenshot_session,
+            screenshot::screenshot_copy,
+            screenshot::screenshot_save,
+            screenshot::screenshot_pin,
+            screenshot::screenshot_ocr,
+            screenshot::screenshot_cancel,
+            screenshot::get_screenshot_pin,
+            screenshot::screenshot_pin_copy,
+            screenshot::screenshot_pin_save,
+            screenshot::screenshot_pin_close
         ])
         .build(tauri::generate_context!())
         .expect("failed to build DustDesk Tauri app");

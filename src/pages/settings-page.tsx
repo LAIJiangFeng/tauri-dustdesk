@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react"
 import type { KeyboardEvent as ReactKeyboardEvent } from "react"
-import { ArrowsClockwise, Copy, Desktop, DownloadSimple, FolderOpen, GearSix, HardDrives, Keyboard, MagnifyingGlass, PlayCircle, Plus, X } from "@phosphor-icons/react"
+import { ArrowsClockwise, Camera, Copy, Desktop, DownloadSimple, FolderOpen, GearSix, HardDrives, Keyboard, MagnifyingGlass, PlayCircle, Plus, X } from "@phosphor-icons/react"
 import { open } from "@tauri-apps/plugin-dialog"
 import { DesktopFrameControlPanel } from "@/components/dustdesk/desktop-frame-control-panel"
 import { Badge } from "@/components/ui/badge"
@@ -355,7 +355,7 @@ export function SettingsPage() {
         <div>
           <CardTitle>设置中心</CardTitle>
         </div>
-        <Badge variant="outline">{rows.length + 6} 项</Badge>
+        <Badge variant="outline">{rows.length + 7} 项</Badge>
       </CardHeader>
       <CardContent className="min-h-0">
         <ScrollArea className="h-full pr-2">
@@ -419,6 +419,8 @@ export function SettingsPage() {
               </CardContent>
             </Card>
           </div>
+
+          <ScreenshotSettingsSection />
 
           <div className="mb-3 grid gap-3 xl:grid-cols-[minmax(0,1.15fr)_minmax(0,1.85fr)]">
             <Card>
@@ -753,4 +755,170 @@ function normalizePathList(paths: string[]) {
     output.push(trimmed)
   }
   return output
+}
+
+function ScreenshotSettingsSection() {
+  const settings = useDustDeskStore((state) => state.snapshot.settings)
+  const updateScreenshotSettings = useDustDeskStore((state) => state.updateScreenshotSettings)
+  const startScreenshot = useDustDeskStore((state) => state.startScreenshot)
+  const inputRef = useRef<HTMLInputElement | null>(null)
+  const [shortcutDraft, setShortcutDraft] = useState(settings.screenshot_shortcut)
+  const [isRecording, setIsRecording] = useState(false)
+  const [isSaving, setIsSaving] = useState(false)
+  const [error, setError] = useState("")
+  const [success, setSuccess] = useState("")
+
+  useEffect(() => {
+    if (!isRecording) {
+      setShortcutDraft(settings.screenshot_shortcut)
+    }
+  }, [isRecording, settings.screenshot_shortcut])
+
+  useEffect(() => {
+    if (isRecording) {
+      inputRef.current?.focus()
+      inputRef.current?.select()
+    }
+  }, [isRecording])
+
+  const save = async (shortcut: string, hideWindow: boolean, successMessage: string) => {
+    const nextShortcut = shortcut.trim()
+    if (!nextShortcut) {
+      setError("快捷键不能为空")
+      return
+    }
+
+    setIsSaving(true)
+    setError("")
+    setSuccess("")
+    try {
+      const nextSettings = await updateScreenshotSettings(nextShortcut, hideWindow)
+      setShortcutDraft(nextSettings.screenshot_shortcut)
+      setSuccess(successMessage)
+    } catch (reason) {
+      setShortcutDraft(settings.screenshot_shortcut)
+      setError(reason instanceof Error ? reason.message : String(reason))
+    } finally {
+      setIsSaving(false)
+    }
+  }
+
+  const handleKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (!isRecording) return
+
+    event.preventDefault()
+    event.stopPropagation()
+
+    const nextShortcut = shortcutFromEvent(event.nativeEvent)
+    if (!nextShortcut) return
+
+    setShortcutDraft(nextShortcut)
+    if (!shortcutKeyFromEvent(event.nativeEvent)) {
+      setError("继续按一个主键，例如 A / S / PrintScreen")
+      return
+    }
+
+    if (!nextShortcut.includes("+")) {
+      setError("请按住 Ctrl / Alt / Shift / Win 中至少一个修饰键")
+      return
+    }
+
+    setIsRecording(false)
+    void save(nextShortcut, settings.screenshot_hide_window, "截图快捷键已保存")
+  }
+
+  const startNow = async () => {
+    setError("")
+    try {
+      await startScreenshot()
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason))
+    }
+  }
+
+  return (
+    <div className="mb-3 grid gap-3 xl:grid-cols-[minmax(0,1.15fr)_minmax(0,1.85fr)]">
+      <Card>
+        <CardContent className="flex min-h-56 flex-col gap-4 p-5">
+          <div className="flex size-11 items-center justify-center rounded-lg bg-muted text-muted-foreground">
+            <Camera className="size-5" weight="duotone" />
+          </div>
+          <div>
+            <h3 className="font-heading text-base font-medium">截图</h3>
+            <p className="mt-2 text-sm leading-6 text-muted-foreground">按快捷键框选区域，可标注、复制、保存、钉在屏幕或识别文字。</p>
+          </div>
+          <div className="mt-auto flex flex-wrap gap-2">
+            <Badge className="w-fit" variant="outline">
+              当前：{settings.screenshot_shortcut}
+            </Badge>
+            <Button type="button" size="sm" variant="secondary" onClick={() => void startNow()}>
+              立即截图
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardContent className="flex min-h-56 flex-col gap-4 p-5">
+          <div className="grid gap-2">
+            <div className="flex items-center justify-between gap-3">
+              <h3 className="font-heading text-base font-medium">截图快捷键</h3>
+              {isRecording ? <Badge>录制中</Badge> : <Badge variant="outline">全局快捷键</Badge>}
+            </div>
+            <Input
+              ref={inputRef}
+              value={shortcutDraft}
+              placeholder="例如 Ctrl+Alt+A"
+              className="h-11 font-mono"
+              onChange={(event) => setShortcutDraft(event.target.value)}
+              onKeyDown={handleKeyDown}
+            />
+            <p className="text-xs leading-5 text-muted-foreground">默认 Ctrl+Alt+A。如与微信、QQ 截图冲突，可改成 Ctrl+Shift+A 等。</p>
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                className="size-4 accent-primary"
+                checked={settings.screenshot_hide_window}
+                disabled={isSaving}
+                onChange={(event) =>
+                  void save(
+                    settings.screenshot_shortcut,
+                    event.target.checked,
+                    event.target.checked ? "截图时将隐藏当前窗口" : "截图时不再隐藏当前窗口",
+                  )
+                }
+              />
+              截图时隐藏当前窗口
+            </label>
+            {success ? <p className="text-xs leading-5 text-emerald-600 dark:text-emerald-400">{success}</p> : null}
+            {error ? <p className="text-xs leading-5 text-destructive">{error}</p> : null}
+          </div>
+          <div className="mt-auto flex flex-wrap gap-2">
+            <Button type="button" variant={isRecording ? "default" : "secondary"} onClick={() => setIsRecording(true)}>
+              {isRecording ? "请按组合键" : "录制快捷键"}
+            </Button>
+            <Button
+              type="button"
+              disabled={isSaving}
+              onClick={() => void save(shortcutDraft, settings.screenshot_hide_window, "截图快捷键已保存")}
+            >
+              {isSaving ? "保存中" : "保存"}
+            </Button>
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={() => {
+                setShortcutDraft(settings.screenshot_shortcut)
+                setError("")
+                setSuccess("")
+                setIsRecording(false)
+              }}
+            >
+              取消
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  )
 }

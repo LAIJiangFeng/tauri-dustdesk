@@ -7,6 +7,8 @@ import { DesktopWidgetPage } from "@/pages/desktop-widget-page"
 import { HomePage } from "@/pages/home-page"
 import { LauncherPage } from "@/pages/launcher-page"
 import { OrganizerPage } from "@/pages/organizer-page"
+import { ScreenshotOverlayPage } from "@/pages/screenshot-overlay-page"
+import { ScreenshotPinPage } from "@/pages/screenshot-pin-page"
 import { SearchOverlayPage } from "@/pages/search-overlay-page"
 import { SearchPage } from "@/pages/search-page"
 import { SettingsPage } from "@/pages/settings-page"
@@ -16,6 +18,8 @@ export function AppRoutes() {
     <Routes>
       <Route path="clipboard-overlay" element={<ClipboardOverlayPage />} />
       <Route path="search-overlay" element={<SearchOverlayPage />} />
+      <Route path="screenshot-overlay" element={<ScreenshotOverlayPage />} />
+      <Route path="screenshot-pin" element={<ScreenshotPinPage />} />
       <Route path="desktop-widget" element={<DesktopWidgetPage />} />
       <Route path="desktop-card/:kind" element={<DesktopCardWindowPage />} />
       <Route path="desktop-card/:kind/:index" element={<DesktopCardWindowPage />} />

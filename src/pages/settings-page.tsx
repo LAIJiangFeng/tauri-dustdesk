@@ -1,8 +1,8 @@
-import { useEffect, useRef, useState } from "react"
-import type { KeyboardEvent as ReactKeyboardEvent } from "react"
+import { useEffect, useState } from "react"
 import { ArrowsClockwise, Camera, Copy, Desktop, DownloadSimple, FolderOpen, GearSix, HardDrives, Keyboard, MagnifyingGlass, PlayCircle, Plus, X } from "@phosphor-icons/react"
 import { open } from "@tauri-apps/plugin-dialog"
 import { DesktopFrameControlPanel } from "@/components/dustdesk/desktop-frame-control-panel"
+import { ShortcutInput, useShortcutDraft } from "@/components/dustdesk/shortcut-input"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -11,28 +11,7 @@ import { ScrollArea } from "@/components/ui/scroll-area"
 import { useDustDeskStore } from "@/stores/dustdesk-store"
 import type { AppUpdateInfo } from "@/types"
 
-const MODIFIER_CODES = new Set(["ControlLeft", "ControlRight", "ShiftLeft", "ShiftRight", "AltLeft", "AltRight", "MetaLeft", "MetaRight"])
 type RuntimeDirectoryTarget = "data" | "organizer" | "launchers"
-
-function shortcutKeyFromEvent(event: KeyboardEvent) {
-  if (MODIFIER_CODES.has(event.code)) return ""
-  if (event.code.startsWith("Key")) return event.code.slice(3).toUpperCase()
-  if (event.code.startsWith("Digit")) return event.code.slice(5)
-  if (event.code === "Space") return "Space"
-  return event.code || event.key
-}
-
-function shortcutFromEvent(event: KeyboardEvent) {
-  const modifiers: string[] = []
-  if (event.ctrlKey) modifiers.push("Ctrl")
-  if (event.altKey) modifiers.push("Alt")
-  if (event.shiftKey) modifiers.push("Shift")
-  if (event.metaKey) modifiers.push("Super")
-
-  const key = shortcutKeyFromEvent(event)
-  if (!key) return modifiers.join("+")
-  return [...modifiers, key].join("+")
-}
 
 export function SettingsPage() {
   const snapshot = useDustDeskStore((state) => state.snapshot)
@@ -44,9 +23,7 @@ export function SettingsPage() {
   const updateLaunchOnStartup = useDustDeskStore((state) => state.updateLaunchOnStartup)
   const checkForUpdates = useDustDeskStore((state) => state.checkForUpdates)
   const openUpdateDownload = useDustDeskStore((state) => state.openUpdateDownload)
-  const shortcutInputRef = useRef<HTMLInputElement | null>(null)
-  const searchShortcutInputRef = useRef<HTMLInputElement | null>(null)
-  const [shortcutDraft, setShortcutDraft] = useState(snapshot.settings.clipboard_shortcut)
+  const { draft: shortcutDraft, setDraft: setShortcutDraft, resetDraft: resetShortcutDraft } = useShortcutDraft(snapshot.settings.clipboard_shortcut)
   const [isRecordingShortcut, setIsRecordingShortcut] = useState(false)
   const [isSavingShortcut, setIsSavingShortcut] = useState(false)
   const [shortcutError, setShortcutError] = useState("")
@@ -56,7 +33,11 @@ export function SettingsPage() {
   const [historyLimitError, setHistoryLimitError] = useState("")
   const [historyLimitSuccess, setHistoryLimitSuccess] = useState("")
   const [searchEnabledDraft, setSearchEnabledDraft] = useState(snapshot.settings.search_enabled)
-  const [searchShortcutDraft, setSearchShortcutDraft] = useState(snapshot.settings.search_shortcut)
+  const {
+    draft: searchShortcutDraft,
+    setDraft: setSearchShortcutDraft,
+    resetDraft: resetSearchShortcutDraft,
+  } = useShortcutDraft(snapshot.settings.search_shortcut)
   const [searchPathsDraft, setSearchPathsDraft] = useState(snapshot.settings.search_paths)
   const [searchPathInput, setSearchPathInput] = useState("")
   const [isRecordingSearchShortcut, setIsRecordingSearchShortcut] = useState(false)
@@ -103,36 +84,13 @@ export function SettingsPage() {
   ]
 
   useEffect(() => {
-    if (!isRecordingShortcut) {
-      setShortcutDraft(snapshot.settings.clipboard_shortcut)
-    }
-  }, [isRecordingShortcut, snapshot.settings.clipboard_shortcut])
-
-  useEffect(() => {
     setHistoryLimitDraft(String(snapshot.settings.clipboard_history_limit))
   }, [snapshot.settings.clipboard_history_limit])
 
   useEffect(() => {
-    if (!isRecordingSearchShortcut) {
-      setSearchShortcutDraft(snapshot.settings.search_shortcut)
-    }
     setSearchEnabledDraft(snapshot.settings.search_enabled)
     setSearchPathsDraft(snapshot.settings.search_paths)
-  }, [isRecordingSearchShortcut, snapshot.settings.search_enabled, snapshot.settings.search_paths, snapshot.settings.search_shortcut])
-
-  useEffect(() => {
-    if (isRecordingShortcut) {
-      shortcutInputRef.current?.focus()
-      shortcutInputRef.current?.select()
-    }
-  }, [isRecordingShortcut])
-
-  useEffect(() => {
-    if (isRecordingSearchShortcut) {
-      searchShortcutInputRef.current?.focus()
-      searchShortcutInputRef.current?.select()
-    }
-  }, [isRecordingSearchShortcut])
+  }, [snapshot.settings.search_enabled, snapshot.settings.search_paths])
 
   const saveShortcut = async (shortcut: string) => {
     const nextShortcut = shortcut.trim()
@@ -145,8 +103,8 @@ export function SettingsPage() {
     setShortcutError("")
     setShortcutSuccess("")
     try {
-      const settings = await updateClipboardShortcut(nextShortcut)
-      setShortcutDraft(settings.clipboard_shortcut)
+      await updateClipboardShortcut(nextShortcut)
+      resetShortcutDraft()
       setShortcutSuccess("剪贴板快捷键已保存")
     } catch (reason) {
       setShortcutError(reason instanceof Error ? reason.message : String(reason))
@@ -191,7 +149,7 @@ export function SettingsPage() {
     try {
       const settings = await updateSearchSettings(enabled, nextShortcut, nextPaths)
       setSearchEnabledDraft(settings.search_enabled)
-      setSearchShortcutDraft(settings.search_shortcut)
+      resetSearchShortcutDraft()
       setSearchPathsDraft(settings.search_paths)
       setSearchSuccess("搜索设置已保存")
     } catch (reason) {
@@ -199,54 +157,6 @@ export function SettingsPage() {
     } finally {
       setIsSavingSearch(false)
     }
-  }
-
-  const handleShortcutKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
-    if (!isRecordingShortcut) return
-
-    event.preventDefault()
-    event.stopPropagation()
-
-    const nextShortcut = shortcutFromEvent(event.nativeEvent)
-    if (!nextShortcut) return
-
-    setShortcutDraft(nextShortcut)
-    if (!shortcutKeyFromEvent(event.nativeEvent)) {
-      setShortcutError("继续按一个主键，例如 Tab / V / Space")
-      return
-    }
-
-    if (!nextShortcut.includes("+")) {
-      setShortcutError("请按住 Ctrl / Alt / Shift / Win 中至少一个修饰键")
-      return
-    }
-
-    setIsRecordingShortcut(false)
-    void saveShortcut(nextShortcut)
-  }
-
-  const handleSearchShortcutKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
-    if (!isRecordingSearchShortcut) return
-
-    event.preventDefault()
-    event.stopPropagation()
-
-    const nextShortcut = shortcutFromEvent(event.nativeEvent)
-    if (!nextShortcut) return
-
-    setSearchShortcutDraft(nextShortcut)
-    if (!shortcutKeyFromEvent(event.nativeEvent)) {
-      setSearchError("继续按一个主键，例如 Space / K / F")
-      return
-    }
-
-    if (!nextShortcut.includes("+")) {
-      setSearchError("请按住 Ctrl / Alt / Shift / Win 中至少一个修饰键")
-      return
-    }
-
-    setIsRecordingSearchShortcut(false)
-    void saveSearchSettings(searchEnabledDraft, nextShortcut, searchPathsDraft)
   }
 
   const addSearchPath = (path = searchPathInput) => {
@@ -384,13 +294,18 @@ export function SettingsPage() {
                     <h3 className="font-heading text-base font-medium">自定义快捷键</h3>
                     {isRecordingShortcut ? <Badge>录制中</Badge> : <Badge variant="outline">全局快捷键</Badge>}
                   </div>
-                  <Input
-                    ref={shortcutInputRef}
+                  <ShortcutInput
                     value={shortcutDraft}
                     placeholder="例如 Ctrl+Alt+V"
-                    className="h-11 font-mono"
-                    onChange={(event) => setShortcutDraft(event.target.value)}
-                    onKeyDown={handleShortcutKeyDown}
+                    isRecording={isRecordingShortcut}
+                    mainKeyExample="Tab / V / Space"
+                    onDraftChange={setShortcutDraft}
+                    onSubmit={() => void saveShortcut(shortcutDraft)}
+                    onRecorded={(nextShortcut) => {
+                      setIsRecordingShortcut(false)
+                      void saveShortcut(nextShortcut)
+                    }}
+                    onRecordingError={setShortcutError}
                   />
                   <p className="text-xs leading-5 text-muted-foreground">格式示例：Ctrl+Tab、Ctrl+Alt+V、Alt+Space。必须包含至少一个修饰键。</p>
                   {shortcutSuccess ? <p className="text-xs leading-5 text-emerald-600 dark:text-emerald-400">{shortcutSuccess}</p> : null}
@@ -407,7 +322,7 @@ export function SettingsPage() {
                     type="button"
                     variant="ghost"
                     onClick={() => {
-                      setShortcutDraft(snapshot.settings.clipboard_shortcut)
+                      resetShortcutDraft()
                       setShortcutError("")
                       setShortcutSuccess("")
                       setIsRecordingShortcut(false)
@@ -506,15 +421,25 @@ export function SettingsPage() {
                     {isRecordingSearchShortcut ? <Badge>录制中</Badge> : <Badge variant="outline">Spotlight 弹窗</Badge>}
                   </div>
                   <div className="grid gap-2 md:grid-cols-[minmax(0,1fr)_auto]">
-                    <Input
-                      ref={searchShortcutInputRef}
+                    <ShortcutInput
                       value={searchShortcutDraft}
                       placeholder="例如 Ctrl+Space"
-                      className="h-11 font-mono"
-                      onChange={(event) => setSearchShortcutDraft(event.target.value)}
-                      onKeyDown={handleSearchShortcutKeyDown}
+                      isRecording={isRecordingSearchShortcut}
+                      mainKeyExample="Space / K / F"
+                      onDraftChange={setSearchShortcutDraft}
+                      onSubmit={() => void saveSearchSettings()}
+                      onRecorded={(nextShortcut) => {
+                        setIsRecordingSearchShortcut(false)
+                        void saveSearchSettings(searchEnabledDraft, nextShortcut, searchPathsDraft)
+                      }}
+                      onRecordingError={setSearchError}
                     />
-                    <Button type="button" variant={isRecordingSearchShortcut ? "default" : "secondary"} onClick={() => setIsRecordingSearchShortcut(true)}>
+                    <Button
+                      type="button"
+                      className="h-11 self-start"
+                      variant={isRecordingSearchShortcut ? "default" : "secondary"}
+                      onClick={() => setIsRecordingSearchShortcut(true)}
+                    >
                       {isRecordingSearchShortcut ? "请按组合键" : "录制搜索快捷键"}
                     </Button>
                   </div>
@@ -594,7 +519,7 @@ export function SettingsPage() {
                     variant="ghost"
                     onClick={() => {
                       setSearchEnabledDraft(snapshot.settings.search_enabled)
-                      setSearchShortcutDraft(snapshot.settings.search_shortcut)
+                      resetSearchShortcutDraft()
                       setSearchPathsDraft(snapshot.settings.search_paths)
                       setSearchPathInput("")
                       setSearchError("")
@@ -761,25 +686,11 @@ function ScreenshotSettingsSection() {
   const settings = useDustDeskStore((state) => state.snapshot.settings)
   const updateScreenshotSettings = useDustDeskStore((state) => state.updateScreenshotSettings)
   const startScreenshot = useDustDeskStore((state) => state.startScreenshot)
-  const inputRef = useRef<HTMLInputElement | null>(null)
-  const [shortcutDraft, setShortcutDraft] = useState(settings.screenshot_shortcut)
+  const { draft: shortcutDraft, setDraft: setShortcutDraft, resetDraft } = useShortcutDraft(settings.screenshot_shortcut)
   const [isRecording, setIsRecording] = useState(false)
   const [isSaving, setIsSaving] = useState(false)
   const [error, setError] = useState("")
   const [success, setSuccess] = useState("")
-
-  useEffect(() => {
-    if (!isRecording) {
-      setShortcutDraft(settings.screenshot_shortcut)
-    }
-  }, [isRecording, settings.screenshot_shortcut])
-
-  useEffect(() => {
-    if (isRecording) {
-      inputRef.current?.focus()
-      inputRef.current?.select()
-    }
-  }, [isRecording])
 
   const save = async (shortcut: string, hideWindow: boolean, successMessage: string) => {
     const nextShortcut = shortcut.trim()
@@ -792,39 +703,15 @@ function ScreenshotSettingsSection() {
     setError("")
     setSuccess("")
     try {
-      const nextSettings = await updateScreenshotSettings(nextShortcut, hideWindow)
-      setShortcutDraft(nextSettings.screenshot_shortcut)
+      await updateScreenshotSettings(nextShortcut, hideWindow)
+      resetDraft()
       setSuccess(successMessage)
     } catch (reason) {
-      setShortcutDraft(settings.screenshot_shortcut)
+      resetDraft()
       setError(reason instanceof Error ? reason.message : String(reason))
     } finally {
       setIsSaving(false)
     }
-  }
-
-  const handleKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
-    if (!isRecording) return
-
-    event.preventDefault()
-    event.stopPropagation()
-
-    const nextShortcut = shortcutFromEvent(event.nativeEvent)
-    if (!nextShortcut) return
-
-    setShortcutDraft(nextShortcut)
-    if (!shortcutKeyFromEvent(event.nativeEvent)) {
-      setError("继续按一个主键，例如 A / S / PrintScreen")
-      return
-    }
-
-    if (!nextShortcut.includes("+")) {
-      setError("请按住 Ctrl / Alt / Shift / Win 中至少一个修饰键")
-      return
-    }
-
-    setIsRecording(false)
-    void save(nextShortcut, settings.screenshot_hide_window, "截图快捷键已保存")
   }
 
   const startNow = async () => {
@@ -865,13 +752,18 @@ function ScreenshotSettingsSection() {
               <h3 className="font-heading text-base font-medium">截图快捷键</h3>
               {isRecording ? <Badge>录制中</Badge> : <Badge variant="outline">全局快捷键</Badge>}
             </div>
-            <Input
-              ref={inputRef}
+            <ShortcutInput
               value={shortcutDraft}
               placeholder="例如 Ctrl+Alt+A"
-              className="h-11 font-mono"
-              onChange={(event) => setShortcutDraft(event.target.value)}
-              onKeyDown={handleKeyDown}
+              isRecording={isRecording}
+              mainKeyExample="A / S / PrintScreen"
+              onDraftChange={setShortcutDraft}
+              onSubmit={() => void save(shortcutDraft, settings.screenshot_hide_window, "截图快捷键已保存")}
+              onRecorded={(nextShortcut) => {
+                setIsRecording(false)
+                void save(nextShortcut, settings.screenshot_hide_window, "截图快捷键已保存")
+              }}
+              onRecordingError={setError}
             />
             <p className="text-xs leading-5 text-muted-foreground">默认 Ctrl+Alt+A。如与微信、QQ 截图冲突，可改成 Ctrl+Shift+A 等。</p>
             <label className="flex items-center gap-2 text-sm">
@@ -908,7 +800,7 @@ function ScreenshotSettingsSection() {
               type="button"
               variant="ghost"
               onClick={() => {
-                setShortcutDraft(settings.screenshot_shortcut)
+                resetDraft()
                 setError("")
                 setSuccess("")
                 setIsRecording(false)

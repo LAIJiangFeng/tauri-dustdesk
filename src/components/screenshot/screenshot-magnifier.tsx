@@ -1,6 +1,7 @@
 import { useImperativeHandle, useRef } from "react"
 import type { Ref } from "react"
 import type { Point } from "@/lib/screenshot/geometry"
+import type { PixelReader } from "@/lib/screenshot/api"
 
 const ZOOM_CELLS = 15
 const CELL_CSS = 8
@@ -9,7 +10,7 @@ const OFFSET = 18
 
 export interface MagnifierSource {
   image: CanvasImageSource
-  pixels: ImageData | null
+  pixels: PixelReader | null
   width: number
   height: number
   scale: number
@@ -36,12 +37,10 @@ export function ScreenshotMagnifier({ handleRef, source }: { handleRef: Ref<Magn
   const lastPointRef = useRef<Point | null>(null)
 
   const rgbAt = (point: Point): [number, number, number] | null => {
-    const pixels = source?.pixels
-    if (!pixels) return null
-    const x = Math.min(Math.max(Math.floor(point.x), 0), pixels.width - 1)
-    const y = Math.min(Math.max(Math.floor(point.y), 0), pixels.height - 1)
-    const offset = (y * pixels.width + x) * 4
-    return [pixels.data[offset], pixels.data[offset + 1], pixels.data[offset + 2]]
+    if (!source?.pixels) return null
+    const x = Math.min(Math.max(Math.floor(point.x), 0), source.width - 1)
+    const y = Math.min(Math.max(Math.floor(point.y), 0), source.height - 1)
+    return source.pixels(x, y)
   }
 
   const formatColor = (rgb: [number, number, number] | null, hexMode: boolean) => {

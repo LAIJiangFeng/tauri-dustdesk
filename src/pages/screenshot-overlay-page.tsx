@@ -33,13 +33,14 @@ import {
   applyTransparentDocument,
   errorText,
   getScreenshotSession,
-  loadScreenshotBitmap,
+  loadScreenshotImage,
   screenshotCancel,
   screenshotCopy,
   screenshotOcr,
   screenshotOverlayReady,
   screenshotPin,
   screenshotSave,
+  type ScreenshotImage,
 } from "@/lib/screenshot/api"
 import {
   HANDLE_DIRECTIONS,
@@ -65,6 +66,9 @@ const HANDLE_HIT_CSS = 7
 const MIN_POINT_DISTANCE = 1.5
 const DIM_COLOR = "rgba(0, 0, 0, 0.45)"
 const ACCENT = "#1aad19"
+/** Selection / hovered-window frame width in CSS pixels; drawn inside the rect, never exported. */
+const FRAME_CSS = 2
+const HANDLE_CSS = 8
 const FIRST_PAINT_TIMEOUT_MS = 300
 
 type Interaction =
@@ -100,9 +104,28 @@ function waitForNextPaint() {
   })
 }
 
-/** Two animation frames, capped in case the off-screen WebView throttles animation frames. */
+/** Two animation frames, capped in case the WebView throttles animation frames. */
 function waitForFirstPaint() {
   return Promise.race([waitForNextPaint(), new Promise<void>((resolve) => window.setTimeout(resolve, FIRST_PAINT_TIMEOUT_MS))])
+}
+
+/** Start-latency marks of one session, logged as a single `[screenshot]` console line once ready is sent. */
+interface StartTiming {
+  origin: number
+  last: number
+  stages: string[]
+}
+
+function createStartTiming(): StartTiming {
+  const now = performance.now()
+  return { origin: now, last: now, stages: [] }
+}
+
+function markStartTiming(timing: StartTiming | null, stage: string) {
+  if (!timing) return
+  const now = performance.now()
+  timing.stages.push(`${stage} ${Math.round(now - timing.last)}ms`)
+  timing.last = now
 }
 
 function isEditableTarget(target: EventTarget | null) {
@@ -143,6 +166,8 @@ export function ScreenshotOverlayPage() {
   const sessionIdRef = useRef<string | null>(null)
   const loadTokenRef = useRef(0)
   const bitmapRef = useRef<ImageBitmap | null>(null)
+  /** True once the capture is drawn into the base canvas; the dim layer must never show before it. */
+  const baseDrawnRef = useRef(false)
   const mosaicRef = useRef<MosaicRenderer | null>(null)
   const selectionRef = useRef<Rect | null>(null)
   const hoverRectRef = useRef<Rect | null>(null)
@@ -160,6 +185,7 @@ export function ScreenshotOverlayPage() {
   const annotationsDirtyRef = useRef(true)
   const hexModeRef = useRef(false)
   const noticeTimerRef = useRef(0)
+  const startTimingRef = useRef<StartTiming | null>(null)
 
   toolRef.current = tool
   toolStyleRef.current = toolStyle
@@ -196,10 +222,11 @@ export function ScreenshotOverlayPage() {
     const label = sizeLabelRef.current
     const frameScale = currentScale()
     const interaction = interactionRef.current
+    const painted = Boolean(current) && baseDrawnRef.current
 
     if (box && label) {
       const rect = selectionRef.current ?? hoverRectRef.current
-      if (current && rect) {
+      if (painted && rect) {
         box.style.display = "block"
         box.style.left = `${rect.x / frameScale}px`
         box.style.top = `${rect.y / frameScale}px`
@@ -208,10 +235,10 @@ export function ScreenshotOverlayPage() {
         box.style.borderColor = ACCENT
         label.style.display = "block"
         label.textContent = `${Math.round(rect.width)} × ${Math.round(rect.height)}`
-        label.style.top = rect.y / frameScale >= 26 ? "-24px" : "4px"
-        label.style.left = rect.y / frameScale >= 26 ? "0px" : "4px"
+        label.style.top = rect.y / frameScale >= 26 ? `${-24 - FRAME_CSS}px` : "4px"
+        label.style.left = rect.y / frameScale >= 26 ? `${-FRAME_CSS}px` : "4px"
       } else {
-        box.style.display = current ? "block" : "none"
+        box.style.display = painted ? "block" : "none"
         box.style.left = "0px"
         box.style.top = "0px"
         box.style.width = "0px"
@@ -248,7 +275,7 @@ export function ScreenshotOverlayPage() {
     }
 
     const showMagnifier =
-      Boolean(current) &&
+      painted &&
       !busyRef.current &&
       (interaction.kind === "creating" ||
         interaction.kind === "resizing" ||
@@ -361,6 +388,7 @@ export function ScreenshotOverlayPage() {
     sessionRef.current = null
     bitmapRef.current?.close()
     bitmapRef.current = null
+    baseDrawnRef.current = false
     mosaicRef.current = null
     const base = baseCanvasRef.current
     if (base) {
@@ -376,10 +404,19 @@ export function ScreenshotOverlayPage() {
     async (sessionId: string) => {
       await waitForFirstPaint()
       if (sessionIdRef.current !== sessionId) return
+      const timing = startTimingRef.current
+      startTimingRef.current = null
+      markStartTiming(timing, "paint")
       try {
         await screenshotOverlayReady(sessionId, monitorIndex)
       } catch {
-        // The backend reveals the overlay on its own after a timeout.
+        // Only the backend start log waits for this; it gives up on its own after a timeout.
+      }
+      if (timing) {
+        markStartTiming(timing, "ready")
+        console.info(
+          `[screenshot] session ${sessionId}: ${timing.stages.join(", ")}; total ${Math.round(performance.now() - timing.origin)}ms`,
+        )
       }
     },
     [monitorIndex],
@@ -388,6 +425,8 @@ export function ScreenshotOverlayPage() {
   const loadSession = useCallback(
     async (expectedSessionId?: string) => {
       if (expectedSessionId && expectedSessionId === sessionIdRef.current) return
+      const timing = startTimingRef.current ?? createStartTiming()
+      startTimingRef.current = timing
       // Concurrent loads (mount + start event) race here: whichever resolves first bumps the token and wins.
       const requestToken = loadTokenRef.current
       let next: ScreenshotSession | null
@@ -400,34 +439,26 @@ export function ScreenshotOverlayPage() {
       if (next.session_id === sessionIdRef.current) return
 
       clearSession()
+      startTimingRef.current = timing
+      markStartTiming(timing, "session")
       const loadToken = loadTokenRef.current
       sessionIdRef.current = next.session_id
-      let bitmap: ImageBitmap
+      let image: ScreenshotImage
       try {
-        bitmap = await loadScreenshotBitmap(next.image_url)
+        image = await loadScreenshotImage(next.image_url, () => markStartTiming(timing, "fetch"))
+        markStartTiming(timing, "decode")
       } catch (reason) {
         if (loadToken === loadTokenRef.current) {
           showNotice(`截图加载失败：${errorText(reason)}`, true)
-          // Still reveal the overlay so the error is visible and Esc can dismiss it.
+          // Report anyway so the backend start log is not left waiting; the error stays visible and Esc dismisses it.
           void reportReady(next.session_id)
         }
         return
       }
+      const { bitmap, pixels } = image
       if (loadToken !== loadTokenRef.current) {
         bitmap.close()
         return
-      }
-
-      let pixels: ImageData | null = null
-      try {
-        const reader = document.createElement("canvas")
-        reader.width = bitmap.width
-        reader.height = bitmap.height
-        const context = reader.getContext("2d", { willReadFrequently: true })
-        context?.drawImage(bitmap, 0, 0)
-        pixels = context?.getImageData(0, 0, bitmap.width, bitmap.height) ?? null
-      } catch {
-        pixels = null
       }
 
       bitmapRef.current = bitmap
@@ -450,11 +481,13 @@ export function ScreenshotOverlayPage() {
     base.getContext("2d")?.drawImage(bitmap, 0, 0)
     overlay.width = bitmap.width
     overlay.height = bitmap.height
-    // Render the dim layer synchronously: the overlay is still off-screen and is only moved onto the
-    // monitor after this frame has been painted.
+    // The overlay is already on screen: render the dim layer synchronously so it lands in the same
+    // frame as the base image, never on top of the transparent window (a dimmed live desktop).
+    baseDrawnRef.current = true
     cancelAnimationFrame(frameRef.current)
     annotationsDirtyRef.current = true
     renderFrame()
+    markStartTiming(startTimingRef.current, "draw")
     void reportReady(session.session_id)
   }, [session])
 
@@ -465,6 +498,7 @@ export function ScreenshotOverlayPage() {
     void (async () => {
       const startDispose = await safeListen<ScreenshotStartEvent>(SCREENSHOT_START_EVENT, (event) => {
         if (event.payload.monitor_index !== monitorIndex) return
+        if (event.payload.session_id !== sessionIdRef.current) startTimingRef.current = createStartTiming()
         void loadSession(event.payload.session_id)
       })
       const endDispose = await safeListen(SCREENSHOT_END_EVENT, () => clearSession())
@@ -1033,8 +1067,8 @@ export function ScreenshotOverlayPage() {
       />
       <div
         ref={selectionBoxRef}
-        className="pointer-events-none absolute z-10 box-border border"
-        style={{ display: "none", boxShadow: `0 0 0 99999px ${DIM_COLOR}` }}
+        className="pointer-events-none absolute z-10 box-border"
+        style={{ display: "none", borderWidth: FRAME_CSS, borderStyle: "solid", boxShadow: `0 0 0 99999px ${DIM_COLOR}` }}
       >
         <div
           ref={sizeLabelRef}
@@ -1125,13 +1159,15 @@ function canPickAnnotation(tool: DrawTool | null) {
   return tool !== "pen" && tool !== "mosaic"
 }
 
+/** Handles are centred on the frame line, which lies inside the box's padding edge. */
 function SelectionHandle({ direction }: { direction: HandleDirection }) {
-  const left = direction.includes("w") ? "0%" : direction.includes("e") ? "100%" : "50%"
-  const top = direction.includes("n") ? "0%" : direction.includes("s") ? "100%" : "50%"
+  const edge = FRAME_CSS / 2
+  const left = direction.includes("w") ? `${-edge}px` : direction.includes("e") ? `calc(100% + ${edge}px)` : "50%"
+  const top = direction.includes("n") ? `${-edge}px` : direction.includes("s") ? `calc(100% + ${edge}px)` : "50%"
   return (
     <span
-      className="absolute size-2 -translate-x-1/2 -translate-y-1/2 rounded-full border border-white"
-      style={{ left, top, background: ACCENT }}
+      className="absolute box-border -translate-x-1/2 -translate-y-1/2 rounded-full border border-white"
+      style={{ left, top, width: HANDLE_CSS, height: HANDLE_CSS, background: ACCENT }}
     />
   )
 }

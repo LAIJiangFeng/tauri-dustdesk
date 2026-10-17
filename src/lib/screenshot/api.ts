@@ -65,16 +65,51 @@ export async function screenshotPinClose(pinId: string) {
   await call<void>("screenshot_pin_close", { pinId })
 }
 
+/** Reads the RGB color of a physical pixel, or null when it is outside the image. */
+export type PixelReader = (x: number, y: number) => [number, number, number] | null
+
+export interface ScreenshotImage {
+  bitmap: ImageBitmap
+  /** Null when the image could only be loaded through the <img> fallback. */
+  pixels: PixelReader | null
+}
+
+/**
+ * Reads pixels straight from an uncompressed 24/32bpp BMP file. Colors must not come from a canvas
+ * readback of the decoded bitmap: a full-frame getImageData stalls the WebView2 renderer for seconds.
+ */
+export function bmpPixelReader(bytes: Uint8Array): PixelReader | null {
+  if (bytes.length < 54 || bytes[0] !== 0x42 || bytes[1] !== 0x4d) return null
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  const dataOffset = view.getUint32(10, true)
+  const width = view.getInt32(18, true)
+  const rawHeight = view.getInt32(22, true)
+  const bytesPerPixel = view.getUint16(28, true) / 8
+  const compression = view.getUint32(30, true)
+  const height = Math.abs(rawHeight)
+  const stride = (width * bytesPerPixel + 3) & ~3
+  if (width <= 0 || height === 0 || (bytesPerPixel !== 3 && bytesPerPixel !== 4) || compression !== 0) return null
+  if (dataOffset + stride * height > bytes.length) return null
+  return (x, y) => {
+    if (x < 0 || y < 0 || x >= width || y >= height) return null
+    const row = rawHeight < 0 ? y : height - 1 - y
+    const offset = dataOffset + row * stride + x * bytesPerPixel
+    return [bytes[offset + 2], bytes[offset + 1], bytes[offset]]
+  }
+}
+
 /**
  * Loads a dustshot:// image as a decoded bitmap that can be drawn into canvases without tainting them.
  * fetch is tried first (needs the protocol's CORS header); <img crossOrigin> is the fallback.
  */
-export async function loadScreenshotBitmap(url: string): Promise<ImageBitmap> {
+export async function loadScreenshotImage(url: string, onFetched?: () => void): Promise<ScreenshotImage> {
   try {
     const response = await fetch(url)
     if (!response.ok) throw new Error(`截图读取失败（${response.status}）`)
-    const blob = await response.blob()
-    return await createImageBitmap(blob)
+    const bytes = new Uint8Array(await response.arrayBuffer())
+    onFetched?.()
+    const bitmap = await createImageBitmap(new Blob([bytes], { type: response.headers.get("content-type") ?? "image/bmp" }))
+    return { bitmap, pixels: bmpPixelReader(bytes) }
   } catch (fetchError) {
     try {
       const image = new Image()
@@ -82,7 +117,7 @@ export async function loadScreenshotBitmap(url: string): Promise<ImageBitmap> {
       image.decoding = "async"
       image.src = url
       await image.decode()
-      return await createImageBitmap(image)
+      return { bitmap: await createImageBitmap(image), pixels: null }
     } catch {
       throw fetchError instanceof Error ? fetchError : new Error(String(fetchError))
     }

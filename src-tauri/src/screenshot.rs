@@ -37,10 +37,12 @@ const RECT_HEADER: &str = "x-dustshot-rect";
 const HIDEABLE_WINDOW_LABELS: [&str; 3] = ["main", "clipboard", "search"];
 const HIDE_WINDOW_SETTLE_DELAY: Duration = Duration::from_millis(180);
 const OFFSCREEN_POSITION: f64 = -32_000.0;
-/// Gap between the virtual desktop and the off-screen staging area for overlays.
-const OFFSCREEN_MARGIN: i32 = 4_000;
-/// Overlays are revealed anyway if the frontend has not reported its first frame by then.
+/// How long the start log waits for the overlays to report their first painted capture.
 const OVERLAY_READY_TIMEOUT: Duration = Duration::from_millis(1_500);
+/// Time given to overlay pages to present a cleared frame before they are hidden.
+const OVERLAY_CLEAR_DELAY: Duration = Duration::from_millis(60);
+/// Overlays are created this long after startup, when the app is idle.
+const OVERLAY_PREWARM_DELAY: Duration = Duration::from_secs(3);
 const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 
 /// True from the moment a capture starts until its session has fully ended, so repeated
@@ -52,6 +54,45 @@ static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 static PINS: OnceLock<Mutex<BTreeMap<u64, PinImage>>> = OnceLock::new();
 static NEXT_PIN_ID: AtomicU64 = AtomicU64::new(1);
 static OVERLAY_READY: OnceLock<(Mutex<OverlayReadyState>, Condvar)> = OnceLock::new();
+/// Time spent building the current session's first `dustshot` image response, for the start log.
+static LAST_SERVE_MICROS: AtomicU64 = AtomicU64::new(0);
+
+/// Stage timings of one capture start, printed as a single `[screenshot]` line.
+struct StartTimer {
+    triggered: Instant,
+    last: Instant,
+    stages: Vec<(&'static str, Duration)>,
+}
+
+impl StartTimer {
+    fn new(triggered: Instant) -> Self {
+        Self {
+            triggered,
+            last: triggered,
+            stages: Vec::new(),
+        }
+    }
+
+    fn mark(&mut self, stage: &'static str) {
+        let now = Instant::now();
+        self.stages.push((stage, now - self.last));
+        self.last = now;
+    }
+
+    fn report(&self, session_id: &str) {
+        let stages = self
+            .stages
+            .iter()
+            .map(|(stage, elapsed)| format!("{stage} {}ms", elapsed.as_millis()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "[screenshot] session {session_id}: {stages}; image response {}ms; total {}ms",
+            LAST_SERVE_MICROS.load(Ordering::SeqCst) / 1_000,
+            self.triggered.elapsed().as_millis()
+        );
+    }
+}
 
 /// Overlays of the current session that still have to report their first painted frame.
 #[derive(Default)]
@@ -194,8 +235,8 @@ fn clear_overlay_ready() {
 }
 
 /// Blocks until every overlay of `session_id` reported ready, the session ended, or the timeout
-/// elapsed.
-fn wait_overlays_ready(session_id: &str, timeout: Duration) {
+/// elapsed. Returns whether every overlay reported ready.
+fn wait_overlays_ready(session_id: &str, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     let mut state = overlay_ready_state();
     while state.session_id.as_deref() == Some(session_id) && !state.pending.is_empty() {
@@ -208,6 +249,7 @@ fn wait_overlays_ready(session_id: &str, timeout: Duration) {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .0;
     }
+    state.pending.is_empty()
 }
 
 fn is_current_session(session_id: &str) -> bool {
@@ -293,11 +335,12 @@ fn ensure_window_physical(window: &WebviewWindow, rect: PhysicalRect) {
 
 /// Shortcut / tray entry point: never blocks the caller.
 pub fn start_screenshot_async(app: AppHandle, delay: Duration) {
+    let triggered = Instant::now();
     tauri::async_runtime::spawn_blocking(move || {
         if !delay.is_zero() {
             std::thread::sleep(delay);
         }
-        if let Err(error) = start_session_blocking(&app) {
+        if let Err(error) = start_session_blocking(&app, triggered) {
             eprintln!("failed to start screenshot: {error}");
         }
     });
@@ -305,22 +348,24 @@ pub fn start_screenshot_async(app: AppHandle, delay: Duration) {
 
 #[tauri::command]
 pub async fn start_screenshot(app: AppHandle) -> Result<(), String> {
-    run_blocking(move || start_session_blocking(&app)).await
+    let triggered = Instant::now();
+    run_blocking(move || start_session_blocking(&app, triggered)).await
 }
 
-fn start_session_blocking(app: &AppHandle) -> Result<(), String> {
+fn start_session_blocking(app: &AppHandle, triggered: Instant) -> Result<(), String> {
     if SESSION_BUSY.swap(true, Ordering::SeqCst) {
         return Ok(());
     }
 
-    let result = start_session_inner(app);
+    let result = start_session_inner(app, StartTimer::new(triggered));
     if result.is_err() {
         finish_session(app);
     }
     result
 }
 
-fn start_session_inner(app: &AppHandle) -> Result<(), String> {
+fn start_session_inner(app: &AppHandle, mut timer: StartTimer) -> Result<(), String> {
+    timer.mark("dispatch");
     let settings = configured_settings();
     let mut needs_settle = false;
     with_lazy_window_operation(|| {
@@ -350,6 +395,7 @@ fn start_session_inner(app: &AppHandle) -> Result<(), String> {
         // Give DWM time to repaint the area under the hidden windows.
         std::thread::sleep(HIDE_WINDOW_SETTLE_DELAY);
     }
+    timer.mark("hide");
 
     let monitors = app.available_monitors().map_err(to_message)?;
     if monitors.is_empty() {
@@ -377,12 +423,14 @@ fn start_session_inner(app: &AppHandle) -> Result<(), String> {
             info.height,
         )?);
     }
+    timer.mark("capture");
 
     let excluded = overlay_windows(app)
         .iter()
         .filter_map(window_handle_value)
         .collect::<Vec<_>>();
     let raw_windows = platform::enumerate_windows(&excluded);
+    timer.mark("windows");
 
     let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::SeqCst).to_string();
     let captures = infos
@@ -397,54 +445,43 @@ fn start_session_inner(app: &AppHandle) -> Result<(), String> {
     // Registered before the session becomes readable, so an overlay page that picks the session
     // up on mount can never report ready before it is waited for.
     begin_overlay_ready(&session_id, infos.iter().map(|info| info.index));
+    LAST_SERVE_MICROS.store(0, Ordering::SeqCst);
     *session_slot() = Some(CaptureSession {
         id: session_id.clone(),
         monitors: captures,
     });
 
-    let staged = with_lazy_window_operation(|| stage_overlays(app, &session_id, &infos))?;
+    with_lazy_window_operation(|| show_overlays(app, &session_id, &infos))?;
+    timer.mark("show");
+    // The overlays are already on screen; ready only marks the first painted capture for the log.
     // Waiting happens outside the window lock so cancelling or other windows never block on it.
-    wait_overlays_ready(&session_id, OVERLAY_READY_TIMEOUT);
-    if !is_current_session(&session_id) {
-        return Ok(());
+    let ready = wait_overlays_ready(&session_id, OVERLAY_READY_TIMEOUT);
+    if is_current_session(&session_id) {
+        timer.mark(if ready { "painted" } else { "paint-timeout" });
+        timer.report(&session_id);
     }
-    with_lazy_window_operation(|| reveal_overlays(&infos, &staged))
+    Ok(())
 }
 
-/// Off-screen staging rect for an overlay: above the whole virtual desktop and horizontally
-/// aligned with its monitor, so the window keeps that monitor's DPI while the page loads and
-/// paints the capture out of sight.
-fn staging_rect(info: &MonitorInfo, infos: &[MonitorInfo]) -> PhysicalRect {
-    let desktop_top = infos.iter().map(|monitor| monitor.y).min().unwrap_or(0);
-    PhysicalRect {
-        x: info.x,
-        y: desktop_top
-            .saturating_sub(info.height as i32)
-            .saturating_sub(OFFSCREEN_MARGIN),
-        width: info.width,
-        height: info.height,
-    }
-}
-
-/// Shows every overlay off-screen at its final size and tells it which session to load. Overlays
-/// only move onto their monitors in `reveal_overlays`, after their first frame was painted, so the
-/// user never sees an empty or stale overlay.
-fn stage_overlays(
-    app: &AppHandle,
-    session_id: &str,
-    infos: &[MonitorInfo],
-) -> Result<Vec<WebviewWindow>, String> {
-    let mut staged = Vec::with_capacity(infos.len());
+/// Shows every overlay directly on its monitor and tells it which session to load.
+///
+/// Overlays are transparent and draw nothing until their page has decoded and painted the
+/// capture (base image and dim layer in the same frame), so showing them right away never exposes
+/// a dimmed live desktop. Showing them in place instead of staging them off-screen and moving them
+/// after their first frame saves a round of window moves, and Esc works from the first moment.
+fn show_overlays(app: &AppHandle, session_id: &str, infos: &[MonitorInfo]) -> Result<(), String> {
+    let mut shown = Vec::with_capacity(infos.len());
     for info in infos {
         let label = overlay_label(info.index);
         let window = match app.get_webview_window(&label) {
             Some(window) => window,
             None => create_overlay_window(app, &label, info.index)?,
         };
-        // WebView2 does not paint or run animation frames for hidden windows, so the overlay is
-        // made visible while it is still off-screen.
-        place_window_physical(&window, staging_rect(info, infos))?;
+        let rect = monitor_rect(info);
+        place_window_physical(&window, rect)?;
         window.show().map_err(to_message)?;
+        let _ = window.set_always_on_top(true);
+        ensure_window_physical(&window, rect);
         let _ = app.emit_to(
             EventTarget::webview_window(label.as_str()),
             START_EVENT,
@@ -453,7 +490,7 @@ fn stage_overlays(
                 monitor_index: info.index,
             },
         );
-        staged.push(window);
+        shown.push(window);
     }
 
     // Overlays left over from a monitor that has since been disconnected stay hidden.
@@ -467,22 +504,8 @@ fn stage_overlays(
             let _ = window.hide();
         }
     }
-    Ok(staged)
-}
 
-fn reveal_overlays(infos: &[MonitorInfo], staged: &[WebviewWindow]) -> Result<(), String> {
-    for (window, info) in staged.iter().zip(infos) {
-        let rect = PhysicalRect {
-            x: info.x,
-            y: info.y,
-            width: info.width,
-            height: info.height,
-        };
-        place_window_physical(window, rect)?;
-        let _ = window.set_always_on_top(true);
-        ensure_window_physical(window, rect);
-    }
-
+    // Focused right away so Esc works even before the capture is painted.
     let cursor = platform::cursor_position();
     let focus_index = infos
         .iter()
@@ -495,12 +518,22 @@ fn reveal_overlays(infos: &[MonitorInfo], staged: &[WebviewWindow]) -> Result<()
             })
         })
         .unwrap_or(0);
-    if let Some(window) = staged.get(focus_index) {
+    if let Some(window) = shown.get(focus_index) {
         let _ = window.set_focus();
     }
     Ok(())
 }
 
+fn monitor_rect(info: &MonitorInfo) -> PhysicalRect {
+    PhysicalRect {
+        x: info.x,
+        y: info.y,
+        width: info.width,
+        height: info.height,
+    }
+}
+
+/// Creates an overlay window hidden; callers place and show it.
 fn create_overlay_window(
     app: &AppHandle,
     label: &str,
@@ -523,30 +556,66 @@ fn create_overlay_window(
         .always_on_top(true)
         .skip_taskbar(true)
         .focused(false)
-        // Transparent instead of an opaque placeholder: if an overlay is ever revealed before its
-        // first frame (ready timeout), the live desktop shows through rather than black.
+        // Transparent instead of an opaque placeholder: until the page painted the capture the
+        // live desktop shows through unchanged rather than black.
         .transparent(true)
         .background_color(Color(0, 0, 0, 0))
-        .visible(true)
+        .visible(false)
         .build()
         .map_err(to_message)
     })
+}
+
+/// Creates the overlay windows of all current monitors ahead of the first capture, so the first
+/// shortcut press does not wait for a WebView to be created and its page to load.
+pub fn prewarm_overlays_async(app: AppHandle) {
+    tauri::async_runtime::spawn_blocking(move || {
+        std::thread::sleep(OVERLAY_PREWARM_DELAY);
+        let monitor_count = app.available_monitors().map(|monitors| monitors.len());
+        for index in 0..monitor_count.unwrap_or(0) {
+            if SESSION_BUSY.load(Ordering::SeqCst) {
+                break;
+            }
+            let label = overlay_label(index);
+            let result = with_lazy_window_operation(|| {
+                if app.get_webview_window(&label).is_none() {
+                    create_overlay_window(&app, &label, index)?;
+                }
+                Ok(())
+            });
+            if let Err(error) = result {
+                eprintln!("[screenshot] failed to prewarm {label}: {error}");
+                break;
+            }
+        }
+    });
 }
 
 /// Ends the current session: overlays are told to clear and hidden, capture memory is released
 /// and windows hidden for the capture are restored. Safe to call when no session is active.
 fn finish_session(app: &AppHandle) {
     clear_overlay_ready();
+    let overlays = overlay_windows(app);
+    for window in &overlays {
+        let _ = app.emit_to(EventTarget::webview_window(window.label()), END_EVENT, ());
+    }
+    let released = session_slot().take();
+    drop(released);
+    // A hidden WebView can present its last frame again when it is shown, so the pages get a few
+    // frames to present their cleared, fully transparent state before they are hidden; otherwise
+    // the next capture could briefly show this one.
+    if overlays
+        .iter()
+        .any(|window| window.is_visible().unwrap_or(false))
+    {
+        std::thread::sleep(OVERLAY_CLEAR_DELAY);
+    }
     let _ = with_lazy_window_operation(|| {
-        for window in overlay_windows(app) {
-            let _ = app.emit_to(EventTarget::webview_window(window.label()), END_EVENT, ());
+        for window in &overlays {
             let _ = window.hide();
         }
         Ok(())
     });
-
-    let released = session_slot().take();
-    drop(released);
 
     let labels = std::mem::take(&mut *restore_labels_slot());
     if !labels.is_empty() {
@@ -939,12 +1008,24 @@ pub fn handle_protocol_request(request: HttpRequest<Vec<u8>>, responder: UriSche
     let is_preflight = request.method() == Method::OPTIONS;
     let path = request.uri().path().to_owned();
     tauri::async_runtime::spawn_blocking(move || {
+        let started = Instant::now();
         let response = if is_preflight {
             protocol_response(StatusCode::NO_CONTENT, "text/plain", Vec::new())
         } else {
             match resolve_protocol_image(&path) {
                 Some((content_type, bytes)) => {
-                    protocol_response(StatusCode::OK, content_type, bytes.as_ref().clone())
+                    let response =
+                        protocol_response(StatusCode::OK, content_type, bytes.as_ref().clone());
+                    if path.starts_with("/session/") {
+                        let micros = started.elapsed().as_micros() as u64;
+                        let _ = LAST_SERVE_MICROS.compare_exchange(
+                            0,
+                            micros.max(1),
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        );
+                    }
+                    response
                 }
                 None => protocol_response(StatusCode::NOT_FOUND, "text/plain", Vec::new()),
             }
@@ -1071,14 +1152,20 @@ mod platform {
         pub title: String,
     }
 
-    /// Captures one monitor area into an uncompressed top-down 32bpp BMP file.
+    /// Captures one monitor area into an uncompressed top-down 24bpp BMP file.
+    ///
+    /// 24bpp lets GDI write the final pixel rows directly: a 32bpp capture has an undefined alpha
+    /// channel that would need a per-pixel pass to make opaque, which is slow in debug builds.
     pub fn capture_bmp(x: i32, y: i32, width: u32, height: u32) -> Result<Vec<u8>, String> {
         if width == 0 || height == 0 {
             return Err("显示器尺寸无效".to_owned());
         }
+        // BMP rows are padded to a multiple of 4 bytes.
         let pixel_bytes = (width as usize)
-            .checked_mul(height as usize)
-            .and_then(|pixels| pixels.checked_mul(4))
+            .checked_mul(3)
+            .map(|row| (row + 3) & !3)
+            .and_then(|stride| stride.checked_mul(height as usize))
+            .filter(|bytes| *bytes <= u32::MAX as usize - BMP_HEADER_SIZE)
             .ok_or_else(|| "显示器尺寸过大".to_owned())?;
         let mut bmp = vec![0u8; BMP_HEADER_SIZE + pixel_bytes];
 
@@ -1120,7 +1207,7 @@ mod platform {
                 biWidth: width as i32,
                 biHeight: -(height as i32),
                 biPlanes: 1,
-                biBitCount: 32,
+                biBitCount: 24,
                 biCompression: BI_RGB,
                 ..std::mem::zeroed()
             };
@@ -1147,12 +1234,6 @@ mod platform {
             }
         }
 
-        // GDI leaves the alpha channel undefined; force opaque so browsers do not treat the
-        // BMP as transparent.
-        for pixel in bmp[BMP_HEADER_SIZE..].chunks_exact_mut(4) {
-            pixel[3] = 255;
-        }
-
         let file_size = bmp.len() as u32;
         bmp[0..2].copy_from_slice(b"BM");
         bmp[2..6].copy_from_slice(&file_size.to_le_bytes());
@@ -1162,7 +1243,7 @@ mod platform {
         info[4..8].copy_from_slice(&(width as i32).to_le_bytes());
         info[8..12].copy_from_slice(&(-(height as i32)).to_le_bytes());
         info[12..14].copy_from_slice(&1u16.to_le_bytes());
-        info[14..16].copy_from_slice(&32u16.to_le_bytes());
+        info[14..16].copy_from_slice(&24u16.to_le_bytes());
         info[20..24].copy_from_slice(&(pixel_bytes as u32).to_le_bytes());
         Ok(bmp)
     }

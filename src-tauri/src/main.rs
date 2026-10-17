@@ -13647,6 +13647,7 @@ fn main() {
             #[cfg(windows)]
             windows_show_desktop::start(app_handle.clone());
             start_desktop_monitor_watch(app_handle.clone());
+            screenshot::prewarm_overlays_async(app_handle.clone());
             let show_main_on_start = !is_startup_launch_invocation();
             let handle = app.handle().clone();
             tauri::async_runtime::spawn_blocking(move || {

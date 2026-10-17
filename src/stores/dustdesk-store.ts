@@ -28,6 +28,8 @@ const defaultSettings: AppSettings = {
   search_shortcut: "Ctrl+Space",
   search_paths: [],
   launch_on_startup: false,
+  screenshot_shortcut: "Ctrl+Alt+A",
+  screenshot_hide_window: false,
 }
 
 const emptyDesktopLayout: DesktopLayout = {
@@ -231,6 +233,13 @@ async function call<T>(command: string, args?: InvokeArgs): Promise<T> {
         search_paths: asArray(args?.paths)
           .map((item) => asString(item))
           .filter(Boolean),
+      }) as T
+    }
+    if (command === "update_screenshot_settings") {
+      return normalizeSettings({
+        ...defaultSettings,
+        screenshot_shortcut: asString(args?.shortcut, defaultSettings.screenshot_shortcut),
+        screenshot_hide_window: asBoolean(args?.hideWindow, defaultSettings.screenshot_hide_window),
       }) as T
     }
     if (command === "update_launch_on_startup") {
@@ -446,6 +455,11 @@ function normalizeSettings(value: unknown): AppSettings {
       .map((item) => asPathString(item))
       .filter(Boolean),
     launch_on_startup: asBoolean(raw.launch_on_startup ?? raw.LaunchOnStartup, defaultSettings.launch_on_startup),
+    screenshot_shortcut: asString(raw.screenshot_shortcut ?? raw.ScreenshotShortcut, defaultSettings.screenshot_shortcut),
+    screenshot_hide_window: asBoolean(
+      raw.screenshot_hide_window ?? raw.ScreenshotHideWindow,
+      defaultSettings.screenshot_hide_window,
+    ),
   }
 }
 
@@ -909,6 +923,8 @@ interface DustDeskState {
   hideSearchOverlay: () => Promise<void>
   updateSearchSettings: (enabled: boolean, shortcut: string, paths: string[]) => Promise<AppSettings>
   updateLaunchOnStartup: (enabled: boolean) => Promise<AppSettings>
+  updateScreenshotSettings: (shortcut: string, hideWindow: boolean) => Promise<AppSettings>
+  startScreenshot: () => Promise<void>
   checkForUpdates: () => Promise<AppUpdateInfo>
   openUpdateDownload: (downloadUrl: string) => Promise<void>
 }
@@ -1422,6 +1438,19 @@ export const useDustDeskStore = create<DustDeskState>()(
         state.snapshot.settings = normalizeSettings(settings)
       })
       return normalizeSettings(settings)
+    },
+    updateScreenshotSettings: async (shortcut, hideWindow) => {
+      const settings = await call<AppSettings>("update_screenshot_settings", {
+        shortcut,
+        hideWindow,
+      })
+      set((state) => {
+        state.snapshot.settings = normalizeSettings(settings)
+      })
+      return normalizeSettings(settings)
+    },
+    startScreenshot: async () => {
+      await call("start_screenshot")
     },
     checkForUpdates: async () => {
       const update = await call<AppUpdateInfo>("check_for_updates")

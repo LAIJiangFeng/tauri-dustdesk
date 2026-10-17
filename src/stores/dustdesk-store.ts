@@ -30,6 +30,8 @@ const defaultSettings: AppSettings = {
   launch_on_startup: false,
   screenshot_shortcut: "Ctrl+Alt+A",
   screenshot_hide_window: false,
+  auto_check_updates: true,
+  skipped_update_version: "",
 }
 
 const emptyDesktopLayout: DesktopLayout = {
@@ -258,8 +260,18 @@ async function call<T>(command: string, args?: InvokeArgs): Promise<T> {
         download_url: "https://github.com/LAIJiangFeng/tauri-dustdesk/releases",
       }) as T
     }
-    if (command === "open_update_download") {
+    if (command === "open_update_download" || command === "dismiss_update_notice") {
       return undefined as T
+    }
+    if (command === "get_update_notice") {
+      return null as T
+    }
+    if (command === "update_update_settings") {
+      return normalizeSettings({
+        ...defaultSettings,
+        auto_check_updates: asBoolean(args?.autoCheckUpdates, defaultSettings.auto_check_updates),
+        skipped_update_version: asString(args?.skippedUpdateVersion, defaultSettings.skipped_update_version),
+      }) as T
     }
     if (command === "classify_desktop_items") {
       return {
@@ -460,6 +472,11 @@ function normalizeSettings(value: unknown): AppSettings {
       raw.screenshot_hide_window ?? raw.ScreenshotHideWindow,
       defaultSettings.screenshot_hide_window,
     ),
+    auto_check_updates: asBoolean(raw.auto_check_updates ?? raw.AutoCheckUpdates, defaultSettings.auto_check_updates),
+    skipped_update_version: asString(
+      raw.skipped_update_version ?? raw.SkippedUpdateVersion,
+      defaultSettings.skipped_update_version,
+    ),
   }
 }
 
@@ -538,6 +555,12 @@ function normalizeSearchOverlay(value: unknown): SearchOverlayData {
     recent: asArray(raw.recent ?? raw.Recent).map(normalizeSearchItem),
     frequent: asArray(raw.frequent ?? raw.Frequent).map(normalizeSearchItem),
   }
+}
+
+export function normalizeUpdateNotice(value: unknown): AppUpdateInfo | null {
+  if (!value || typeof value !== "object") return null
+  const update = normalizeUpdateInfo(value)
+  return update.update_available ? update : null
 }
 
 function normalizeUpdateInfo(value: unknown): AppUpdateInfo {
@@ -927,6 +950,9 @@ interface DustDeskState {
   startScreenshot: () => Promise<void>
   checkForUpdates: () => Promise<AppUpdateInfo>
   openUpdateDownload: (downloadUrl: string) => Promise<void>
+  getUpdateNotice: () => Promise<AppUpdateInfo | null>
+  dismissUpdateNotice: () => Promise<void>
+  updateUpdateSettings: (options: { autoCheckUpdates?: boolean; skippedUpdateVersion?: string }) => Promise<AppSettings>
 }
 
 export const useDustDeskStore = create<DustDeskState>()(
@@ -1460,6 +1486,23 @@ export const useDustDeskStore = create<DustDeskState>()(
       await call("open_update_download", {
         downloadUrl,
       })
+    },
+    getUpdateNotice: async () => {
+      const update = await call<unknown>("get_update_notice")
+      return normalizeUpdateNotice(update)
+    },
+    dismissUpdateNotice: async () => {
+      await call("dismiss_update_notice")
+    },
+    updateUpdateSettings: async (options) => {
+      const settings = await call<AppSettings>("update_update_settings", {
+        autoCheckUpdates: options.autoCheckUpdates,
+        skippedUpdateVersion: options.skippedUpdateVersion,
+      })
+      set((state) => {
+        state.snapshot.settings = normalizeSettings(settings)
+      })
+      return normalizeSettings(settings)
     },
   })),
 )

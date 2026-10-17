@@ -12,6 +12,7 @@ import { ScreenshotPinPage } from "@/pages/screenshot-pin-page"
 import { SearchOverlayPage } from "@/pages/search-overlay-page"
 import { SearchPage } from "@/pages/search-page"
 import { SettingsPage } from "@/pages/settings-page"
+import { UpdateNoticePage } from "@/pages/update-notice-page"
 
 export function AppRoutes() {
   return (
@@ -20,6 +21,7 @@ export function AppRoutes() {
       <Route path="search-overlay" element={<SearchOverlayPage />} />
       <Route path="screenshot-overlay" element={<ScreenshotOverlayPage />} />
       <Route path="screenshot-pin" element={<ScreenshotPinPage />} />
+      <Route path="update-notice" element={<UpdateNoticePage />} />
       <Route path="desktop-widget" element={<DesktopWidgetPage />} />
       <Route path="desktop-card/:kind" element={<DesktopCardWindowPage />} />
       <Route path="desktop-card/:kind/:index" element={<DesktopCardWindowPage />} />

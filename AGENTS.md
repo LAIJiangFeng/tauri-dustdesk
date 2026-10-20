@@ -68,6 +68,14 @@
 - 已解析过的 Shell 图标应在前端内存中缓存。快照刷新后优先复用缓存图标，只对新增路径异步调用 `resolve_path_icons`，避免同一路径反复解析导致卡顿。
 - 只有明确需要桌面项目列表的页面，才执行完整桌面扫描和图标提取。
 
+## 桌面框贴边隐藏
+
+- 贴边隐藏配置按窗口 label 存在 `DesktopLayout.EdgeHide`，几何与收起/展开状态以后端 `desktop_edge_hide.rs` 为唯一权威；分类重排时配置与运行时状态都要像 `Windows` 一样重映射 label。
+- 窄条几何永远不能写进 `DesktopLayout.Windows`。`save_desktop_window_layout` 对已开启贴边的框：收起中直接返回，展开中在锁外等主键松开后重新贴边再保存；收起前也要先提交当前展开矩形。
+- 收起时先 `set_resizable(false)`、把最小尺寸降到物理 1×1，再改尺寸和位置；展开后再恢复 `desktop_window_min_logical_size` 与 `set_resizable(!locked)`。`apply_desktop_window_state` 对收起中的窗口必须保持不可缩放，所有放置路径在 `show()` 前调用 `reapply_after_placement`。
+- 展开后的离开检测用 `desktop_edge_hide_pointer` 光标轮询，只在展开态轮询；不要依赖 DOM mouseleave，无边框窗口边缘的缩放热区会误报离开导致反复闪烁。菜单、右键菜单、操作遮罩用 `data-edge-hide-hold` 标记占用。
+- 锁顺序固定为 `LAZY_WINDOW_OPERATION_LOCK` → 贴边锁 → `CONFIG_MUTATION_LOCK`，不能在 `with_config_mutation` 闭包里重新应用贴边；等待鼠标松开时不得持锁。
+
 ## 相关验证
 
 - 修改 Tauri 窗口逻辑后，在 `src-tauri` 下运行 `cargo check`。

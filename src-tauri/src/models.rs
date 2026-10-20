@@ -68,6 +68,57 @@ pub struct DesktopLayout {
 
     #[serde(rename = "Windows", alias = "windows", default)]
     pub windows: BTreeMap<String, DesktopWindowLayout>,
+
+    #[serde(
+        rename = "EdgeHide",
+        alias = "edge_hide",
+        default,
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub edge_hide: BTreeMap<String, DesktopEdgeHideConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DesktopEdge {
+    #[default]
+    Top,
+    Left,
+    Right,
+    Bottom,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DesktopEdgeHideMode {
+    #[default]
+    Auto,
+    Top,
+    Left,
+    Right,
+    Bottom,
+}
+
+impl DesktopEdgeHideMode {
+    pub fn fixed_edge(self) -> Option<DesktopEdge> {
+        match self {
+            Self::Auto => None,
+            Self::Top => Some(DesktopEdge::Top),
+            Self::Left => Some(DesktopEdge::Left),
+            Self::Right => Some(DesktopEdge::Right),
+            Self::Bottom => Some(DesktopEdge::Bottom),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct DesktopEdgeHideConfig {
+    pub enabled: bool,
+    pub mode: DesktopEdgeHideMode,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edge: Option<DesktopEdge>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

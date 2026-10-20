@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod clipboard_bridge;
+mod desktop_edge_hide;
 mod models;
 mod screenshot;
 mod store;
@@ -620,6 +621,7 @@ fn reorder_category_impl(
     })?;
 
     if from_index != to_index {
+        desktop_edge_hide::remap_runtime_after_category_reorder(from_index, to_index)?;
         reconcile_reordered_category_windows(
             app,
             &categories,
@@ -698,6 +700,16 @@ fn reorder_category_config(
             let mapped_label =
                 remap_desktop_category_window_label(&label, from_index, to_index).unwrap_or(label);
             (mapped_label, layout)
+        })
+        .collect();
+
+    let previous_edge_hide = std::mem::take(&mut config.desktop_layout.edge_hide);
+    config.desktop_layout.edge_hide = previous_edge_hide
+        .into_iter()
+        .map(|(label, edge_hide)| {
+            let mapped_label =
+                remap_desktop_category_window_label(&label, from_index, to_index).unwrap_or(label);
+            (mapped_label, edge_hide)
         })
         .collect();
     Ok(())
@@ -2244,6 +2256,10 @@ async fn toggle_desktop_launcher_frame(
 async fn save_desktop_window_layout(app: tauri::AppHandle, label: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         if !is_desktop_card_window_label(&label) {
+            return Ok(());
+        }
+        // 贴边隐藏的框由贴边模块等待松手、重新贴边并保存，窄条几何永远不写进布局。
+        if desktop_edge_hide::commit_user_layout_change(&app, &label)? {
             return Ok(());
         }
         let Some(window) = app.get_webview_window(&label) else {
@@ -8461,7 +8477,7 @@ fn is_noise_search_dir(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::DesktopLayout;
+    use crate::models::{DesktopEdge, DesktopEdgeHideConfig, DesktopEdgeHideMode, DesktopLayout};
     use std::cell::{Cell, RefCell};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -8913,6 +8929,11 @@ mod tests {
             height: 240,
             ..DesktopWindowLayout::default()
         };
+        let edge_hide = |edge| DesktopEdgeHideConfig {
+            enabled: true,
+            mode: DesktopEdgeHideMode::Auto,
+            edge: Some(edge),
+        };
         let mut config = AppConfig {
             desktop_categories: vec![category("A"), category("B"), category("C"), category("D")],
             desktop_icon_positions: BTreeMap::new(),
@@ -8927,6 +8948,21 @@ mod tests {
                     ("desktop-category-2".to_owned(), layout(30)),
                     ("desktop-category-2-monitor-a1b2".to_owned(), layout(31)),
                     ("desktop-widget".to_owned(), layout(90)),
+                ]),
+                edge_hide: BTreeMap::from([
+                    (
+                        "desktop-category-0".to_owned(),
+                        edge_hide(DesktopEdge::Left),
+                    ),
+                    (
+                        "desktop-category-0-monitor-a1b2".to_owned(),
+                        edge_hide(DesktopEdge::Bottom),
+                    ),
+                    (
+                        "desktop-category-2".to_owned(),
+                        edge_hide(DesktopEdge::Right),
+                    ),
+                    ("desktop-launcher".to_owned(), edge_hide(DesktopEdge::Top)),
                 ]),
             },
         };
@@ -8953,6 +8989,18 @@ mod tests {
             11
         );
         assert_eq!(config.desktop_layout.windows["desktop-widget"].x, 90);
+        let edge_of = |label: &str| config.desktop_layout.edge_hide[label].edge;
+        assert_eq!(edge_of("desktop-category-2"), Some(DesktopEdge::Left));
+        assert_eq!(
+            edge_of("desktop-category-2-monitor-a1b2"),
+            Some(DesktopEdge::Bottom)
+        );
+        assert_eq!(edge_of("desktop-category-1"), Some(DesktopEdge::Right));
+        assert_eq!(edge_of("desktop-launcher"), Some(DesktopEdge::Top));
+        assert!(!config
+            .desktop_layout
+            .edge_hide
+            .contains_key("desktop-category-0"));
     }
 
     #[test]
@@ -12207,6 +12255,12 @@ fn settle_desktop_windows_after_launch(app: &tauri::AppHandle) {
 fn show_desktop_background_window(window: &WebviewWindow) -> Result<(), String> {
     let state = load_desktop_window_state()?;
     apply_desktop_window_state(window, state)?;
+    if let Err(error) = desktop_edge_hide::reapply_after_placement(window) {
+        append_desktop_diagnostic(
+            "edge-hide-reapply-failed",
+            &format!("label={} error={}", window.label(), error),
+        );
+    }
     keep_desktop_window_behind_apps(window);
     window.show().map_err(to_message)?;
     keep_desktop_window_behind_apps(window);
@@ -12676,7 +12730,11 @@ fn apply_desktop_window_state(
         let _ = apply_saved_desktop_window_layout(window, &label);
     }
     window.set_maximizable(false).map_err(to_message)?;
-    window.set_resizable(!state.locked).map_err(to_message)?;
+    // 贴边收起的窄条必须保持不可缩放，否则缩放热区会吞掉窄条上的鼠标事件。
+    let collapsed = desktop_edge_hide::is_collapsed(window.label());
+    window
+        .set_resizable(!state.locked && !collapsed)
+        .map_err(to_message)?;
     window
         .set_ignore_cursor_events(state.click_through)
         .map_err(to_message)?;
@@ -13813,6 +13871,11 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            desktop_edge_hide::get_desktop_edge_hide,
+            desktop_edge_hide::set_desktop_edge_hide,
+            desktop_edge_hide::expand_desktop_edge_hide,
+            desktop_edge_hide::collapse_desktop_edge_hide,
+            desktop_edge_hide::desktop_edge_hide_pointer,
             load_snapshot,
             load_desktop_snapshot,
             resolve_path_icons,

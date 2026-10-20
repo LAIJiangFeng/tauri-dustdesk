@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type CSSProperties, type DragEvent as ReactDragEvent, type MouseEvent as ReactMouseEvent, type ReactNode } from "react"
 import { FileIcon } from "@/components/dustdesk/file-icon"
 import { ItemContextMenu, type ItemContextMenuAction } from "@/components/dustdesk/item-context-menu"
-import { useDesktopItemSelection } from "@/hooks/use-desktop-item-selection"
+import { desktopItemAttribute, desktopItemListAttribute, useDesktopItemSelection } from "@/hooks/use-desktop-item-selection"
 import type { DesktopWidgetSettings, DesktopWidgetViewMode } from "@/lib/desktop-widget-settings"
 import { desktopDropPositionFromDragEnd, didDragEndOutsideWindow, type DesktopDropPosition, waitForDustDeskPathDropAcceptance, writeDustDeskPathDrag } from "@/lib/dustdesk-dnd"
 import { cn, displayPathName, extensionFromPath } from "@/lib/utils"
@@ -192,10 +192,11 @@ export function DesktopBoxItemList({
     <>
       <div
         className={className}
+        {...{ [desktopItemListAttribute]: "" }}
         onClick={(event) => {
           // Clicks inside the menu portal bubble here through React; only real blank-area clicks clear.
           const target = event.target as HTMLElement
-          if (!event.currentTarget.contains(target) || target.closest("[data-desktop-box-item]")) return
+          if (!event.currentTarget.contains(target) || target.closest(`[${desktopItemAttribute}]`)) return
           selection.clearSelection()
         }}
       >
@@ -285,7 +286,7 @@ function DesktopBoxItem({
       type="button"
       title={entry.path}
       draggable={Boolean(dragPath)}
-      data-desktop-box-item=""
+      {...{ [desktopItemAttribute]: "" }}
       aria-pressed={selected}
       className={cn(
         "flex min-w-0 items-center text-white/90 transition",

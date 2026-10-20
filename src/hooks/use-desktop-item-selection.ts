@@ -2,6 +2,10 @@ import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as R
 
 /** Marks popups (context menus, settings panels) that should suspend box keyboard shortcuts. */
 export const desktopPopupAttribute = "data-dustdesk-popup"
+/** Marks one item button of a desktop box. */
+export const desktopItemAttribute = "data-desktop-box-item"
+/** Marks the item list container of a desktop box. */
+export const desktopItemListAttribute = "data-desktop-box-list"
 
 export interface DesktopItemSelectionShortcuts {
   onCopy: (paths: string[]) => void
@@ -102,11 +106,11 @@ export function useDesktopItemSelection(visiblePaths: string[], shortcuts: Deskt
         event.preventDefault()
         if (event.shiftKey) shortcuts.onCopyPath(selectedPaths)
         else shortcuts.onCopy(selectedPaths)
-      } else if (event.key === "Enter" && !ctrl && !event.shiftKey && hasSelection) {
+      } else if (event.key === "Enter" && !ctrl && !event.shiftKey && hasSelection && focusInItemList()) {
         // Also stops a focused item button from turning Enter into a click.
         event.preventDefault()
         if (!event.repeat) shortcuts.onOpen(selectedPaths)
-      } else if (event.key === "Delete" && !ctrl && !event.shiftKey && hasSelection) {
+      } else if (event.key === "Delete" && !ctrl && !event.shiftKey && hasSelection && focusInItemList()) {
         event.preventDefault()
         if (!event.repeat) shortcuts.onDelete(selectedPaths)
       }
@@ -117,6 +121,16 @@ export function useDesktopItemSelection(visiblePaths: string[], shortcuts: Deskt
   }, [])
 
   return { selectedPaths, isSelected, clearSelection, selectAll, handleItemClick, handleItemContextMenu }
+}
+
+/**
+ * Enter and Delete belong to the item list only while focus is nowhere in particular or inside
+ * the list; other focused controls (settings button, links...) keep their own key handling.
+ */
+function focusInItemList() {
+  const active = document.activeElement
+  if (!active || active === document.body || active === document.documentElement) return true
+  return Boolean(active.closest(`[${desktopItemAttribute}], [${desktopItemListAttribute}]`))
 }
 
 function shortcutsAvailable() {

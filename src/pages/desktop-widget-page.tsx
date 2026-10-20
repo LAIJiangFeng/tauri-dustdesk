@@ -38,9 +38,12 @@ import {
   type Icon,
 } from "@phosphor-icons/react"
 import { categoryBoxEntry, DesktopBoxItemList, recycleConfirmMessage, recycleResultNotice, restoreResultNotice } from "@/components/dustdesk/desktop-box-items"
+import { DesktopEdgeHideMenuSection } from "@/components/dustdesk/desktop-edge-hide-menu-section"
+import { DesktopEdgeHideShell } from "@/components/dustdesk/desktop-edge-hide-shell"
 import { SettingsMenuSection } from "@/components/dustdesk/settings-menu-section"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { useDesktopEdgeHide } from "@/hooks/use-desktop-edge-hide"
 import { usePersistCurrentWindowLayout } from "@/hooks/use-persist-current-window-layout"
 import { useDesktopWindowState } from "@/hooks/use-desktop-window-state"
 import { useTheme } from "@/hooks/use-theme"
@@ -61,7 +64,7 @@ import {
 import { repaintCurrentWindow, safeCurrentWebviewDragDropEvent, safeListen, startCurrentWindowDragging, startCurrentWindowResizeDragging } from "@/lib/tauri-window"
 import { cn, displayPathName, remapIndexAfterMove } from "@/lib/utils"
 import { useDustDeskStore } from "@/stores/dustdesk-store"
-import type { CategoryOrderChangedEvent, DesktopItem, DesktopOperationEvent, DesktopWindowState } from "@/types"
+import type { CategoryOrderChangedEvent, DesktopEdgeHideMode, DesktopEdgeHideState, DesktopItem, DesktopOperationEvent, DesktopWindowState } from "@/types"
 
 const activeCategoryKey = "dustdesk-desktop-widget-active-category"
 const layoutsStorageKey = "dustdesk-desktop-widget-layouts"
@@ -136,6 +139,11 @@ export function DesktopWidgetPage() {
   const [isMergingCategories, setIsMergingCategories] = useState(false)
   const [dropOperationLabel, setDropOperationLabel] = useState("")
   const desktopOperationLabel = isClassifyingDesktop ? notice || "正在智能收纳桌面..." : isRestoringDesktop ? notice || "正在还原桌面..." : isMergingCategories ? "正在合并分类..." : dropOperationLabel
+  const edgeHide = useDesktopEdgeHide({
+    fallbackLabel: "desktop-widget",
+    busy: openSettingsId !== "" || Boolean(desktopOperationLabel) || isClassifyingDesktop || isRestoringDesktop || isMergingCategories,
+    clickThrough: desktopWindowState.click_through,
+  })
   const hasSnapshot = Boolean(snapshot.data_dir)
   const dragRef = useRef<{
     id: string
@@ -764,6 +772,14 @@ export function DesktopWidgetPage() {
     }
   }
 
+  async function handleChangeEdgeHide(enabled: boolean, mode: DesktopEdgeHideMode) {
+    try {
+      await edgeHide.setEdgeHide(enabled, mode)
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : String(error))
+    }
+  }
+
   async function handleToggleDesktopWindowClickThrough() {
     try {
       const next = await setClickThrough(!desktopWindowState.click_through)
@@ -821,6 +837,9 @@ export function DesktopWidgetPage() {
     updateViewMode,
     onToggleDesktopWindowLocked: handleToggleDesktopWindowLocked,
     onToggleDesktopWindowClickThrough: handleToggleDesktopWindowClickThrough,
+    edgeHideState: edgeHide.state,
+    edgeHidePending: edgeHide.settingPending,
+    onChangeEdgeHide: (enabled: boolean, mode: DesktopEdgeHideMode) => void handleChangeEdgeHide(enabled, mode),
     onSplitCategory: () => (activeCategory ? handleSplitCategory(activeCategory.index) : Promise.resolve()),
     onSplitAllCategories: handleSplitAllCategories,
     onMergeAllCategories: handleMergeAllCategories,
@@ -840,71 +859,77 @@ export function DesktopWidgetPage() {
   }
 
   return (
-    <div className="desktop-widget-page h-screen w-screen overflow-hidden bg-transparent p-2 text-white">
-      <section
-        data-frame-id="organizer"
-        data-drop-zone={activeCategory?.id ?? "category:0"}
-        style={frameStyle}
-        className={cn(
-          "relative flex h-full w-full min-w-0 flex-col overflow-hidden rounded-2xl border border-white/15 backdrop-blur-2xl transition-colors",
-          activeCategory && (hoverZone === "organizer" || hoverZone === activeCategory.id) && "border-emerald-200/80",
-        )}
-      >
-        <div
-          className={desktopWindowState.locked ? "cursor-default" : "cursor-move"}
-          onPointerDown={(event) => {
-            if (desktopWindowState.locked) return
-            if ((event.target as HTMLElement).closest("button,input")) return
-            void startCurrentWindowDragging()
-          }}
+    <DesktopEdgeHideShell
+      controller={edgeHide}
+      handleBackground={desktopWidgetBackgroundColor({ ...settings, opacity: Math.max(settings.opacity, 0.7) })}
+      accentColor={activeCategory?.color ?? "rgba(255, 255, 255, 0.7)"}
+    >
+      <div className="desktop-widget-page relative h-full w-full overflow-hidden bg-transparent p-2 text-white">
+        <section
+          data-frame-id="organizer"
+          data-drop-zone={activeCategory?.id ?? "category:0"}
+          style={frameStyle}
+          className={cn(
+            "relative flex h-full w-full min-w-0 flex-col overflow-hidden rounded-2xl border border-white/15 backdrop-blur-2xl transition-colors",
+            activeCategory && (hoverZone === "organizer" || hoverZone === activeCategory.id) && "border-emerald-200/80",
+          )}
         >
-          <OrganizerTop
-            categories={groupedCategories}
-            activeId={activeCategory?.id ?? "category:0"}
-            hoverZone={hoverZone}
-            menuProps={menuProps}
-            openSettings={openSettingsId === "organizer"}
-            onActiveChange={setActiveCategoryId}
-            onOpenSettings={() => setOpenSettingsId((id) => (id === "organizer" ? "" : "organizer"))}
-            onSplitCategory={handleSplitCategory}
-            onReorderCategory={handleReorderCategory}
+          <div
+            className={desktopWindowState.locked ? "cursor-default" : "cursor-move"}
+            onPointerDown={(event) => {
+              if (desktopWindowState.locked) return
+              if ((event.target as HTMLElement).closest("button,input")) return
+              void startCurrentWindowDragging()
+            }}
+          >
+            <OrganizerTop
+              categories={groupedCategories}
+              activeId={activeCategory?.id ?? "category:0"}
+              hoverZone={hoverZone}
+              menuProps={menuProps}
+              openSettings={openSettingsId === "organizer"}
+              onActiveChange={setActiveCategoryId}
+              onOpenSettings={() => setOpenSettingsId((id) => (id === "organizer" ? "" : "organizer"))}
+              onSplitCategory={handleSplitCategory}
+              onReorderCategory={handleReorderCategory}
+            />
+          </div>
+          {activeCategory ? (
+            <CategoryItems
+              category={snapshot.categories[activeCategory.index]}
+              categoryIndex={activeCategory.index}
+              settings={itemSettings}
+              onOpen={openPath}
+              onShowInFolder={showPathInFolder}
+              onRestoreDragOut={handleRestoreDragOut}
+            />
+          ) : (
+            <EmptyDropHint title="分类都已拆出" detail="在设置里点一键合并分类，就会回到这个分类组。" />
+          )}
+          {desktopOperationLabel ? <WidgetOperationOverlay label={desktopOperationLabel} /> : null}
+        </section>
+        {notice ? (
+          <div className="pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full bg-slate-950/70 px-3 py-1 text-xs text-white/80 ring-1 ring-white/10">{notice}</div>
+        ) : null}
+        {!desktopWindowState.locked ? (
+          <button
+            type="button"
+            className="no-drag absolute bottom-0 right-0 size-6 cursor-nwse-resize rounded-br-2xl border-b-2 border-r-2 border-white/35"
+            aria-label="调整桌面框窗口大小"
+            onPointerDown={(event) => {
+              event.preventDefault()
+              void startCurrentWindowResizeDragging("SouthEast")
+            }}
           />
-        </div>
-        {activeCategory ? (
-          <CategoryItems
-            category={snapshot.categories[activeCategory.index]}
-            categoryIndex={activeCategory.index}
-            settings={itemSettings}
-            onOpen={openPath}
-            onShowInFolder={showPathInFolder}
-            onRestoreDragOut={handleRestoreDragOut}
-          />
-        ) : (
-          <EmptyDropHint title="分类都已拆出" detail="在设置里点一键合并分类，就会回到这个分类组。" />
-        )}
-        {desktopOperationLabel ? <WidgetOperationOverlay label={desktopOperationLabel} /> : null}
-      </section>
-      {notice ? (
-        <div className="pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full bg-slate-950/70 px-3 py-1 text-xs text-white/80 ring-1 ring-white/10">{notice}</div>
-      ) : null}
-      {!desktopWindowState.locked ? (
-        <button
-          type="button"
-          className="no-drag absolute bottom-0 right-0 size-6 cursor-nwse-resize rounded-br-2xl border-b-2 border-r-2 border-white/35"
-          aria-label="调整桌面框窗口大小"
-          onPointerDown={(event) => {
-            event.preventDefault()
-            void startCurrentWindowResizeDragging("SouthEast")
-          }}
-        />
-      ) : null}
-    </div>
+        ) : null}
+      </div>
+    </DesktopEdgeHideShell>
   )
 }
 
 function WidgetOperationOverlay({ label }: { label: string }) {
   return (
-    <div className="no-drag pointer-events-none absolute inset-0 z-40 grid place-items-center bg-slate-950/60 backdrop-blur-md">
+    <div data-edge-hide-hold="" className="no-drag pointer-events-none absolute inset-0 z-40 grid place-items-center bg-slate-950/60 backdrop-blur-md">
       <div className="flex items-center gap-2 rounded-xl border border-white/15 bg-slate-950/90 px-3 py-2 text-xs font-semibold text-white shadow-2xl shadow-black/30">
         <ArrowsClockwise className="size-4 animate-spin text-emerald-300" weight="duotone" />
         <span>{label}</span>
@@ -982,6 +1007,9 @@ interface SettingsMenuProps {
   updateViewMode: (viewMode: DesktopWidgetViewMode) => void
   onToggleDesktopWindowLocked: () => Promise<void>
   onToggleDesktopWindowClickThrough: () => Promise<void>
+  edgeHideState: DesktopEdgeHideState | null
+  edgeHidePending: boolean
+  onChangeEdgeHide: (enabled: boolean, mode: DesktopEdgeHideMode) => void
   onSplitCategory: () => Promise<void>
   onSplitAllCategories: () => Promise<void>
   onMergeAllCategories: () => Promise<void>
@@ -1099,6 +1127,9 @@ function SettingsMenu({
   updateViewMode,
   onToggleDesktopWindowLocked,
   onToggleDesktopWindowClickThrough,
+  edgeHideState,
+  edgeHidePending,
+  onChangeEdgeHide,
   onSplitCategory,
   onSplitAllCategories,
   onMergeAllCategories,
@@ -1113,6 +1144,7 @@ function SettingsMenu({
 }: SettingsMenuProps & { kind: "organizer" | "category" | "launcher" }) {
   return (
     <div
+      data-edge-hide-hold=""
       className="desktop-widget-scroll absolute right-0 top-8 z-50 max-h-[min(440px,calc(100vh-4rem))] w-64 max-w-[calc(100vw-1rem)] space-y-1.5 overflow-x-hidden overflow-y-auto overscroll-contain rounded-2xl border border-white/15 bg-slate-950/90 p-1.5 text-white shadow-2xl shadow-black/35 backdrop-blur-2xl"
       aria-label="桌面框设置"
       data-dustdesk-popup=""
@@ -1153,6 +1185,7 @@ function SettingsMenu({
         />
         <MenuButton icon={X} label="隐藏桌面框" onClick={() => void onHide()} />
       </SettingsMenuSection>
+      <DesktopEdgeHideMenuSection state={edgeHideState} pending={edgeHidePending} onChange={onChangeEdgeHide} />
       <SettingsMenuSection title="外观与排版">
         <RangeRow label="卡片透明度" min={0.25} max={0.85} step={0.05} value={settings.opacity} onChange={(opacity) => updateSettings({ opacity })} />
         <ColorRow value={settings.backgroundColor} onChange={(backgroundColor) => updateSettings({ backgroundColor })} />

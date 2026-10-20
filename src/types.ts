@@ -223,3 +223,29 @@ export interface ScreenshotPinInfo {
   width: number
   height: number
 }
+
+export type DesktopEdge = "top" | "left" | "right" | "bottom"
+
+export type DesktopEdgeHideMode = "auto" | DesktopEdge
+
+export interface DesktopEdgeHideRect {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+export interface DesktopEdgeHideState {
+  label: string
+  enabled: boolean
+  mode: DesktopEdgeHideMode
+  edge: DesktopEdge | null
+  collapsed: boolean
+  expanded: DesktopEdgeHideRect
+  scale_factor: number
+}
+
+export interface DesktopEdgeHidePointer {
+  inside: boolean
+  primary_button_down: boolean
+}

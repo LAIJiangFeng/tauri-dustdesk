@@ -180,6 +180,10 @@ function focusInItemList() {
 
 function shortcutsAvailable() {
   if (!document.hasFocus()) return false
+  // A collapsed edge-hidden box keeps its item list mounted but invisible (and may keep focus);
+  // items the user cannot see must not react to keys.
+  const list = document.querySelector(`[${desktopItemListAttribute}]`)
+  if (list instanceof HTMLElement && getComputedStyle(list).visibility === "hidden") return false
   const active = document.activeElement
   if (active instanceof HTMLElement) {
     if (active.isContentEditable) return false

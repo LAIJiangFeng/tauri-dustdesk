@@ -3,8 +3,6 @@ import {
   useMemo,
   useRef,
   useState,
-  type CSSProperties,
-  type DragEvent as ReactDragEvent,
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
   type WheelEvent as ReactWheelEvent,
@@ -39,15 +37,14 @@ import {
   X,
   type Icon,
 } from "@phosphor-icons/react"
-import { FileIcon } from "@/components/dustdesk/file-icon"
-import { ItemContextMenu, type ItemContextMenuAction } from "@/components/dustdesk/item-context-menu"
+import { categoryBoxEntry, DesktopBoxItemList, recycleConfirmMessage, recycleResultNotice, restoreResultNotice } from "@/components/dustdesk/desktop-box-items"
 import { SettingsMenuSection } from "@/components/dustdesk/settings-menu-section"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { usePersistCurrentWindowLayout } from "@/hooks/use-persist-current-window-layout"
 import { useDesktopWindowState } from "@/hooks/use-desktop-window-state"
 import { useTheme } from "@/hooks/use-theme"
-import { allowPathLikeDrag, desktopDropPositionFromDragEnd, didDragEndOutsideWindow, hasDustDeskPathDrag, markDustDeskPathDropAccepted, readDustDeskPathDrag, registerDustDeskDropCategory, type DesktopDropPosition, waitForDustDeskPathDropAcceptance, writeDustDeskPathDrag } from "@/lib/dustdesk-dnd"
+import { allowPathLikeDrag, hasDustDeskPathDrag, markDustDeskPathDropAccepted, readDustDeskPathDrag, registerDustDeskDropCategory, type DesktopDropPosition } from "@/lib/dustdesk-dnd"
 import {
   desktopWidgetBackgroundColor,
   desktopWidgetCategoryViewScope,
@@ -62,7 +59,7 @@ import {
   type DesktopWidgetViewMode,
 } from "@/lib/desktop-widget-settings"
 import { repaintCurrentWindow, safeCurrentWebviewDragDropEvent, safeListen, startCurrentWindowDragging, startCurrentWindowResizeDragging } from "@/lib/tauri-window"
-import { cn, displayPathName, extensionFromPath, remapIndexAfterMove } from "@/lib/utils"
+import { cn, displayPathName, remapIndexAfterMove } from "@/lib/utils"
 import { useDustDeskStore } from "@/stores/dustdesk-store"
 import type { CategoryOrderChangedEvent, DesktopItem, DesktopOperationEvent, DesktopWindowState } from "@/types"
 
@@ -115,7 +112,6 @@ export function DesktopWidgetPage() {
   const addItemsToCategoryLight = useDustDeskStore((state) => state.addItemsToCategoryLight)
   const addLaunchersLight = useDustDeskStore((state) => state.addLaunchersLight)
   const removeLauncher = useDustDeskStore((state) => state.removeLauncher)
-  const restoreItemToDesktopLight = useDustDeskStore((state) => state.restoreItemToDesktopLight)
   const completeInternalPathDragLight = useDustDeskStore((state) => state.completeInternalPathDragLight)
   const startRestoreAllToDesktopTask = useDustDeskStore((state) => state.startRestoreAllToDesktopTask)
   const showPathInFolder = useDustDeskStore((state) => state.showPathInFolder)
@@ -881,7 +877,6 @@ export function DesktopWidgetPage() {
             settings={itemSettings}
             onOpen={openPath}
             onShowInFolder={showPathInFolder}
-            onRestoreToDesktop={restoreItemToDesktopLight}
             onRestoreDragOut={handleRestoreDragOut}
           />
         ) : (
@@ -1120,6 +1115,7 @@ function SettingsMenu({
     <div
       className="desktop-widget-scroll absolute right-0 top-8 z-50 max-h-[min(440px,calc(100vh-4rem))] w-64 max-w-[calc(100vw-1rem)] space-y-1.5 overflow-x-hidden overflow-y-auto overscroll-contain rounded-2xl border border-white/15 bg-slate-950/90 p-1.5 text-white shadow-2xl shadow-black/35 backdrop-blur-2xl"
       aria-label="桌面框设置"
+      data-dustdesk-popup=""
     >
       {kind !== "launcher" ? (
         <>
@@ -1498,7 +1494,6 @@ function CategoryItems({
   settings,
   onOpen,
   onShowInFolder,
-  onRestoreToDesktop,
   onRestoreDragOut,
 }: {
   category?: { name: string; item_details: DesktopItem[] }
@@ -1506,198 +1501,44 @@ function CategoryItems({
   settings: WidgetItemSettings
   onOpen: (path: string) => Promise<void>
   onShowInFolder: (path: string) => Promise<void>
-  onRestoreToDesktop: (index: number, path: string) => Promise<string>
   onRestoreDragOut: (index: number, path: string, position: DesktopDropPosition) => Promise<void>
 }) {
+  const restoreItemsToDesktopLight = useDustDeskStore((state) => state.restoreItemsToDesktopLight)
+  const deleteCategoryItemsToRecycleBinLight = useDustDeskStore((state) => state.deleteCategoryItemsToRecycleBinLight)
   const items = category?.item_details ?? []
   if (items.length === 0) {
     return <EmptyDropHint title="暂无项目" detail="把桌面文件拖到这里，会自动收纳进这个分类。" />
   }
 
   return (
-    <div className="desktop-widget-scroll h-full overflow-auto">
-      <WidgetGrid settings={settings}>
-        {items.map((item) => (
-          <WidgetItem
-            key={item.path}
-            name={item.name || displayPathName(item.path)}
-            path={item.path}
-            extension={item.extension || extensionFromPath(item.path)}
-            isDir={item.is_dir}
-            iconDataUrl={item.icon_data_url}
-            dragPath={item.path}
-            dragEffectAllowed="copyMove"
-            settings={settings}
-            onOpen={onOpen}
-            onDragEndOutside={(position) => onRestoreDragOut(categoryIndex, item.path, position)}
-            actions={[
-              {
-                label: "打开",
-                icon: "open",
-                onSelect: () => onOpen(item.path),
-              },
-              {
-                label: "在资源管理器中显示",
-                icon: "folder",
-                onSelect: () => onShowInFolder(item.path),
-              },
-              {
-                label: "移回桌面",
-                icon: "restore",
-                onSelect: async () => {
-                  await onRestoreToDesktop(categoryIndex, item.path)
-                },
-              },
-            ]}
-          />
-        ))}
-      </WidgetGrid>
-    </div>
-  )
-}
-
-function LauncherItems({
-  launchers,
-  settings,
-  onOpen,
-  onStartAll,
-  onShowInFolder,
-  onRemoveLauncher,
-}: {
-  launchers: { name: string; path: string; icon_data_url?: string }[]
-  settings: WidgetItemSettings
-  onOpen: (path: string) => Promise<void>
-  onStartAll: () => Promise<void>
-  onShowInFolder: (path: string) => Promise<void>
-  onRemoveLauncher: (path: string) => Promise<void>
-}) {
-  if (launchers.length === 0) {
-    return <EmptyDropHint title="暂无启动项" detail="把快捷方式、程序或常用文件拖到这里。" />
-  }
-
-  return (
-    <div className="flex h-full min-h-0 flex-col">
-      <div className="desktop-widget-scroll min-h-0 flex-1 overflow-auto">
-        <WidgetGrid settings={settings}>
-          {launchers.map((item, index) => (
-            <WidgetItem
-              key={`${item.path}-${index}`}
-              name={item.name || displayPathName(item.path)}
-              path={item.path}
-              extension={extensionFromPath(item.path)}
-              isDir={false}
-              iconDataUrl={item.icon_data_url}
-              settings={settings}
-              onOpen={onOpen}
-              actions={[
-                {
-                  label: "启动",
-                  icon: "open",
-                  onSelect: () => onOpen(item.path),
-                },
-                {
-                  label: "在资源管理器中显示",
-                  icon: "folder",
-                  onSelect: () => onShowInFolder(item.path),
-                },
-                {
-                  label: "从快捷启动移除",
-                  icon: "remove",
-                  tone: "danger",
-                  onSelect: () => onRemoveLauncher(item.path),
-                },
-              ]}
-            />
-          ))}
-        </WidgetGrid>
-      </div>
-      <button className="sr-only" type="button" onClick={() => void onStartAll()}>
-        启动全部
-      </button>
-    </div>
-  )
-}
-
-function WidgetGrid({ settings, children }: { settings: WidgetItemSettings; children: ReactNode }) {
-  const isList = settings.viewMode === "list"
-  const itemSize = isList ? Math.round(Math.max(28, Math.min(38, settings.iconSize * 0.68))) : settings.iconSize
-  const style = {
-    "--widget-item-size": `${itemSize}px`,
-    ...(isList
-      ? {}
-      : {
-          gridTemplateColumns: `repeat(auto-fill, minmax(${Math.max(76, settings.iconSize + 48)}px, 1fr))`,
-        }),
-  } as CSSProperties
-
-  return (
-    <div className={cn(isList ? "flex flex-col gap-0.5 p-2 pb-6" : "grid gap-2 p-3 pb-6")} style={style} data-view-mode={settings.viewMode}>
-      {children}
-    </div>
-  )
-}
-
-function WidgetItem({
-  name,
-  path,
-  extension,
-  iconDataUrl,
-  dragPath,
-  dragEffectAllowed,
-  isDir,
-  settings,
-  onOpen,
-  onDragEndOutside,
-  actions,
-}: {
-  name: string
-  path: string
-  extension: string
-  isDir?: boolean
-  iconDataUrl?: string
-  dragPath?: string
-  dragEffectAllowed?: DataTransfer["effectAllowed"]
-  settings: WidgetItemSettings
-  onOpen: (path: string) => Promise<void>
-  onDragEndOutside?: (position: DesktopDropPosition) => unknown
-  actions?: ItemContextMenuAction[]
-}) {
-  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null)
-  const isList = settings.viewMode === "list"
-
-  return (
-    <button
-      type="button"
-      title={path}
-      draggable={Boolean(dragPath)}
-      className={cn(
-        "flex min-w-0 items-center text-white/90 transition",
-        isList
-          ? "min-h-11 flex-row gap-2 rounded-lg border border-transparent bg-transparent px-2 py-1.5 text-left hover:border-white/10 hover:bg-white/10"
-          : "flex-col gap-2 rounded-xl border border-white/10 bg-white/10 p-2 text-center hover:border-white/25 hover:bg-white/15",
-      )}
-      onDragStart={(event) => {
-        if (!dragPath) return
-        writeDustDeskPathDrag(event.dataTransfer, dragPath, dragEffectAllowed)
-      }}
-      onDragEnd={(event: ReactDragEvent<HTMLButtonElement>) => {
-        if (!dragPath || !onDragEndOutside || !didDragEndOutsideWindow(event)) return
-        const position = desktopDropPositionFromDragEnd(event)
-        void waitForDustDeskPathDropAcceptance(event.dataTransfer, dragPath).then((accepted) => {
-          if (accepted) return
-          return Promise.resolve(onDragEndOutside(position)).catch(() => undefined)
-        })
-      }}
-      onDoubleClick={() => void onOpen(path)}
-      onContextMenu={(event) => {
-        event.preventDefault()
-        setMenu({ x: event.clientX, y: event.clientY })
-      }}
-    >
-      <FileIcon name={name} extension={extension} isDir={isDir} iconDataUrl={iconDataUrl} className={cn("widget-item-icon bg-white/10 text-white/70", isList && "rounded-md")} />
-      {isList || settings.showNames ? <span className={cn("truncate text-xs font-semibold", isList ? "min-w-0 flex-1 text-left leading-5" : "w-full")}>{name}</span> : null}
-      {menu && actions ? <ItemContextMenu x={menu.x} y={menu.y} actions={actions} onClose={() => setMenu(null)} /> : null}
-    </button>
+    <DesktopBoxItemList
+      className="desktop-widget-scroll h-full overflow-auto"
+      entries={items.map(categoryBoxEntry)}
+      settings={settings}
+      dragEffectAllowed="copyMove"
+      openLabel="打开"
+      removeLabel="删除"
+      confirmRemove={recycleConfirmMessage}
+      onOpen={onOpen}
+      onRemove={async (paths) => recycleResultNotice(await deleteCategoryItemsToRecycleBinLight(categoryIndex, paths))}
+      onDragEndOutside={(path, position) => onRestoreDragOut(categoryIndex, path, position)}
+      menuActions={({ path, paths, common, run }) => [
+        common.open,
+        common.copy,
+        common.copyPath,
+        {
+          label: "在资源管理器中显示",
+          icon: "folder",
+          onSelect: () => run(() => onShowInFolder(path)),
+        },
+        {
+          label: "移回桌面",
+          icon: "restore",
+          onSelect: () => run(async () => restoreResultNotice(await restoreItemsToDesktopLight(categoryIndex, paths))),
+        },
+        common.remove,
+      ]}
+    />
   )
 }
 

@@ -146,6 +146,25 @@ pub fn copy_png_to_clipboard_with_history(png_bytes: &[u8]) -> Result<(), String
     Ok(())
 }
 
+/// Puts existing files on the clipboard as CF_HDROP (copy semantics). File copies are not
+/// clipboard history entries, matching Explorer, so the monitor is suppressed for this write.
+pub fn copy_files_to_clipboard(paths: &[String]) -> Result<(), String> {
+    if paths.is_empty() {
+        return Err("没有可复制的项目".to_owned());
+    }
+    suppress_clipboard_monitor_for(Duration::from_secs(3));
+    set_files_clipboard(paths)
+}
+
+/// Writes plain text without suppressing the monitor, so a copied path enters text history
+/// just like Explorer's "Copy as path".
+pub fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
+    if text.is_empty() {
+        return Err("没有可复制的文本".to_owned());
+    }
+    set_text_clipboard(text)
+}
+
 pub fn image_base64(id: &str) -> Result<String, String> {
     let store = AppStore::open().map_err(to_message)?;
     let clipboard = store.load_clipboard();
@@ -614,6 +633,27 @@ fn set_png_image_clipboard(_png_bytes: &[u8]) -> Result<(), String> {
     Err("当前平台暂不支持写入图片剪贴板".to_owned())
 }
 
+#[cfg(not(windows))]
+fn set_files_clipboard(_paths: &[String]) -> Result<(), String> {
+    Err("当前平台暂不支持复制文件到剪贴板".to_owned())
+}
+
+#[cfg(not(windows))]
+fn set_text_clipboard(_text: &str) -> Result<(), String> {
+    Err("当前平台暂不支持写入剪贴板".to_owned())
+}
+
+#[cfg(windows)]
+fn set_files_clipboard(paths: &[String]) -> Result<(), String> {
+    let paths = paths.iter().map(String::as_str).collect::<Vec<_>>();
+    windows_clipboard::set_files(&paths)
+}
+
+#[cfg(windows)]
+fn set_text_clipboard(text: &str) -> Result<(), String> {
+    windows_clipboard::set_text(text)
+}
+
 #[cfg(windows)]
 fn set_png_image_clipboard(png_bytes: &[u8]) -> Result<(), String> {
     windows_clipboard::set_png_image(png_bytes)
@@ -668,9 +708,7 @@ mod windows_clipboard {
                 IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW,
                 SetClipboardData,
             },
-            Memory::{
-                GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE, GMEM_ZEROINIT,
-            },
+            Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE},
             Threading::{AttachThreadInput, GetCurrentThreadId},
         },
         UI::{
@@ -841,7 +879,7 @@ mod windows_clipboard {
         Some(bytes)
     }
 
-    fn set_text(text: &str) -> Result<(), String> {
+    pub fn set_text(text: &str) -> Result<(), String> {
         let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
         let bytes_len = wide.len() * std::mem::size_of::<u16>();
 
@@ -954,11 +992,28 @@ mod windows_clipboard {
     }
 
     fn hdrop_from_file_path(path: &str) -> Result<windows_sys::Win32::Foundation::HANDLE, String> {
-        let wide_path = path
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .chain(std::iter::once(0))
-            .collect::<Vec<_>>();
+        hdrop_from_file_paths(&[path])
+    }
+
+    /// Builds a CF_HDROP global: a `DROPFILES` header followed by wide paths, each terminated
+    /// by one NUL, with an extra NUL ending the list.
+    pub(super) fn hdrop_from_file_paths(
+        paths: &[&str],
+    ) -> Result<windows_sys::Win32::Foundation::HANDLE, String> {
+        let bytes = hdrop_bytes(paths)?;
+        global_alloc_bytes(&bytes, "无法分配文件剪贴板内存")
+    }
+
+    pub(super) fn hdrop_bytes(paths: &[&str]) -> Result<Vec<u8>, String> {
+        if paths.is_empty() {
+            return Err("没有可写入剪贴板的文件".to_owned());
+        }
+        let mut wide_paths = Vec::<u16>::new();
+        for path in paths {
+            wide_paths.extend(path.encode_utf16());
+            wide_paths.push(0);
+        }
+        wide_paths.push(0);
         let header = DROPFILES {
             pFiles: std::mem::size_of::<DROPFILES>() as u32,
             pt: windows_sys::Win32::Foundation::POINT { x: 0, y: 0 },
@@ -966,36 +1021,67 @@ mod windows_clipboard {
             fWide: 1,
         };
         let header_size = std::mem::size_of::<DROPFILES>();
-        let paths_size = wide_path.len() * std::mem::size_of::<u16>();
+        let paths_size = wide_paths.len() * std::mem::size_of::<u16>();
         let total_size = header_size
             .checked_add(paths_size)
-            .ok_or_else(|| "图片文件路径过长".to_owned())?;
-        let handle = unsafe { GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, total_size) };
-        if handle.is_null() {
-            return Err("无法分配图片文件剪贴板内存".to_owned());
+            .ok_or_else(|| "文件路径过长".to_owned())?;
+        let mut bytes = Vec::with_capacity(total_size);
+        // SAFETY: DROPFILES is a plain `repr(C)` struct; reading its bytes is well defined.
+        bytes.extend_from_slice(unsafe {
+            std::slice::from_raw_parts((&header as *const DROPFILES).cast::<u8>(), header_size)
+        });
+        for unit in wide_paths {
+            bytes.extend_from_slice(&unit.to_le_bytes());
         }
+        Ok(bytes)
+    }
+
+    /// Writes files to the clipboard the way Explorer's "Copy" does: CF_HDROP plus
+    /// "Preferred DropEffect" = DROPEFFECT_COPY, so pasting produces copies (Explorer, desktop)
+    /// or file attachments (WeChat, QQ).
+    pub fn set_files(paths: &[&str]) -> Result<(), String> {
+        let mut file_handle = Some(hdrop_from_file_paths(paths)?);
+        let mut drop_effect_handle =
+            match global_alloc_u32(DROPEFFECT_COPY, "无法分配文件复制语义剪贴板内存")
+            {
+                Ok(handle) => Some(handle),
+                Err(error) => {
+                    unsafe { free_global_handle(&mut file_handle) };
+                    return Err(error);
+                }
+            };
 
         unsafe {
-            let ptr = GlobalLock(handle) as *mut u8;
-            if ptr.is_null() {
-                GlobalFree(handle);
-                return Err("无法写入图片文件剪贴板内存".to_owned());
+            if OpenClipboard(null_mut()) == 0 {
+                free_global_handle(&mut file_handle);
+                free_global_handle(&mut drop_effect_handle);
+                return Err("无法打开系统剪贴板".to_owned());
             }
 
-            std::ptr::copy_nonoverlapping(
-                (&header as *const DROPFILES).cast::<u8>(),
-                ptr,
-                header_size,
-            );
-            std::ptr::copy_nonoverlapping(
-                wide_path.as_ptr().cast::<u8>(),
-                ptr.add(header_size),
-                paths_size,
-            );
-            GlobalUnlock(handle);
+            EmptyClipboard();
+            let Some(files) = file_handle.take() else {
+                CloseClipboard();
+                free_global_handle(&mut drop_effect_handle);
+                return Err("文件剪贴板数据为空".to_owned());
+            };
+            if SetClipboardData(CF_HDROP, files).is_null() {
+                CloseClipboard();
+                GlobalFree(files);
+                free_global_handle(&mut drop_effect_handle);
+                return Err("无法设置文件剪贴板".to_owned());
+            }
+
+            if let Some(handle) = drop_effect_handle.take() {
+                let format = RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT);
+                if format == 0 || SetClipboardData(format, handle).is_null() {
+                    GlobalFree(handle);
+                }
+            }
+
+            CloseClipboard();
         }
 
-        Ok(handle)
+        Ok(())
     }
 
     fn global_alloc_bytes(
@@ -1377,5 +1463,63 @@ mod windows_clipboard {
 
     fn write_i32(bytes: &mut [u8], offset: usize, value: i32) {
         bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{hdrop_bytes, DROPFILES};
+
+        fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+            u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+        }
+
+        fn wide_units(bytes: &[u8]) -> Vec<u16> {
+            bytes
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .collect()
+        }
+
+        #[test]
+        fn hdrop_bytes_lays_out_header_and_wide_paths() {
+            let paths = [r"C:\DustDesk\报告.docx", r"D:\资料\照片"];
+            let bytes = hdrop_bytes(&paths).unwrap();
+            let header_size = std::mem::size_of::<DROPFILES>();
+
+            // DROPFILES { pFiles, pt.x, pt.y, fNC, fWide }
+            assert_eq!(header_size, 20);
+            assert_eq!(read_u32(&bytes, 0) as usize, header_size);
+            assert_eq!(read_u32(&bytes, 4), 0);
+            assert_eq!(read_u32(&bytes, 8), 0);
+            assert_eq!(read_u32(&bytes, 12), 0);
+            assert_eq!(read_u32(&bytes, 16), 1);
+
+            let units = wide_units(&bytes[header_size..]);
+            let mut expected = Vec::<u16>::new();
+            for path in paths {
+                expected.extend(path.encode_utf16());
+                expected.push(0);
+            }
+            expected.push(0);
+            assert_eq!(units, expected);
+            assert_eq!(bytes.len(), header_size + expected.len() * 2);
+
+            let list = String::from_utf16(&units[..units.len() - 2]).unwrap();
+            assert_eq!(list.split(char::from(0)).collect::<Vec<_>>(), paths);
+            assert_eq!(&units[units.len() - 2..], &[0, 0]);
+        }
+
+        #[test]
+        fn hdrop_bytes_single_path_ends_with_double_nul() {
+            let bytes = hdrop_bytes(&[r"C:/a.txt"]).unwrap();
+            let units = wide_units(&bytes[std::mem::size_of::<DROPFILES>()..]);
+            assert_eq!(&units[units.len() - 2..], &[0, 0]);
+            assert_eq!(units.iter().filter(|unit| **unit == 0).count(), 2);
+        }
+
+        #[test]
+        fn hdrop_bytes_rejects_empty_list() {
+            assert!(hdrop_bytes(&[]).is_err());
+        }
     }
 }

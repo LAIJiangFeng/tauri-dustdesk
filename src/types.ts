@@ -27,6 +27,17 @@ export interface LaunchItem {
   icon_data_url?: string
 }
 
+export interface RecycleCategoryItemsResult {
+  recycled: number
+  skipped: number
+  errors: string[]
+}
+
+export interface RestoreItemsResult {
+  restored: number
+  errors: string[]
+}
+
 export interface ClassifyResult {
   moved: number
   skipped: number

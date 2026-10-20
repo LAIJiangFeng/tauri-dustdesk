@@ -57,6 +57,13 @@
 - 图片历史项以持久化的 `image_path` / `image_thumb_path` / `image_hash` 为准。预览可返回缩略图 base64，但粘贴时必须用原图路径或原始图片数据，不能只粘贴缩略图。
 - Windows 图片粘贴要给目标窗口激活和大图写入留出缓冲。设置 `CF_DIB` 后应等待目标窗口回到前台，并按图片大小延迟后再发送 `Ctrl+V`，否则首次粘贴容易没有效果、第二次才成功。
 
+## 桌面框条目操作
+
+- 桌面框里分类条目的“删除”必须移到回收站（`SHFileOperationW` 带 `FOF_ALLOWUNDO`，并用 `FOF_WANTNUKEWARNING` 防止无法回收时被静默永久删除）。无法回收的项目保留原样，不从分类配置移除，并在提示里说明数量。只从配置删路径无效，加载快照会从 `DesktopOrganizer/<分类名>` 把真实文件补回来。
+- 删除命令只处理确实记录在该分类 `item_paths` 里的路径，其它路径一律跳过；并与收纳/还原共用 `with_config_mutation` 串行化，开头先恢复 transfer journal。
+- “复制”写 CF_HDROP（多文件、宽字符、双零结尾）加 `Preferred DropEffect = DROPEFFECT_COPY`，写入前抑制剪贴板历史监控，文件复制不进历史；“复制路径”写 CF_UNICODETEXT 且不抑制监控，按资源管理器“复制文件地址”的语义进入文本历史。
+- 快捷启动条目的删除只删 `Launchers` 里的入口和 `launch.json` 记录，不碰原始文件；批量操作完成后只刷新一次快照。
+
 ## 桌面快照性能
 
 - 桌面悬浮框和独立分类卡片应使用轻量 `load_desktop_snapshot`，不要走完整 `load_snapshot`。

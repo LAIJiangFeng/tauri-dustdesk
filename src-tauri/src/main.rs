@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod clipboard_bridge;
+mod desktop_item_actions;
 mod models;
 mod screenshot;
 mod store;
@@ -1206,6 +1207,13 @@ fn add_launchers_with_names(items: Vec<(String, String)>) -> Result<usize, Strin
 
 #[tauri::command]
 fn remove_launcher(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    remove_launcher_impl(path)?;
+    emit_desktop_cards_changed(&app);
+    Ok(())
+}
+
+/// Removes only the Launchers entry and its record; the original target is never touched.
+fn remove_launcher_impl(path: String) -> Result<(), String> {
     with_launcher_mutation(|| {
         let path = normalize_path_input(&path)?;
         let store = AppStore::open().map_err(to_message)?;
@@ -1219,9 +1227,7 @@ fn remove_launcher(app: tauri::AppHandle, path: String) -> Result<(), String> {
             remove_existing_path(&path_buf)?;
         }
         store.save_launchers(&launchers).map_err(to_message)
-    })?;
-    emit_desktop_cards_changed(&app);
-    Ok(())
+    })
 }
 
 #[tauri::command]
@@ -13835,6 +13841,10 @@ fn main() {
             add_launcher,
             add_launchers,
             remove_launcher,
+            desktop_item_actions::remove_launchers,
+            desktop_item_actions::copy_paths_to_clipboard,
+            desktop_item_actions::copy_text_to_clipboard,
+            desktop_item_actions::delete_category_items_to_recycle_bin,
             show_path_in_folder,
             classify_desktop_items,
             start_classify_desktop_items_task,

@@ -1,4 +1,4 @@
-import { ClipboardText, Copy, FolderOpen, RocketLaunch, ShieldCheck, Trash, UploadSimple } from "@phosphor-icons/react"
+import { ClipboardText, Copy, FolderOpen, Info, PencilSimple, RocketLaunch, Scissors, ShieldCheck, Trash, UploadSimple } from "@phosphor-icons/react"
 import { useLayoutEffect, useRef, useState } from "react"
 import { createPortal } from "react-dom"
 import { desktopPopupAttribute } from "@/hooks/use-desktop-item-selection"
@@ -7,7 +7,7 @@ import { cn } from "@/lib/utils"
 export interface ItemContextMenuAction {
   label: string
   tone?: "default" | "danger"
-  icon?: "open" | "admin" | "folder" | "restore" | "remove" | "copy" | "path"
+  icon?: "open" | "admin" | "folder" | "restore" | "remove" | "copy" | "path" | "cut" | "rename" | "properties"
   shortcut?: string
   onSelect: () => void | Promise<void>
 }
@@ -28,6 +28,9 @@ const actionIcons = {
   remove: Trash,
   copy: Copy,
   path: ClipboardText,
+  cut: Scissors,
+  rename: PencilSimple,
+  properties: Info,
 }
 
 export function ItemContextMenu({ x, y, actions, header, onClose }: ItemContextMenuProps) {

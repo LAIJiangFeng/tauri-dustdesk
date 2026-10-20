@@ -63,6 +63,10 @@
 - 删除命令只处理确实记录在该分类 `item_paths` 里的路径，其它路径一律跳过；并与收纳/还原共用 `with_config_mutation` 串行化，开头先恢复 transfer journal。
 - “复制”写 CF_HDROP（多文件、宽字符、双零结尾）加 `Preferred DropEffect = DROPEFFECT_COPY`，写入前抑制剪贴板历史监控，文件复制不进历史；“复制路径”写 CF_UNICODETEXT 且不抑制监控，按资源管理器“复制文件地址”的语义进入文本历史。
 - 快捷启动条目的删除只删 `Launchers` 里的入口和 `launch.json` 记录，不碰原始文件；批量操作完成后只刷新一次快照。
+- 分类条目“重命名”只做同目录不覆盖的重命名（`MoveFileExW` 不带 `MOVEFILE_REPLACE_EXISTING` / `MOVEFILE_COPY_ALLOWED`），走 `with_config_mutation` 并先恢复 transfer journal；必须原位替换分类 `item_paths` 里的路径（保持顺序），并把 `desktop_icon_positions` 的旧路径记录改挂到新路径，否则“移回桌面”会丢失原图标位置。名称校验以后端为准（非法字符、保留名、结尾点号、同目录同名不区分大小写，只改大小写允许）。
+- 快捷启动条目“重命名”只改 `Launchers` 里的入口文件和 `launch.json` 的路径与名称，走 `with_launcher_mutation`，绝不改快捷方式指向的原始文件。
+- “剪切”写 CF_HDROP 加 `Preferred DropEffect = DROPEFFECT_MOVE`（与复制共用 `clipboard_bridge` 写入，drop effect 作参数），写入前抑制剪贴板历史监控；只接受分类条目，`Launchers` 里的入口一律拒绝，因为剪切粘贴到桌面等于把启动项迁回桌面。框里不支持粘贴，Ctrl+V 只提示。
+- 剪切后由前端约每秒轮询 `clipboard_cut_status`（最长 30 分钟），剪贴板序列号变化、被剪切路径已不存在或在 DustDesk 里又复制/剪切别的项目时解除半透明；后端发现路径已不存在必须广播 `dustdesk://desktop-cards-changed`，让所有窗口（包括其它显示器上的同名框）刷新。
 
 ## 桌面快照性能
 

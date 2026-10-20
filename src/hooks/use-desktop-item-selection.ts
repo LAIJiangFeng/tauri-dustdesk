@@ -12,26 +12,40 @@ export interface DesktopItemSelectionShortcuts {
   onCopyPath: (paths: string[]) => void
   onOpen: (paths: string[]) => void
   onDelete: (paths: string[]) => void
+  onCut: (paths: string[]) => void
+  onRename: (path: string) => void
+  onProperties: (paths: string[]) => void
+  onPaste: () => void
 }
 
 /**
  * Windows-desktop-like selection for the items of one box: click, Ctrl+click, Shift+click,
- * Ctrl+A, Esc, plus Ctrl+C / Ctrl+Shift+C / Enter / Delete shortcuts on the selection.
+ * Ctrl+A, Esc, plus Ctrl+C / Ctrl+Shift+C / Ctrl+X / Enter / Delete / F2 / Alt+Enter shortcuts on
+ * the selection and a Ctrl+V hint.
  * `paths` is the visible order; selected paths that disappear from it are dropped.
  */
 export function useDesktopItemSelection(visiblePaths: string[], shortcuts: DesktopItemSelectionShortcuts) {
   const [selected, setSelected] = useState<ReadonlySet<string>>(() => new Set())
   const anchorRef = useRef<string | null>(null)
+  // F2 renames the most recently clicked item; Shift+click keeps the anchor but moves this.
+  const lastClickedRef = useRef<string | null>(null)
+  // Set by selectOnly for a path a coming refresh is expected to list (a renamed item); it
+  // survives pruning until it shows up.
+  const pendingSelectRef = useRef<string | null>(null)
   // Callers rebuild the array every render; key on its content (Windows paths never contain "\n").
   const pathsKey = visiblePaths.join("\n")
   const paths = useMemo(() => (pathsKey ? pathsKey.split("\n") : []), [pathsKey])
 
   useEffect(() => {
     const present = new Set(paths)
-    if (anchorRef.current && !present.has(anchorRef.current)) anchorRef.current = null
+    if (pendingSelectRef.current && present.has(pendingSelectRef.current)) pendingSelectRef.current = null
+    const pending = pendingSelectRef.current
+    const keep = (path: string) => present.has(path) || path === pending
+    if (anchorRef.current && !keep(anchorRef.current)) anchorRef.current = null
+    if (lastClickedRef.current && !keep(lastClickedRef.current)) lastClickedRef.current = null
     setSelected((current) => {
-      if ([...current].every((path) => present.has(path))) return current
-      return new Set([...current].filter((path) => present.has(path)))
+      if ([...current].every(keep)) return current
+      return new Set([...current].filter(keep))
     })
   }, [paths])
 
@@ -48,10 +62,20 @@ export function useDesktopItemSelection(visiblePaths: string[], shortcuts: Deskt
     setSelected(new Set(paths))
   }, [paths])
 
+  /** Selects exactly `path`, kept even if the refresh that lists it has not arrived yet. */
+  const selectOnly = useCallback((path: string) => {
+    anchorRef.current = path
+    lastClickedRef.current = path
+    pendingSelectRef.current = path
+    setSelected(new Set([path]))
+  }, [])
+
   const handleItemClick = useCallback(
     (path: string, event: ReactMouseEvent) => {
       const additive = event.ctrlKey || event.metaKey
       const anchor = anchorRef.current
+      lastClickedRef.current = path
+      pendingSelectRef.current = null
       if (event.shiftKey && anchor && paths.includes(anchor)) {
         const from = paths.indexOf(anchor)
         const to = paths.indexOf(path)
@@ -77,6 +101,7 @@ export function useDesktopItemSelection(visiblePaths: string[], shortcuts: Deskt
   /** Right-click keeps an existing multi-selection; otherwise it selects only that item. */
   const handleItemContextMenu = useCallback(
     (path: string) => {
+      lastClickedRef.current = path
       if (selected.has(path)) return selectedPaths
       anchorRef.current = path
       setSelected(new Set([path]))
@@ -90,10 +115,19 @@ export function useDesktopItemSelection(visiblePaths: string[], shortcuts: Deskt
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.defaultPrevented || event.isComposing || event.altKey || !shortcutsAvailable()) return
+      if (event.defaultPrevented || event.isComposing || !shortcutsAvailable()) return
       const { shortcuts, selectedPaths, selectAll, clearSelection } = latestRef.current
       const ctrl = event.ctrlKey || event.metaKey
       const hasSelection = selectedPaths.length > 0
+
+      if (event.altKey) {
+        // Alt+Enter is the only Alt shortcut; other Alt chords stay with the WebView / system.
+        if (event.key === "Enter" && !ctrl && !event.shiftKey && hasSelection && focusInItemList()) {
+          event.preventDefault()
+          if (!event.repeat) shortcuts.onProperties(selectedPaths)
+        }
+        return
+      }
 
       if (ctrl && !event.shiftKey && event.code === "KeyA") {
         event.preventDefault()
@@ -106,6 +140,16 @@ export function useDesktopItemSelection(visiblePaths: string[], shortcuts: Deskt
         event.preventDefault()
         if (event.shiftKey) shortcuts.onCopyPath(selectedPaths)
         else shortcuts.onCopy(selectedPaths)
+      } else if (ctrl && !event.shiftKey && event.code === "KeyX" && hasSelection && focusInItemList()) {
+        event.preventDefault()
+        if (!event.repeat) shortcuts.onCut(selectedPaths)
+      } else if (ctrl && !event.shiftKey && event.code === "KeyV" && focusInItemList()) {
+        event.preventDefault()
+        if (!event.repeat) shortcuts.onPaste()
+      } else if (event.key === "F2" && !ctrl && !event.shiftKey && hasSelection && focusInItemList()) {
+        event.preventDefault()
+        const lastClicked = lastClickedRef.current
+        if (!event.repeat) shortcuts.onRename(lastClicked && selectedPaths.includes(lastClicked) ? lastClicked : selectedPaths[0])
       } else if (event.key === "Enter" && !ctrl && !event.shiftKey && hasSelection && focusInItemList()) {
         // Also stops a focused item button from turning Enter into a click.
         event.preventDefault()
@@ -120,12 +164,13 @@ export function useDesktopItemSelection(visiblePaths: string[], shortcuts: Deskt
     return () => globalThis.removeEventListener("keydown", onKeyDown)
   }, [])
 
-  return { selectedPaths, isSelected, clearSelection, selectAll, handleItemClick, handleItemContextMenu }
+  return { selectedPaths, isSelected, clearSelection, selectAll, selectOnly, handleItemClick, handleItemContextMenu }
 }
 
 /**
- * Enter and Delete belong to the item list only while focus is nowhere in particular or inside
- * the list; other focused controls (settings button, links...) keep their own key handling.
+ * Enter, Delete, F2, Alt+Enter, Ctrl+X and Ctrl+V belong to the item list only while focus is
+ * nowhere in particular or inside the list; other focused controls (settings button, links...)
+ * keep their own key handling.
  */
 function focusInItemList() {
   const active = document.activeElement

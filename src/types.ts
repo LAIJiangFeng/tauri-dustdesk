@@ -33,6 +33,13 @@ export interface RecycleCategoryItemsResult {
   errors: string[]
 }
 
+export interface ClipboardCutState {
+  paths: string[]
+  /** Clipboard sequence number right after the cut was written. */
+  sequence: number
+  startedAt: number
+}
+
 export interface RestoreItemsResult {
   restored: number
   errors: string[]

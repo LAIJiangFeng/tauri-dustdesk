@@ -146,14 +146,38 @@ pub fn copy_png_to_clipboard_with_history(png_bytes: &[u8]) -> Result<(), String
     Ok(())
 }
 
+/// "Preferred DropEffect" written next to CF_HDROP: tells the paste target whether to copy
+/// the files or move them away, like Explorer's "Copy" and "Cut".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileDropEffect {
+    Copy,
+    Move,
+}
+
 /// Puts existing files on the clipboard as CF_HDROP (copy semantics). File copies are not
 /// clipboard history entries, matching Explorer, so the monitor is suppressed for this write.
 pub fn copy_files_to_clipboard(paths: &[String]) -> Result<(), String> {
+    write_files_to_clipboard(paths, FileDropEffect::Copy).map(|_| ())
+}
+
+/// Puts existing files on the clipboard as CF_HDROP with move semantics, so the Explorer
+/// window or desktop that pastes them moves the files. Returns the clipboard sequence number
+/// right after the write, used to notice when the clipboard changes afterwards.
+pub fn cut_files_to_clipboard(paths: &[String]) -> Result<u32, String> {
+    write_files_to_clipboard(paths, FileDropEffect::Move)
+}
+
+fn write_files_to_clipboard(paths: &[String], effect: FileDropEffect) -> Result<u32, String> {
     if paths.is_empty() {
-        return Err("没有可复制的项目".to_owned());
+        return Err("没有可写入剪贴板的项目".to_owned());
     }
     suppress_clipboard_monitor_for(Duration::from_secs(3));
-    set_files_clipboard(paths)
+    set_files_clipboard(paths, effect)?;
+    Ok(clipboard_sequence_number().unwrap_or_default())
+}
+
+pub fn clipboard_sequence_number() -> Option<u32> {
+    system_clipboard_sequence_number()
 }
 
 /// Writes plain text without suppressing the monitor, so a copied path enters text history
@@ -634,7 +658,7 @@ fn set_png_image_clipboard(_png_bytes: &[u8]) -> Result<(), String> {
 }
 
 #[cfg(not(windows))]
-fn set_files_clipboard(_paths: &[String]) -> Result<(), String> {
+fn set_files_clipboard(_paths: &[String], _effect: FileDropEffect) -> Result<(), String> {
     Err("当前平台暂不支持复制文件到剪贴板".to_owned())
 }
 
@@ -644,9 +668,9 @@ fn set_text_clipboard(_text: &str) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn set_files_clipboard(paths: &[String]) -> Result<(), String> {
+fn set_files_clipboard(paths: &[String], effect: FileDropEffect) -> Result<(), String> {
     let paths = paths.iter().map(String::as_str).collect::<Vec<_>>();
-    windows_clipboard::set_files(&paths)
+    windows_clipboard::set_files(&paths, effect)
 }
 
 #[cfg(windows)]
@@ -725,13 +749,14 @@ mod windows_clipboard {
         },
     };
 
-    use super::LAST_TARGET_HWND;
+    use super::{FileDropEffect, LAST_TARGET_HWND};
 
     const BI_RGB: u32 = 0;
     const CF_DIB: u32 = 8;
     const CF_HDROP: u32 = 15;
     const CF_UNICODETEXT: u32 = 13;
     const DROPEFFECT_COPY: u32 = 1;
+    const DROPEFFECT_MOVE: u32 = 2;
     const FOCUS_WAIT_TIMEOUT: Duration = Duration::from_millis(900);
     const FOCUS_WAIT_STEP: Duration = Duration::from_millis(25);
     const TEXT_PASTE_READY_DELAY: Duration = Duration::from_millis(180);
@@ -1036,14 +1061,17 @@ mod windows_clipboard {
         Ok(bytes)
     }
 
-    /// Writes files to the clipboard the way Explorer's "Copy" does: CF_HDROP plus
-    /// "Preferred DropEffect" = DROPEFFECT_COPY, so pasting produces copies (Explorer, desktop)
-    /// or file attachments (WeChat, QQ).
-    pub fn set_files(paths: &[&str]) -> Result<(), String> {
+    /// Writes files to the clipboard the way Explorer's "Copy" / "Cut" do: CF_HDROP plus
+    /// "Preferred DropEffect". DROPEFFECT_COPY makes pasting produce copies (Explorer, desktop)
+    /// or file attachments (WeChat, QQ); DROPEFFECT_MOVE makes Explorer move the files away.
+    pub fn set_files(paths: &[&str], effect: FileDropEffect) -> Result<(), String> {
+        let drop_effect = match effect {
+            FileDropEffect::Copy => DROPEFFECT_COPY,
+            FileDropEffect::Move => DROPEFFECT_MOVE,
+        };
         let mut file_handle = Some(hdrop_from_file_paths(paths)?);
         let mut drop_effect_handle =
-            match global_alloc_u32(DROPEFFECT_COPY, "无法分配文件复制语义剪贴板内存")
-            {
+            match global_alloc_u32(drop_effect, "无法分配文件剪贴板语义内存") {
                 Ok(handle) => Some(handle),
                 Err(error) => {
                     unsafe { free_global_handle(&mut file_handle) };

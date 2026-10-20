@@ -7,6 +7,7 @@ import type {
   AppPage,
   AppSettings,
   AppSnapshot,
+  ClipboardCutState,
   AppUpdateInfo,
   ClassifyResult,
   ClipboardHistoryItem,
@@ -114,6 +115,16 @@ let snapshotLoadedAt = 0
 let desktopSnapshotLoadPromise: Promise<void> | null = null
 let desktopSnapshotForceReloadQueued = false
 let desktopSnapshotLoadedAt = 0
+const clipboardCutPollMs = 1000
+const clipboardCutMaxWatchMs = 30 * 60 * 1000
+let clipboardCutTimer: ReturnType<typeof setTimeout> | null = null
+let clipboardCutToken = 0
+
+function stopClipboardCutWatch() {
+  clipboardCutToken += 1
+  if (clipboardCutTimer) clearTimeout(clipboardCutTimer)
+  clipboardCutTimer = null
+}
 
 function resetRuntimeCaches() {
   iconResolutionToken += 1
@@ -909,6 +920,13 @@ interface DustDeskState {
   deleteCategoryItemsToRecycleBinLight: (index: number, paths: string[]) => Promise<RecycleCategoryItemsResult>
   copyPathsToClipboard: (paths: string[]) => Promise<number>
   copyTextToClipboard: (text: string) => Promise<void>
+  /** Items this window last cut to the clipboard; shown dimmed until the cut is resolved. */
+  clipboardCut: ClipboardCutState | null
+  cutPathsToClipboard: (paths: string[]) => Promise<number>
+  clearClipboardCut: () => void
+  renameCategoryItemLight: (index: number, path: string, newName: string) => Promise<string>
+  renameLauncherLight: (path: string, newName: string) => Promise<string>
+  showItemProperties: (paths: string[]) => Promise<void>
   completeInternalPathDragLight: (sourceIndex: number, path: string, position: DesktopDropPosition) => Promise<InternalPathDragOutcome>
   restoreAllToDesktop: () => Promise<number>
   restoreAllToDesktopLight: () => Promise<number>
@@ -1253,10 +1271,70 @@ export const useDustDeskStore = create<DustDeskState>()(
       }
     },
     copyPathsToClipboard: async (paths) => {
-      return Number(await call<number>("copy_paths_to_clipboard", { paths })) || 0
+      const copied = Number(await call<number>("copy_paths_to_clipboard", { paths })) || 0
+      get().clearClipboardCut()
+      return copied
     },
     copyTextToClipboard: async (text) => {
       await call("copy_text_to_clipboard", { text })
+      get().clearClipboardCut()
+    },
+    clipboardCut: null,
+    cutPathsToClipboard: async (paths) => {
+      const result = await call<{ count?: number; sequence?: number }>("cut_paths_to_clipboard", { paths })
+      const cut: ClipboardCutState = { paths, sequence: Number(result?.sequence) || 0, startedAt: Date.now() }
+      stopClipboardCutWatch()
+      set((state) => {
+        state.clipboardCut = cut
+      })
+      // Poll until the clipboard changes or Explorer pasted (moved) the items away; the backend
+      // broadcasts desktop-cards-changed when it sees them gone, so every window refreshes.
+      const token = clipboardCutToken
+      const poll = async () => {
+        if (token !== clipboardCutToken) return
+        if (Date.now() - cut.startedAt > clipboardCutMaxWatchMs) {
+          get().clearClipboardCut()
+          return
+        }
+        try {
+          const status = await call<{ clipboard_changed?: boolean; missing?: unknown }>("clipboard_cut_status", {
+            paths: cut.paths,
+            sequence: cut.sequence,
+          })
+          if (token !== clipboardCutToken) return
+          const missing = asArray(status?.missing)
+          if (status?.clipboard_changed || missing.length > 0) {
+            get().clearClipboardCut()
+            if (missing.length > 0) void get().loadDesktopSnapshot({ force: true })
+            return
+          }
+        } catch {
+          // A failed poll just waits for the next tick.
+        }
+        if (token === clipboardCutToken) clipboardCutTimer = setTimeout(() => void poll(), clipboardCutPollMs)
+      }
+      clipboardCutTimer = setTimeout(() => void poll(), clipboardCutPollMs)
+      return Number(result?.count) || paths.length
+    },
+    clearClipboardCut: () => {
+      stopClipboardCutWatch()
+      if (!get().clipboardCut) return
+      set((state) => {
+        state.clipboardCut = null
+      })
+    },
+    renameCategoryItemLight: async (index, path, newName) => {
+      const newPath = asString(await call<string>("rename_category_item", { index, path, newName }), path)
+      await get().loadDesktopSnapshot({ force: true })
+      return newPath
+    },
+    renameLauncherLight: async (path, newName) => {
+      const newPath = asString(await call<string>("rename_launcher", { path, newName }), path)
+      await get().loadDesktopSnapshot({ force: true })
+      return newPath
+    },
+    showItemProperties: async (paths) => {
+      await call("show_item_properties", { paths })
     },
     completeInternalPathDragLight: async (sourceIndex, path, position) => {
       const outcome = await call<InternalPathDragOutcome>("complete_internal_path_drag", {

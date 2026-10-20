@@ -919,6 +919,7 @@ function CategoryItems({
 }) {
   const restoreItemsToDesktopLight = useDustDeskStore((state) => state.restoreItemsToDesktopLight)
   const deleteCategoryItemsToRecycleBinLight = useDustDeskStore((state) => state.deleteCategoryItemsToRecycleBinLight)
+  const renameCategoryItemLight = useDustDeskStore((state) => state.renameCategoryItemLight)
   if (items.length === 0) {
     return <EmptyDropHint title="暂无项目" detail="把桌面文件拖到这里，会自动收纳进这个分类。" />
   }
@@ -929,16 +930,20 @@ function CategoryItems({
       entries={items.map(categoryBoxEntry)}
       settings={settings}
       dragEffectAllowed="copyMove"
+      allowCut
       openLabel="打开"
       removeLabel="删除"
       confirmRemove={recycleConfirmMessage}
       onOpen={onOpen}
       onRemove={async (paths) => recycleResultNotice(await deleteCategoryItemsToRecycleBinLight(categoryIndex, paths))}
+      onRename={(path, newName) => renameCategoryItemLight(categoryIndex, path, newName)}
       onDragEndOutside={onRestoreDragOut}
       menuActions={({ path, paths, common, run }) => [
         common.open,
+        common.cut,
         common.copy,
         common.copyPath,
+        common.rename,
         {
           label: "在资源管理器中显示",
           icon: "folder",
@@ -950,6 +955,7 @@ function CategoryItems({
           onSelect: () => run(async () => restoreResultNotice(await restoreItemsToDesktopLight(categoryIndex, paths))),
         },
         common.remove,
+        common.properties,
       ]}
     />
   )
@@ -969,6 +975,7 @@ function LauncherItems({
   onShowInFolder: (path: string) => Promise<void>
 }) {
   const removeLaunchersLight = useDustDeskStore((state) => state.removeLaunchersLight)
+  const renameLauncherLight = useDustDeskStore((state) => state.renameLauncherLight)
   if (launchers.length === 0) {
     return <EmptyDropHint title="暂无启动项" detail="把快捷方式、程序或常用文件拖到这里。" />
   }
@@ -990,6 +997,7 @@ function LauncherItems({
       confirmRemove={(count) => `从快捷启动移除 ${count} 项？只删除启动入口，不会删除原始文件。`}
       onOpen={onOpen}
       onRemove={async (paths) => `已从快捷启动移除 ${await removeLaunchersLight(paths)} 项`}
+      onRename={renameLauncherLight}
       menuActions={({ path, common, run }) => [
         common.open,
         {
@@ -999,12 +1007,14 @@ function LauncherItems({
         },
         common.copy,
         common.copyPath,
+        common.rename,
         {
           label: "在资源管理器中显示",
           icon: "folder",
           onSelect: () => run(() => onShowInFolder(path)),
         },
         common.remove,
+        common.properties,
       ]}
     />
   )

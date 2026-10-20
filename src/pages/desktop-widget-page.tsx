@@ -1505,6 +1505,7 @@ function CategoryItems({
 }) {
   const restoreItemsToDesktopLight = useDustDeskStore((state) => state.restoreItemsToDesktopLight)
   const deleteCategoryItemsToRecycleBinLight = useDustDeskStore((state) => state.deleteCategoryItemsToRecycleBinLight)
+  const renameCategoryItemLight = useDustDeskStore((state) => state.renameCategoryItemLight)
   const items = category?.item_details ?? []
   if (items.length === 0) {
     return <EmptyDropHint title="暂无项目" detail="把桌面文件拖到这里，会自动收纳进这个分类。" />
@@ -1516,16 +1517,20 @@ function CategoryItems({
       entries={items.map(categoryBoxEntry)}
       settings={settings}
       dragEffectAllowed="copyMove"
+      allowCut
       openLabel="打开"
       removeLabel="删除"
       confirmRemove={recycleConfirmMessage}
       onOpen={onOpen}
       onRemove={async (paths) => recycleResultNotice(await deleteCategoryItemsToRecycleBinLight(categoryIndex, paths))}
+      onRename={(path, newName) => renameCategoryItemLight(categoryIndex, path, newName)}
       onDragEndOutside={(path, position) => onRestoreDragOut(categoryIndex, path, position)}
       menuActions={({ path, paths, common, run }) => [
         common.open,
+        common.cut,
         common.copy,
         common.copyPath,
+        common.rename,
         {
           label: "在资源管理器中显示",
           icon: "folder",
@@ -1537,6 +1542,7 @@ function CategoryItems({
           onSelect: () => run(async () => restoreResultNotice(await restoreItemsToDesktopLight(categoryIndex, paths))),
         },
         common.remove,
+        common.properties,
       ]}
     />
   )

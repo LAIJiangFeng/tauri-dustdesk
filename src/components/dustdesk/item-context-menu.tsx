@@ -53,6 +53,7 @@ export function ItemContextMenu({ x, y, actions, onClose }: ItemContextMenuProps
       <button type="button" className="fixed inset-0 z-[80] cursor-default bg-transparent" aria-label="关闭菜单" onClick={onClose} />
       <div
         ref={menuRef}
+        data-edge-hide-hold=""
         className="fixed z-[90] w-max min-w-44 max-w-[calc(100vw-1rem)] overflow-x-auto overflow-y-auto rounded-xl border bg-popover p-1 text-popover-foreground shadow-xl ring-1 ring-foreground/10"
         style={{ left: position.left, top: position.top, maxHeight: "calc(100vh - 1rem)" }}
         role="menu"

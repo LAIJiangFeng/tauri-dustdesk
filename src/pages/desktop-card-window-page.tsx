@@ -31,11 +31,14 @@ import {
   X,
   type Icon,
 } from "@phosphor-icons/react"
+import { DesktopEdgeHideMenuSection } from "@/components/dustdesk/desktop-edge-hide-menu-section"
+import { DesktopEdgeHideShell } from "@/components/dustdesk/desktop-edge-hide-shell"
 import { FileIcon } from "@/components/dustdesk/file-icon"
 import { ItemContextMenu, type ItemContextMenuAction } from "@/components/dustdesk/item-context-menu"
 import { SettingsMenuSection } from "@/components/dustdesk/settings-menu-section"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { useDesktopEdgeHide } from "@/hooks/use-desktop-edge-hide"
 import { usePersistCurrentWindowLayout } from "@/hooks/use-persist-current-window-layout"
 import { useDesktopWindowState } from "@/hooks/use-desktop-window-state"
 import { useTheme } from "@/hooks/use-theme"
@@ -56,7 +59,7 @@ import {
 import { repaintCurrentWindow, safeCurrentWebviewDragDropEvent, safeListen, startCurrentWindowDragging, startCurrentWindowResizeDragging } from "@/lib/tauri-window"
 import { cn, displayPathName, extensionFromPath } from "@/lib/utils"
 import { useDustDeskStore } from "@/stores/dustdesk-store"
-import type { DesktopItem, DesktopOperationEvent, DesktopWindowState } from "@/types"
+import type { DesktopEdgeHideMode, DesktopEdgeHideState, DesktopItem, DesktopOperationEvent, DesktopWindowState } from "@/types"
 
 const splitCategoriesStorageKey = "dustdesk-desktop-widget-split-categories"
 
@@ -137,6 +140,11 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
     return categoryVisual(category?.name ?? "分类", index)
   }, [category?.name, index, kind])
   usePersistCurrentWindowLayout(windowLabel)
+  const edgeHide = useDesktopEdgeHide({
+    fallbackLabel: windowLabel,
+    busy: menuOpen || Boolean(desktopOperationLabel) || isClassifyingDesktop || isRestoringDesktop || isMergingCategories,
+    clickThrough: desktopWindowState.click_through,
+  })
 
   useEffect(() => {
     registerDustDeskDropCategory(kind === "category" && Number.isFinite(index) ? index : null)
@@ -597,6 +605,14 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
     }
   }
 
+  async function handleChangeEdgeHide(enabled: boolean, mode: DesktopEdgeHideMode) {
+    try {
+      await edgeHide.setEdgeHide(enabled, mode)
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : String(error))
+    }
+  }
+
   async function handleToggleDesktopWindowClickThrough() {
     try {
       const next = await setClickThrough(!desktopWindowState.click_through)
@@ -614,129 +630,134 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
   }
 
   return (
-    <div className="desktop-widget-page h-screen w-screen bg-transparent p-2 text-white">
-      <section
-        className="relative flex h-full w-full min-w-0 flex-col overflow-hidden rounded-2xl border border-white/15 backdrop-blur-2xl"
-        style={frameStyle}
-      >
-        <header
-          className={cn("no-drag flex h-12 shrink-0 items-center justify-between gap-2 border-b border-white/10 px-3", desktopWindowState.locked ? "cursor-default" : "cursor-move")}
-          onPointerDown={(event) => {
-            if (desktopWindowState.locked) return
-            if ((event.target as HTMLElement).closest("button,input")) return
-            void startCurrentWindowDragging()
-          }}
+    <DesktopEdgeHideShell controller={edgeHide} handleBackground={desktopWidgetBackgroundColor({ ...settings, opacity: Math.max(settings.opacity, 0.7) })} accentColor={visual.color}>
+      <div className="desktop-widget-page relative h-full w-full bg-transparent p-2 text-white">
+        <section
+          className="relative flex h-full w-full min-w-0 flex-col overflow-hidden rounded-2xl border border-white/15 backdrop-blur-2xl"
+          style={frameStyle}
         >
-          {kind === "launcher" ? (
-            <Badge className="mr-auto bg-white/10 text-white hover:bg-white/10">{snapshot.launchers.length}</Badge>
-          ) : (
-            <button type="button" className="flex min-w-0 items-center gap-2">
-              <Icon className="size-5 shrink-0" weight="duotone" style={{ color: visual.color }} />
-              <span className="truncate text-sm font-semibold">{category?.name ?? "分类"}</span>
-              <Badge className="bg-white/10 text-white hover:bg-white/10">{items.length}</Badge>
-            </button>
-          )}
-          <div className="ml-auto flex shrink-0 items-center gap-1">
+          <header
+            className={cn("no-drag flex h-12 shrink-0 items-center justify-between gap-2 border-b border-white/10 px-3", desktopWindowState.locked ? "cursor-default" : "cursor-move")}
+            onPointerDown={(event) => {
+              if (desktopWindowState.locked) return
+              if ((event.target as HTMLElement).closest("button,input")) return
+              void startCurrentWindowDragging()
+            }}
+          >
             {kind === "launcher" ? (
-              <>
-                <Button size="xs" onClick={() => void handleStartAll()}>
-                  <RocketLaunch className="size-3.5" weight="duotone" />
-                  启动
-                </Button>
-                <Button size="icon-sm" variant="secondary" title="以管理员身份启动全部" aria-label="以管理员身份启动全部" onClick={() => void handleStartAll(true)}>
-                  <ShieldCheck className="size-4" weight="duotone" />
-                </Button>
-              </>
-            ) : null}
-            <div className="relative">
-              <Button size="icon-sm" variant="secondary" title="设置" aria-label="设置" onClick={() => setMenuOpen((value) => !value)}>
-                <GearSix className="size-4" weight="duotone" />
-              </Button>
-              {menuOpen ? (
-                <SettingsMenu
-                  kind={kind}
-                  settings={settings}
-                  viewMode={viewMode}
-                  createCategory={handleCreateCategory}
-                  renameCategory={handleRenameCategory}
-                  deleteCategory={handleDeleteCategory}
-                  categorySortByName={category?.sort_by_name ?? false}
-                  onToggleCategorySort={async () => {
-                    if (!category) return
-                    const enabled = !category.sort_by_name
-                    try {
-                      await setCategorySortByName(index, enabled)
-                      setNotice(enabled ? `「${category.name}」已按名称排序` : `「${category.name}」已恢复原收纳顺序`)
-                    } catch (error) {
-                      setNotice(error instanceof Error ? error.message : String(error))
-                    }
-                  }}
-                  updateSettings={updateSettings}
-                  updateViewMode={updateViewMode}
-                  desktopWindowState={desktopWindowState}
-                  desktopWindowStatePending={desktopWindowStatePending}
-                  onToggleDesktopWindowLocked={handleToggleDesktopWindowLocked}
-                  onToggleDesktopWindowClickThrough={handleToggleDesktopWindowClickThrough}
-                  onRefresh={handleRefresh}
-                  onSplitAllCategories={handleSplitAllCategories}
-                  onClassifyDesktop={handleClassifyDesktopItems}
-                  onOrganizeAndSplitAll={handleOrganizeAndSplitAll}
-                  onRestoreAllToDesktop={handleRestoreAllToDesktop}
-                  isClassifyingDesktop={isClassifyingDesktop}
-                  isRestoringDesktop={isRestoringDesktop}
-                  isMergingCategories={isMergingCategories}
-                  onMerge={handleMergeCategory}
-                  onMergeAllCategories={handleMergeAllCategories}
-                  onHide={hideCurrentWindow}
-                />
+              <Badge className="mr-auto bg-white/10 text-white hover:bg-white/10">{snapshot.launchers.length}</Badge>
+            ) : (
+              <button type="button" className="flex min-w-0 items-center gap-2">
+                <Icon className="size-5 shrink-0" weight="duotone" style={{ color: visual.color }} />
+                <span className="truncate text-sm font-semibold">{category?.name ?? "分类"}</span>
+                <Badge className="bg-white/10 text-white hover:bg-white/10">{items.length}</Badge>
+              </button>
+            )}
+            <div className="ml-auto flex shrink-0 items-center gap-1">
+              {kind === "launcher" ? (
+                <>
+                  <Button size="xs" onClick={() => void handleStartAll()}>
+                    <RocketLaunch className="size-3.5" weight="duotone" />
+                    启动
+                  </Button>
+                  <Button size="icon-sm" variant="secondary" title="以管理员身份启动全部" aria-label="以管理员身份启动全部" onClick={() => void handleStartAll(true)}>
+                    <ShieldCheck className="size-4" weight="duotone" />
+                  </Button>
+                </>
               ) : null}
+              <div className="relative">
+                <Button size="icon-sm" variant="secondary" title="设置" aria-label="设置" onClick={() => setMenuOpen((value) => !value)}>
+                  <GearSix className="size-4" weight="duotone" />
+                </Button>
+                {menuOpen ? (
+                  <SettingsMenu
+                    kind={kind}
+                    settings={settings}
+                    viewMode={viewMode}
+                    createCategory={handleCreateCategory}
+                    renameCategory={handleRenameCategory}
+                    deleteCategory={handleDeleteCategory}
+                    categorySortByName={category?.sort_by_name ?? false}
+                    onToggleCategorySort={async () => {
+                      if (!category) return
+                      const enabled = !category.sort_by_name
+                      try {
+                        await setCategorySortByName(index, enabled)
+                        setNotice(enabled ? `「${category.name}」已按名称排序` : `「${category.name}」已恢复原收纳顺序`)
+                      } catch (error) {
+                        setNotice(error instanceof Error ? error.message : String(error))
+                      }
+                    }}
+                    updateSettings={updateSettings}
+                    updateViewMode={updateViewMode}
+                    desktopWindowState={desktopWindowState}
+                    desktopWindowStatePending={desktopWindowStatePending}
+                    onToggleDesktopWindowLocked={handleToggleDesktopWindowLocked}
+                    onToggleDesktopWindowClickThrough={handleToggleDesktopWindowClickThrough}
+                    edgeHideState={edgeHide.state}
+                    edgeHidePending={edgeHide.settingPending}
+                    onChangeEdgeHide={(enabled, mode) => void handleChangeEdgeHide(enabled, mode)}
+                    onRefresh={handleRefresh}
+                    onSplitAllCategories={handleSplitAllCategories}
+                    onClassifyDesktop={handleClassifyDesktopItems}
+                    onOrganizeAndSplitAll={handleOrganizeAndSplitAll}
+                    onRestoreAllToDesktop={handleRestoreAllToDesktop}
+                    isClassifyingDesktop={isClassifyingDesktop}
+                    isRestoringDesktop={isRestoringDesktop}
+                    isMergingCategories={isMergingCategories}
+                    onMerge={handleMergeCategory}
+                    onMergeAllCategories={handleMergeAllCategories}
+                    onHide={hideCurrentWindow}
+                  />
+                ) : null}
+              </div>
             </div>
-          </div>
-        </header>
+          </header>
 
-        {kind === "launcher" ? (
-          <LauncherItems
-            launchers={snapshot.launchers}
-            settings={itemSettings}
-            onOpen={openPath}
-            onOpenAsAdministrator={openPathAsAdministrator}
-            onShowInFolder={showPathInFolder}
-            onRemoveLauncher={removeLauncher}
+          {kind === "launcher" ? (
+            <LauncherItems
+              launchers={snapshot.launchers}
+              settings={itemSettings}
+              onOpen={openPath}
+              onOpenAsAdministrator={openPathAsAdministrator}
+              onShowInFolder={showPathInFolder}
+              onRemoveLauncher={removeLauncher}
+            />
+          ) : (
+            <CategoryItems
+              items={items}
+              categoryIndex={index}
+              settings={itemSettings}
+              onOpen={openPath}
+              onShowInFolder={showPathInFolder}
+              onRestoreToDesktop={restoreItemToDesktopLight}
+              onRestoreDragOut={handleRestoreDragOut}
+            />
+          )}
+          {desktopOperationLabel ? <WidgetOperationOverlay label={desktopOperationLabel} /> : null}
+        </section>
+        {notice ? (
+          <div className="pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full bg-slate-950/70 px-3 py-1 text-xs text-white/80 ring-1 ring-white/10">{notice}</div>
+        ) : null}
+        {!desktopWindowState.locked ? (
+          <button
+            type="button"
+            className="no-drag absolute bottom-0 right-0 size-7 cursor-nwse-resize rounded-br-2xl border-b-2 border-r-2 border-white/45"
+            aria-label="调整窗口大小"
+            onPointerDown={(event) => {
+              event.preventDefault()
+              void startCurrentWindowResizeDragging("SouthEast")
+            }}
           />
-        ) : (
-          <CategoryItems
-            items={items}
-            categoryIndex={index}
-            settings={itemSettings}
-            onOpen={openPath}
-            onShowInFolder={showPathInFolder}
-            onRestoreToDesktop={restoreItemToDesktopLight}
-            onRestoreDragOut={handleRestoreDragOut}
-          />
-        )}
-        {desktopOperationLabel ? <WidgetOperationOverlay label={desktopOperationLabel} /> : null}
-      </section>
-      {notice ? (
-        <div className="pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full bg-slate-950/70 px-3 py-1 text-xs text-white/80 ring-1 ring-white/10">{notice}</div>
-      ) : null}
-      {!desktopWindowState.locked ? (
-        <button
-          type="button"
-          className="no-drag absolute bottom-0 right-0 size-7 cursor-nwse-resize rounded-br-2xl border-b-2 border-r-2 border-white/45"
-          aria-label="调整窗口大小"
-          onPointerDown={(event) => {
-            event.preventDefault()
-            void startCurrentWindowResizeDragging("SouthEast")
-          }}
-        />
-      ) : null}
-    </div>
+        ) : null}
+      </div>
+    </DesktopEdgeHideShell>
   )
 }
 
 function WidgetOperationOverlay({ label }: { label: string }) {
   return (
-    <div className="no-drag pointer-events-none absolute inset-0 z-40 grid place-items-center bg-slate-950/60 backdrop-blur-md">
+    <div data-edge-hide-hold="" className="no-drag pointer-events-none absolute inset-0 z-40 grid place-items-center bg-slate-950/60 backdrop-blur-md">
       <div className="flex items-center gap-2 rounded-xl border border-white/15 bg-slate-950/90 px-3 py-2 text-xs font-semibold text-white shadow-2xl shadow-black/30">
         <ArrowsClockwise className="size-4 animate-spin text-emerald-300" weight="duotone" />
         <span>{label}</span>
@@ -760,6 +781,9 @@ function SettingsMenu({
   desktopWindowStatePending,
   onToggleDesktopWindowLocked,
   onToggleDesktopWindowClickThrough,
+  edgeHideState,
+  edgeHidePending,
+  onChangeEdgeHide,
   onRefresh,
   onSplitAllCategories,
   onClassifyDesktop,
@@ -786,6 +810,9 @@ function SettingsMenu({
   desktopWindowStatePending: boolean
   onToggleDesktopWindowLocked: () => Promise<void>
   onToggleDesktopWindowClickThrough: () => Promise<void>
+  edgeHideState: DesktopEdgeHideState | null
+  edgeHidePending: boolean
+  onChangeEdgeHide: (enabled: boolean, mode: DesktopEdgeHideMode) => void
   onRefresh: () => Promise<void>
   onSplitAllCategories: () => Promise<void>
   onClassifyDesktop: () => Promise<void>
@@ -800,6 +827,7 @@ function SettingsMenu({
 }) {
   return (
     <div
+      data-edge-hide-hold=""
       className="desktop-widget-scroll absolute right-0 top-8 z-50 max-h-[min(440px,calc(100vh-4rem))] w-64 max-w-[calc(100vw-1rem)] space-y-1.5 overflow-x-hidden overflow-y-auto overscroll-contain rounded-2xl border border-white/15 bg-slate-950/90 p-1.5 text-white shadow-2xl shadow-black/35 backdrop-blur-2xl"
       aria-label="桌面框设置"
     >
@@ -839,6 +867,7 @@ function SettingsMenu({
         />
         <MenuButton icon={X} label="隐藏当前框" onClick={() => void onHide()} />
       </SettingsMenuSection>
+      <DesktopEdgeHideMenuSection state={edgeHideState} pending={edgeHidePending} onChange={onChangeEdgeHide} />
       <SettingsMenuSection title="外观与排版">
         <RangeRow label="卡片透明度" min={0.25} max={0.85} step={0.05} value={settings.opacity} onChange={(opacity) => updateSettings({ opacity })} />
         <ColorRow value={settings.backgroundColor} onChange={(backgroundColor) => updateSettings({ backgroundColor })} />

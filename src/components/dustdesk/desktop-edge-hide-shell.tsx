@@ -20,6 +20,15 @@ const edgeAnchors: Record<DesktopEdge, CSSProperties> = {
   right: { top: 0, right: 0 },
 }
 
+const edgeStripThickness = 6
+
+const edgeStripAnchors: Record<DesktopEdge, CSSProperties> = {
+  top: { top: 0, left: 0, right: 0, height: edgeStripThickness },
+  bottom: { bottom: 0, left: 0, right: 0, height: edgeStripThickness },
+  left: { left: 0, top: 0, bottom: 0, width: edgeStripThickness },
+  right: { right: 0, top: 0, bottom: 0, width: edgeStripThickness },
+}
+
 export function DesktopEdgeHideShell({ controller, handleBackground, accentColor, children }: DesktopEdgeHideShellProps) {
   const { state, phase, slidOut, reducedMotion, handleProps } = controller
   const active = Boolean(state?.enabled) && phase !== "disabled"
@@ -67,12 +76,14 @@ function EdgeHideHandle({
   handleProps: DesktopEdgeHideController["handleProps"]
 }) {
   const horizontal = isDesktopEdgeHorizontal(edge)
+  // 命中区和把手都锚定在停靠边、固定 6px 厚度：展开时窗口可能先于重新渲染被放大，不能把把手拉成整块。
+  const hitStyle = edgeStripAnchors[edge]
   // 两端内缩 8px，与卡片可见边框（页面 p-2）对齐。
-  const barStyle: CSSProperties = horizontal ? { left: 8, right: 8, top: 0, bottom: 0 } : { top: 8, bottom: 8, left: 0, right: 0 }
+  const barStyle: CSSProperties = horizontal ? { ...edgeStripAnchors[edge], left: 8, right: 8 } : { ...edgeStripAnchors[edge], top: 8, bottom: 8 }
   const gripStyle: CSSProperties = horizontal ? { width: 28, height: 2 } : { width: 2, height: 28 }
 
   return (
-    <div className="absolute inset-0 cursor-pointer" aria-label="展开桌面框" role="button" tabIndex={-1} {...handleProps}>
+    <div className="absolute cursor-pointer" style={hitStyle} aria-label="展开桌面框" role="button" tabIndex={-1} {...handleProps}>
       <div className="absolute grid place-items-center rounded-[3px] ring-1 ring-inset ring-white/15" style={{ ...barStyle, backgroundColor: background }}>
         <span className="rounded-full opacity-90" style={{ ...gripStyle, backgroundColor: accentColor }} />
       </div>

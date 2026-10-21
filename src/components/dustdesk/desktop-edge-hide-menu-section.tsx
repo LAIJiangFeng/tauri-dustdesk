@@ -51,7 +51,7 @@ export function DesktopEdgeHideMenuSection({ state, pending, onChange }: Desktop
           </div>
         </div>
       ) : null}
-      <p className="px-2 pb-1 text-[10px] leading-4 text-white/45">鼠标移到屏幕边缘的窄条即可展开。</p>
+      <p className="px-2 pb-1 text-[10px] leading-4 text-white/45">鼠标移到屏幕边缘的窄条即可展开。设置会同步到所有显示器上的这个框。</p>
     </SettingsMenuSection>
   )
 }

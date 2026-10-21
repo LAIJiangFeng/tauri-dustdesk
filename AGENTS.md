@@ -85,6 +85,8 @@
 - 窄条几何永远不能写进 `DesktopLayout.Windows`。`save_desktop_window_layout` 对已开启贴边的框：收起中直接返回，展开中在锁外等主键松开后重新贴边再保存；收起前也要先提交当前展开矩形。
 - 收起时先 `set_resizable(false)`、把最小尺寸降到物理 1×1，再改尺寸和位置；展开后再恢复 `desktop_window_min_logical_size` 与 `set_resizable(!locked)`。`apply_desktop_window_state` 对收起中的窗口必须保持不可缩放，所有放置路径在 `show()` 前调用 `reapply_after_placement`。
 - 展开后的离开检测用 `desktop_edge_hide_pointer` 光标轮询，只在展开态轮询；不要依赖 DOM mouseleave，无边框窗口边缘的缩放热区会误报离开导致反复闪烁。菜单、右键菜单、操作遮罩用 `data-edge-hide-hold` 标记占用。
+- 同一个框在各显示器上的副本以 `primary_desktop_window_label_for(label).unwrap_or(label)` 为键共用开关与模式：读取一律走 `effective_edge_hide_config`（自己有记录用自己的，否则先主屏后其它副本取第一个已开启的，停靠边清空按本副本显示器重新解析）；`set_desktop_edge_hide` 要同步所有运行中副本和已有记录的副本，其它副本开启时先在展开态保存布局再直接收起，关闭时只改已有记录，不要为只读继承写入记录。
+- 自动模式优先选「自然停靠边」：工作区边缘与显示器边缘重合（任务栏边不算），且沿该边在框所占范围内没有相接的其它显示器（部分重叠也排除）；一条都没有才退回四边最近。固定边模式按用户选择。
 - 锁顺序固定为 `LAZY_WINDOW_OPERATION_LOCK` → 贴边锁 → `CONFIG_MUTATION_LOCK`，不能在 `with_config_mutation` 闭包里重新应用贴边；等待鼠标松开时不得持锁。
 
 ## 相关验证

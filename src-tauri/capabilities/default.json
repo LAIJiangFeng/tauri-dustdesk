@@ -13,7 +13,8 @@
     "desktop-launcher-monitor-*",
     "screenshot-overlay-*",
     "screenshot-pin-*",
-    "update-notice"
+    "update-notice",
+    "file-dialog-assist"
   ],
   "permissions": [
     "core:default",

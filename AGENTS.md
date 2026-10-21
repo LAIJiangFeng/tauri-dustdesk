@@ -87,6 +87,13 @@
 - 展开后的离开检测用 `desktop_edge_hide_pointer` 光标轮询，只在展开态轮询；不要依赖 DOM mouseleave，无边框窗口边缘的缩放热区会误报离开导致反复闪烁。菜单、右键菜单、操作遮罩用 `data-edge-hide-hold` 标记占用。
 - 锁顺序固定为 `LAZY_WINDOW_OPERATION_LOCK` → 贴边锁 → `CONFIG_MUTATION_LOCK`，不能在 `with_config_mutation` 闭包里重新应用贴边；等待鼠标松开时不得持锁。
 
+## 文件对话框搜索助手
+
+- 只用 `SetWinEventHook(..., WINEVENT_OUTOFCONTEXT)` 识别其它软件的打开/保存对话框，不注入 DLL、不挂键盘鼠标钩子。钩子在专用消息泵线程里，回调只 `PostThreadMessageW` 投递消息，不做窗口操作或耗时工作；面板的创建、移动、显示、隐藏放在阻塞 worker 里，按最新请求合并。
+- 系统级只挂 `EVENT_SYSTEM_FOREGROUND`；`EVENT_OBJECT_LOCATIONCHANGE` 和销毁/隐藏事件只按被跟踪对话框的进程与线程注册，对话框消失后立即注销。不要注册系统级位置变化钩子。
+- 保存对话框和选择文件夹对话框只跳转、不确认文件路径，绝不能覆盖保存；跳转时文件夹路径带结尾 `\`，跳转前先 `WM_GETTEXT` 记下文件名框原文字，跳转后恢复，软件预填的文件名不能丢。只有打开对话框里点文件才写入完整路径并 `BM_CLICK` 确认。
+- 面板是临时浮层，允许 `always_on_top`，但显示一律 `SWP_NOACTIVATE`，不抢焦点；DustDesk 自己进程里的对话框不处理。跨权限（管理员程序）消息被 UIPI 拦截时只提示并提供复制路径，钩子与面板出错只写诊断日志。
+
 ## 相关验证
 
 - 修改 Tauri 窗口逻辑后，在 `src-tauri` 下运行 `cargo check`。

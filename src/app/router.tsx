@@ -4,6 +4,7 @@ import { ClipboardOverlayPage } from "@/pages/clipboard-overlay-page"
 import { ClipboardPage } from "@/pages/clipboard-page"
 import { DesktopCardWindowPage } from "@/pages/desktop-card-window-page"
 import { DesktopWidgetPage } from "@/pages/desktop-widget-page"
+import { FileDialogAssistPage } from "@/pages/file-dialog-assist-page"
 import { HomePage } from "@/pages/home-page"
 import { LauncherPage } from "@/pages/launcher-page"
 import { OrganizerPage } from "@/pages/organizer-page"
@@ -22,6 +23,7 @@ export function AppRoutes() {
       <Route path="screenshot-overlay" element={<ScreenshotOverlayPage />} />
       <Route path="screenshot-pin" element={<ScreenshotPinPage />} />
       <Route path="update-notice" element={<UpdateNoticePage />} />
+      <Route path="file-dialog-assist" element={<FileDialogAssistPage />} />
       <Route path="desktop-widget" element={<DesktopWidgetPage />} />
       <Route path="desktop-card/:kind" element={<DesktopCardWindowPage />} />
       <Route path="desktop-card/:kind/:index" element={<DesktopCardWindowPage />} />

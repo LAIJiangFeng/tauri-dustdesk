@@ -221,6 +221,13 @@ pub struct AppSettings {
         default
     )]
     pub skipped_update_version: String,
+
+    #[serde(
+        rename = "FileDialogAssistEnabled",
+        alias = "file_dialog_assist_enabled",
+        default = "default_file_dialog_assist_enabled"
+    )]
+    pub file_dialog_assist_enabled: bool,
 }
 
 impl Default for AppSettings {
@@ -236,6 +243,7 @@ impl Default for AppSettings {
             screenshot_hide_window: false,
             auto_check_updates: default_auto_check_updates(),
             skipped_update_version: String::new(),
+            file_dialog_assist_enabled: default_file_dialog_assist_enabled(),
         }
     }
 }
@@ -517,6 +525,10 @@ fn default_search_enabled() -> bool {
 }
 
 fn default_auto_check_updates() -> bool {
+    true
+}
+
+fn default_file_dialog_assist_enabled() -> bool {
     true
 }
 

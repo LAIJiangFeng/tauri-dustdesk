@@ -35,6 +35,7 @@ const defaultSettings: AppSettings = {
   screenshot_hide_window: false,
   auto_check_updates: true,
   skipped_update_version: "",
+  file_dialog_assist_enabled: true,
 }
 
 const emptyDesktopLayout: DesktopLayout = {
@@ -286,6 +287,12 @@ async function call<T>(command: string, args?: InvokeArgs): Promise<T> {
         skipped_update_version: asString(args?.skippedUpdateVersion, defaultSettings.skipped_update_version),
       }) as T
     }
+    if (command === "update_file_dialog_assist_settings") {
+      return normalizeSettings({
+        ...defaultSettings,
+        file_dialog_assist_enabled: asBoolean(args?.enabled, defaultSettings.file_dialog_assist_enabled),
+      }) as T
+    }
     if (command === "classify_desktop_items") {
       return {
         moved: demoSnapshot.desktop_items.length,
@@ -489,6 +496,10 @@ function normalizeSettings(value: unknown): AppSettings {
     skipped_update_version: asString(
       raw.skipped_update_version ?? raw.SkippedUpdateVersion,
       defaultSettings.skipped_update_version,
+    ),
+    file_dialog_assist_enabled: asBoolean(
+      raw.file_dialog_assist_enabled ?? raw.FileDialogAssistEnabled,
+      defaultSettings.file_dialog_assist_enabled,
     ),
   }
 }
@@ -978,6 +989,7 @@ interface DustDeskState {
   getUpdateNotice: () => Promise<AppUpdateInfo | null>
   dismissUpdateNotice: () => Promise<void>
   updateUpdateSettings: (options: { autoCheckUpdates?: boolean; skippedUpdateVersion?: string }) => Promise<AppSettings>
+  updateFileDialogAssistSettings: (enabled: boolean) => Promise<AppSettings>
 }
 
 export const useDustDeskStore = create<DustDeskState>()(
@@ -1622,6 +1634,13 @@ export const useDustDeskStore = create<DustDeskState>()(
         state.snapshot.settings = normalizeSettings(settings)
       })
       return normalizeSettings(settings)
+    },
+    updateFileDialogAssistSettings: async (enabled) => {
+      const settings = normalizeSettings(await call<AppSettings>("update_file_dialog_assist_settings", { enabled }))
+      set((state) => {
+        state.snapshot.settings = settings
+      })
+      return settings
     },
   })),
 )

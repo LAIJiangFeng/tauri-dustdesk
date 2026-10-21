@@ -22,6 +22,7 @@ const emptyOverlay: SearchOverlayData = {
     screenshot_hide_window: false,
     auto_check_updates: true,
     skipped_update_version: "",
+    file_dialog_assist_enabled: true,
   },
   paths: [],
   recent: [],

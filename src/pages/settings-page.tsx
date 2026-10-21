@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react"
-import { ArrowsClockwise, Camera, Copy, Desktop, DownloadSimple, FolderOpen, GearSix, HardDrives, Keyboard, MagnifyingGlass, PlayCircle, Plus, X } from "@phosphor-icons/react"
+import { AppWindow, ArrowsClockwise, Camera, Copy, Desktop, DownloadSimple, FolderOpen, GearSix, HardDrives, Keyboard, MagnifyingGlass, PlayCircle, Plus, X } from "@phosphor-icons/react"
 import { open } from "@tauri-apps/plugin-dialog"
 import { DesktopFrameControlPanel } from "@/components/dustdesk/desktop-frame-control-panel"
 import { ShortcutInput, useShortcutDraft } from "@/components/dustdesk/shortcut-input"
@@ -26,6 +26,7 @@ export function SettingsPage() {
   const openUpdateDownload = useDustDeskStore((state) => state.openUpdateDownload)
   const getUpdateNotice = useDustDeskStore((state) => state.getUpdateNotice)
   const updateUpdateSettings = useDustDeskStore((state) => state.updateUpdateSettings)
+  const updateFileDialogAssistSettings = useDustDeskStore((state) => state.updateFileDialogAssistSettings)
   const { draft: shortcutDraft, setDraft: setShortcutDraft, resetDraft: resetShortcutDraft } = useShortcutDraft(snapshot.settings.clipboard_shortcut)
   const [isRecordingShortcut, setIsRecordingShortcut] = useState(false)
   const [isSavingShortcut, setIsSavingShortcut] = useState(false)
@@ -58,6 +59,9 @@ export function SettingsPage() {
   const [updateError, setUpdateError] = useState("")
   const [updateSuccess, setUpdateSuccess] = useState("")
   const [isSavingAutoCheck, setIsSavingAutoCheck] = useState(false)
+  const [isSavingFileDialogAssist, setIsSavingFileDialogAssist] = useState(false)
+  const [fileDialogAssistError, setFileDialogAssistError] = useState("")
+  const [fileDialogAssistSuccess, setFileDialogAssistSuccess] = useState("")
   const safeSearchPathsDraft = Array.isArray(searchPathsDraft) ? searchPathsDraft : []
   const effectiveSearchPaths = safeSearchPathsDraft.length > 0 ? safeSearchPathsDraft : [snapshot.organizer_root].filter(Boolean)
   const rows = [
@@ -288,6 +292,20 @@ export function SettingsPage() {
       setUpdateError(reason instanceof Error ? reason.message : String(reason))
     } finally {
       setIsSavingAutoCheck(false)
+    }
+  }
+
+  const toggleFileDialogAssist = async () => {
+    setIsSavingFileDialogAssist(true)
+    setFileDialogAssistError("")
+    setFileDialogAssistSuccess("")
+    try {
+      const settings = await updateFileDialogAssistSettings(!snapshot.settings.file_dialog_assist_enabled)
+      setFileDialogAssistSuccess(settings.file_dialog_assist_enabled ? "已开启文件对话框搜索助手" : "已关闭文件对话框搜索助手")
+    } catch (reason) {
+      setFileDialogAssistError(reason instanceof Error ? reason.message : String(reason))
+    } finally {
+      setIsSavingFileDialogAssist(false)
     }
   }
 
@@ -607,6 +625,46 @@ export function SettingsPage() {
                 <div className="mt-auto flex flex-wrap gap-2">
                   <Button type="button" disabled={isSavingStartup} onClick={() => void toggleLaunchOnStartup()}>
                     {isSavingStartup ? "保存中" : snapshot.settings.launch_on_startup ? "关闭开机自启" : "开启开机自启"}
+                  </Button>
+                </div>
+              </CardContent>
+            </Card>
+          </div>
+
+          <div className="mb-3 grid gap-3 xl:grid-cols-[minmax(0,1.05fr)_minmax(0,1.95fr)]">
+            <Card>
+              <CardContent className="flex min-h-44 flex-col gap-4 p-5">
+                <div className="flex size-11 items-center justify-center rounded-lg bg-muted text-muted-foreground">
+                  <AppWindow className="size-5" weight="duotone" />
+                </div>
+                <div>
+                  <h3 className="font-heading text-base font-medium">文件对话框搜索助手</h3>
+                  <p className="mt-2 text-sm leading-6 text-muted-foreground">其它软件弹出打开或保存对话框时，在下方显示 DustDesk 面板，一键跳到收纳目录或搜索收纳的文件。</p>
+                </div>
+                <Badge className="mt-auto w-fit" variant={snapshot.settings.file_dialog_assist_enabled ? "default" : "outline"}>
+                  {snapshot.settings.file_dialog_assist_enabled ? "已启用" : "已关闭"}
+                </Badge>
+              </CardContent>
+            </Card>
+
+            <Card>
+              <CardContent className="flex min-h-44 flex-col gap-4 p-5">
+                <div className="grid gap-2">
+                  <h3 className="font-heading text-base font-medium">对话框面板</h3>
+                  <p className="text-sm leading-6 text-muted-foreground">
+                    点文件夹让对话框跳转，打开对话框里点文件直接选中上传；保存对话框只跳转，不会覆盖文件。支持名称和拼音首字母搜索。
+                  </p>
+                  {fileDialogAssistSuccess ? <p className="text-xs leading-5 text-emerald-600 dark:text-emerald-400">{fileDialogAssistSuccess}</p> : null}
+                  {fileDialogAssistError ? <p className="text-xs leading-5 text-destructive">{fileDialogAssistError}</p> : null}
+                </div>
+                <div className="mt-auto flex flex-wrap gap-2">
+                  <Button
+                    type="button"
+                    aria-pressed={snapshot.settings.file_dialog_assist_enabled}
+                    disabled={isSavingFileDialogAssist}
+                    onClick={() => void toggleFileDialogAssist()}
+                  >
+                    {isSavingFileDialogAssist ? "保存中" : snapshot.settings.file_dialog_assist_enabled ? "关闭文件对话框助手" : "开启文件对话框助手"}
                   </Button>
                 </div>
               </CardContent>

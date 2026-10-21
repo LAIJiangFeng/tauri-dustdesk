@@ -3,6 +3,7 @@
 mod clipboard_bridge;
 mod desktop_edge_hide;
 mod desktop_item_actions;
+mod file_dialog_assist;
 mod models;
 mod screenshot;
 mod store;
@@ -13721,6 +13722,7 @@ fn main() {
             start_desktop_monitor_watch(app_handle.clone());
             screenshot::prewarm_overlays_async(app_handle.clone());
             update_notice::start_auto_check(app_handle.clone());
+            file_dialog_assist::start(app_handle.clone());
             let show_main_on_start = !is_startup_launch_invocation();
             let handle = app.handle().clone();
             tauri::async_runtime::spawn_blocking(move || {
@@ -13924,6 +13926,12 @@ fn main() {
             update_notice::get_update_notice,
             update_notice::dismiss_update_notice,
             update_notice::update_update_settings,
+            file_dialog_assist::file_dialog_assist_state,
+            file_dialog_assist::file_dialog_assist_search,
+            file_dialog_assist::file_dialog_assist_list,
+            file_dialog_assist::file_dialog_assist_execute,
+            file_dialog_assist::file_dialog_assist_focus_dialog,
+            file_dialog_assist::update_file_dialog_assist_settings,
             open_path,
             open_path_as_administrator,
             start_all_launchers,

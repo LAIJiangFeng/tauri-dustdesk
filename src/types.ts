@@ -161,6 +161,7 @@ export interface AppSettings {
   screenshot_hide_window: boolean
   auto_check_updates: boolean
   skipped_update_version: string
+  file_dialog_assist_enabled: boolean
 }
 
 export interface AppSnapshot {

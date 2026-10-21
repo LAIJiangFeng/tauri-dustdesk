@@ -6,7 +6,7 @@ import { DesktopWidgetPage } from "@/pages/desktop-widget-page"
 import { safeCurrentWindow } from "@/lib/tauri-window"
 import { useDustDeskStore } from "@/stores/dustdesk-store"
 
-const overlayRoutes = new Set(["clipboard-overlay", "search-overlay", "screenshot-overlay", "screenshot-pin", "update-notice"])
+const overlayRoutes = new Set(["clipboard-overlay", "search-overlay", "screenshot-overlay", "screenshot-pin", "update-notice", "file-dialog-assist"])
 
 function App() {
   const load = useDustDeskStore((state) => state.load)

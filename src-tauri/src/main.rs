@@ -1936,7 +1936,16 @@ fn update_runtime_directory_locked(target: String, path: String) -> Result<(), S
         return Err("目录不能为空".to_owned());
     }
 
-    recover_pending_runtime_migration_locked()?;
+    if let RuntimeMigrationOutcome::RolledBack(message) = recover_pending_runtime_migration_with(
+        &AppRuntimeMigrationJournalPersistence,
+        &AppRuntimeMigrationSteps,
+    )? {
+        // A stale migration that never touched config must not block the new request.
+        append_desktop_diagnostic(
+            "runtime_migration_rolled_back",
+            &format!("context=update message=\"{}\"", diagnostic_value(&message)),
+        );
+    }
 
     let old_store = AppStore::open().map_err(to_message)?;
     let requested_path = PathBuf::from(path);
@@ -1944,10 +1953,16 @@ fn update_runtime_directory_locked(target: String, path: String) -> Result<(), S
 
     let prospective_store = old_store
         .with_runtime_directory(&target, &requested_path)
-        .map_err(to_message)?;
-    prospective_store
-        .ensure_runtime_dirs()
-        .map_err(to_message)?;
+        .map_err(|error| {
+            runtime_directory_unwritable_message(
+                &target,
+                &requested_path,
+                &anyhow_io_reason(&error),
+            )
+        })?;
+    prospective_store.ensure_runtime_dirs().map_err(|error| {
+        runtime_directory_unwritable_message(&target, &requested_path, &anyhow_io_reason(&error))
+    })?;
     // `with_runtime_directory` canonicalizes to `\\?\` paths. Rewritten config and marker paths
     // must use the plain form that `AppStore::open()` reports, or they will not match later.
     let journal_path = |path: PathBuf| store::without_verbatim_prefix(&path).display().to_string();
@@ -1963,72 +1978,370 @@ fn update_runtime_directory_locked(target: String, path: String) -> Result<(), S
         new_organizer_root: journal_path(prospective_store.organizer_root()),
         new_launchers_root: journal_path(prospective_store.launchers_root()),
     };
-    save_runtime_migration_journal(&journal)?;
-    complete_runtime_migration_journal(journal)?;
-
-    Ok(())
+    match start_runtime_migration_with(
+        journal,
+        &AppRuntimeMigrationJournalPersistence,
+        &AppRuntimeMigrationSteps,
+        probe_runtime_directory_writable,
+    )? {
+        RuntimeMigrationOutcome::Completed => Ok(()),
+        RuntimeMigrationOutcome::RolledBack(message) => {
+            append_desktop_diagnostic(
+                "runtime_migration_rolled_back",
+                &format!("context=new message=\"{}\"", diagnostic_value(&message)),
+            );
+            Err(message)
+        }
+    }
 }
 
-fn recover_pending_runtime_migration_locked() -> Result<(), String> {
-    let Some(content) = AppStore::load_runtime_migration_journal().map_err(to_message)? else {
-        return Ok(());
-    };
-    let journal: RuntimeMigrationJournal = serde_json::from_str(&content).map_err(to_message)?;
-    complete_runtime_migration_journal(journal)
+/// Persistence for `%APPDATA%\DustDesk\runtime-migration.json`, injectable for tests.
+trait RuntimeMigrationJournalPersistence {
+    fn load(&self) -> Result<Option<String>, String>;
+    fn save(&self, bytes: &[u8]) -> Result<(), String>;
+    fn remove(&self) -> Result<(), String>;
 }
 
-fn complete_runtime_migration_journal(mut journal: RuntimeMigrationJournal) -> Result<(), String> {
-    let prospective_store = AppStore::from_runtime_dirs(
+struct AppRuntimeMigrationJournalPersistence;
+
+impl RuntimeMigrationJournalPersistence for AppRuntimeMigrationJournalPersistence {
+    fn load(&self) -> Result<Option<String>, String> {
+        AppStore::load_runtime_migration_journal().map_err(|error| format!("{error:#}"))
+    }
+
+    fn save(&self, bytes: &[u8]) -> Result<(), String> {
+        AppStore::save_runtime_migration_journal(bytes).map_err(|error| format!("{error:#}"))
+    }
+
+    fn remove(&self) -> Result<(), String> {
+        AppStore::remove_runtime_migration_journal().map_err(|error| format!("{error:#}"))
+    }
+}
+
+/// Side effects of each migration phase, injectable for tests.
+trait RuntimeMigrationSteps {
+    fn ensure_target_dirs(&self, journal: &RuntimeMigrationJournal) -> Result<(), String>;
+    fn copy_and_verify(&self, journal: &RuntimeMigrationJournal) -> Result<(), String>;
+    fn rewrite_paths(&self, journal: &RuntimeMigrationJournal) -> Result<(), String>;
+    /// Undo a possibly partial `rewrite_paths`; paths that were never rewritten stay untouched.
+    fn revert_rewritten_paths(&self, journal: &RuntimeMigrationJournal) -> Result<(), String>;
+    fn switch_directory(&self, journal: &RuntimeMigrationJournal) -> Result<(), String>;
+    fn cleanup_sources(&self, journal: &RuntimeMigrationJournal) -> Result<(), String>;
+}
+
+struct AppRuntimeMigrationSteps;
+
+fn runtime_migration_prospective_store(journal: &RuntimeMigrationJournal) -> AppStore {
+    AppStore::from_runtime_dirs(
         PathBuf::from(&journal.new_data_dir),
         PathBuf::from(&journal.new_organizer_root),
         PathBuf::from(&journal.new_launchers_root),
-    );
-    prospective_store
-        .ensure_runtime_dirs()
-        .map_err(to_message)?;
+    )
+}
 
-    if runtime_migration_phase_index(&journal.phase) < runtime_migration_phase_index("copied") {
-        copy_runtime_migration_contents(&journal)?;
-        verify_runtime_migration_contents(&journal)?;
-        set_runtime_migration_phase(&mut journal, "copied")?;
+impl RuntimeMigrationSteps for AppRuntimeMigrationSteps {
+    fn ensure_target_dirs(&self, journal: &RuntimeMigrationJournal) -> Result<(), String> {
+        runtime_migration_prospective_store(journal)
+            .ensure_runtime_dirs()
+            .map_err(|error| format!("{error:#}"))
     }
 
-    if runtime_migration_phase_index(&journal.phase) < runtime_migration_phase_index("rewritten") {
-        rewrite_runtime_migration_paths(&journal, &prospective_store)?;
-        set_runtime_migration_phase(&mut journal, "rewritten")?;
+    fn copy_and_verify(&self, journal: &RuntimeMigrationJournal) -> Result<(), String> {
+        copy_runtime_migration_contents(journal)?;
+        verify_runtime_migration_contents(journal)
     }
 
-    if runtime_migration_phase_index(&journal.phase) < runtime_migration_phase_index("switched") {
+    fn rewrite_paths(&self, journal: &RuntimeMigrationJournal) -> Result<(), String> {
+        rewrite_runtime_migration_paths(journal, &runtime_migration_prospective_store(journal))
+    }
+
+    fn revert_rewritten_paths(&self, journal: &RuntimeMigrationJournal) -> Result<(), String> {
+        // The forward rewrite edits the files of the prospective store; map new roots back.
+        let mut reversed = journal.clone();
+        std::mem::swap(&mut reversed.old_data_dir, &mut reversed.new_data_dir);
+        std::mem::swap(
+            &mut reversed.old_organizer_root,
+            &mut reversed.new_organizer_root,
+        );
+        std::mem::swap(
+            &mut reversed.old_launchers_root,
+            &mut reversed.new_launchers_root,
+        );
+        rewrite_runtime_migration_paths(&reversed, &runtime_migration_prospective_store(journal))
+    }
+
+    fn switch_directory(&self, journal: &RuntimeMigrationJournal) -> Result<(), String> {
         let new_store =
             AppStore::set_runtime_directory(&journal.target, Path::new(&journal.requested_path))
-                .map_err(to_message)?;
+                .map_err(|error| format!("{error:#}"))?;
         if let Err(error) = repair_existing_app_desktop_entries(&new_store) {
             eprintln!("DustDesk 运行目录已切换，但桌面入口暂未更新：{error}");
         }
-        set_runtime_migration_phase(&mut journal, "switched")?;
+        Ok(())
+    }
+
+    fn cleanup_sources(&self, journal: &RuntimeMigrationJournal) -> Result<(), String> {
+        cleanup_runtime_migration_sources(journal)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RuntimeMigrationOutcome {
+    Completed,
+    /// The migration failed before config was rewritten and was cancelled; carries the message.
+    RolledBack(String),
+}
+
+/// Probes the new root, then persists a `prepared` journal and runs it. Nothing is persisted when
+/// the target is not writable.
+fn start_runtime_migration_with(
+    journal: RuntimeMigrationJournal,
+    persistence: &impl RuntimeMigrationJournalPersistence,
+    steps: &impl RuntimeMigrationSteps,
+    probe: impl Fn(&Path) -> io::Result<()>,
+) -> Result<RuntimeMigrationOutcome, String> {
+    let (_, target_root) = runtime_migration_primary_pair(&journal);
+    probe(&target_root).map_err(|error| {
+        runtime_directory_unwritable_message(
+            &journal.target,
+            &target_root,
+            &io_error_reason(&error),
+        )
+    })?;
+    save_runtime_migration_journal(persistence, &journal)?;
+    finish_runtime_migration_journal(journal, persistence, steps)
+}
+
+fn recover_pending_runtime_migration_with(
+    persistence: &impl RuntimeMigrationJournalPersistence,
+    steps: &impl RuntimeMigrationSteps,
+) -> Result<RuntimeMigrationOutcome, String> {
+    let Some(content) = persistence.load()? else {
+        return Ok(RuntimeMigrationOutcome::Completed);
+    };
+    let journal: RuntimeMigrationJournal = serde_json::from_str(&content)
+        .map_err(|error| format!("运行目录迁移记录无法解析：{error}"))?;
+    finish_runtime_migration_journal(journal, persistence, steps)
+}
+
+fn recover_pending_runtime_migration_on_startup() -> Result<(), String> {
+    store::with_storage_mutation(|| {
+        recover_runtime_migration_for_startup_with(
+            &AppRuntimeMigrationJournalPersistence,
+            &AppRuntimeMigrationSteps,
+            append_desktop_diagnostic,
+        )
+    })
+}
+
+/// A rolled back journal is logged and startup continues; later-phase failures still abort.
+fn recover_runtime_migration_for_startup_with(
+    persistence: &impl RuntimeMigrationJournalPersistence,
+    steps: &impl RuntimeMigrationSteps,
+    mut diagnostic: impl FnMut(&str, &str),
+) -> Result<(), String> {
+    if let RuntimeMigrationOutcome::RolledBack(message) =
+        recover_pending_runtime_migration_with(persistence, steps)?
+    {
+        diagnostic(
+            "runtime_migration_rolled_back",
+            &format!("context=startup message=\"{}\"", diagnostic_value(&message)),
+        );
+    }
+    Ok(())
+}
+
+/// Runs the remaining phases. A failure while the phase is still `prepared` / `copied` is rolled
+/// back: the journal is removed and source, config, marker and path files stay as they were.
+/// From `rewritten` on the migration must be finished, so the journal is kept.
+fn finish_runtime_migration_journal(
+    mut journal: RuntimeMigrationJournal,
+    persistence: &impl RuntimeMigrationJournalPersistence,
+    steps: &impl RuntimeMigrationSteps,
+) -> Result<RuntimeMigrationOutcome, String> {
+    // A `copied` journal may come from a run interrupted inside the rewrite step.
+    let mut rewrite_may_be_partial = journal.phase == "copied";
+    let result = complete_runtime_migration_journal(&mut journal, persistence, steps, || {
+        rewrite_may_be_partial = true;
+    });
+    let Err(error) = result else {
+        return Ok(RuntimeMigrationOutcome::Completed);
+    };
+
+    let (source, target) = runtime_migration_primary_pair(&journal);
+    if !runtime_migration_phase_allows_rollback(&journal.phase) {
+        return Err(format!(
+            "运行目录迁移未完成（{} → {}）：{error}。配置已指向新目录，将在下次修改目录或启动时继续完成迁移。",
+            source.display(),
+            target.display()
+        ));
+    }
+
+    let revert_error = if rewrite_may_be_partial {
+        steps.revert_rewritten_paths(&journal).err()
+    } else {
+        None
+    };
+    persistence.remove().map_err(|remove_error| {
+        format!(
+            "运行目录迁移失败（{} → {}）：{error}。取消迁移时无法删除迁移记录：{remove_error}",
+            source.display(),
+            target.display()
+        )
+    })?;
+
+    let mut message = format!(
+        "运行目录迁移失败：{} → {}：{error}。",
+        source.display(),
+        target.display()
+    );
+    match revert_error {
+        None => message.push_str("已取消本次迁移，原目录和配置均未改动。"),
+        Some(revert_error) => message.push_str(&format!(
+            "已取消本次迁移，原目录未改动，但恢复配置中的路径记录时出错：{revert_error}。"
+        )),
+    }
+    message.push_str("目标文件夹里可能留有部分副本，可以手动删除。");
+    Ok(RuntimeMigrationOutcome::RolledBack(message))
+}
+
+fn runtime_migration_phase_allows_rollback(phase: &str) -> bool {
+    matches!(phase, "prepared" | "copied")
+}
+
+fn complete_runtime_migration_journal(
+    journal: &mut RuntimeMigrationJournal,
+    persistence: &impl RuntimeMigrationJournalPersistence,
+    steps: &impl RuntimeMigrationSteps,
+    mut before_rewrite: impl FnMut(),
+) -> Result<(), String> {
+    steps.ensure_target_dirs(journal)?;
+
+    if runtime_migration_phase_index(&journal.phase) < runtime_migration_phase_index("copied") {
+        steps.copy_and_verify(journal)?;
+        set_runtime_migration_phase(persistence, journal, "copied")?;
+    }
+
+    if runtime_migration_phase_index(&journal.phase) < runtime_migration_phase_index("rewritten") {
+        before_rewrite();
+        steps.rewrite_paths(journal)?;
+        set_runtime_migration_phase(persistence, journal, "rewritten")?;
+    }
+
+    if runtime_migration_phase_index(&journal.phase) < runtime_migration_phase_index("switched") {
+        steps.switch_directory(journal)?;
+        set_runtime_migration_phase(persistence, journal, "switched")?;
     }
 
     if runtime_migration_phase_index(&journal.phase) < runtime_migration_phase_index("cleaned") {
-        if let Err(error) = cleanup_runtime_migration_sources(&journal) {
+        if let Err(error) = steps.cleanup_sources(journal) {
             eprintln!("DustDesk 运行目录已安全切换，旧目录暂未完全清理：{error}");
         }
-        set_runtime_migration_phase(&mut journal, "cleaned")?;
+        set_runtime_migration_phase(persistence, journal, "cleaned")?;
     }
 
-    AppStore::remove_runtime_migration_journal().map_err(to_message)
+    persistence.remove()
 }
 
-fn save_runtime_migration_journal(journal: &RuntimeMigrationJournal) -> Result<(), String> {
+fn save_runtime_migration_journal(
+    persistence: &impl RuntimeMigrationJournalPersistence,
+    journal: &RuntimeMigrationJournal,
+) -> Result<(), String> {
     let json = serde_json::to_vec_pretty(journal).map_err(to_message)?;
-    AppStore::save_runtime_migration_journal(&json).map_err(to_message)
+    persistence.save(&json)
 }
 
+/// The in-memory phase advances before persisting, so a step that succeeded is never rolled back
+/// even if recording it failed.
 fn set_runtime_migration_phase(
+    persistence: &impl RuntimeMigrationJournalPersistence,
     journal: &mut RuntimeMigrationJournal,
     phase: &str,
 ) -> Result<(), String> {
     journal.phase = phase.to_owned();
-    save_runtime_migration_journal(journal)
+    save_runtime_migration_journal(persistence, journal)
+}
+
+/// The root the user picked and the root it replaces, used for messages and the write probe.
+fn runtime_migration_primary_pair(journal: &RuntimeMigrationJournal) -> (PathBuf, PathBuf) {
+    match journal.target.as_str() {
+        "data" => (
+            PathBuf::from(&journal.old_data_dir),
+            PathBuf::from(&journal.new_data_dir),
+        ),
+        "launchers" => (
+            PathBuf::from(&journal.old_launchers_root),
+            PathBuf::from(&journal.new_launchers_root),
+        ),
+        _ => (
+            PathBuf::from(&journal.old_organizer_root),
+            PathBuf::from(&journal.new_organizer_root),
+        ),
+    }
+}
+
+/// Creates, writes and deletes a uniquely named file. The name follows the internal staging pattern
+/// (`.dustdesk-transfer-s<hex>-<n>.tmp`) so scans filter it even if deletion is interrupted.
+fn probe_runtime_directory_writable(dir: &Path) -> io::Result<()> {
+    for index in 0..1000 {
+        let candidate = dir.join(format!(".dustdesk-transfer-{}-{index}.tmp", now_id()));
+        let mut file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+        let write_result = file
+            .write_all(b"DustDesk write probe")
+            .and_then(|()| file.sync_all());
+        drop(file);
+        let remove_result = fs::remove_file(&candidate);
+        write_result?;
+        return remove_result;
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "无法生成唯一的写入探测文件名",
+    ))
+}
+
+fn io_error_reason(error: &io::Error) -> String {
+    match error.kind() {
+        io::ErrorKind::PermissionDenied => "拒绝访问".to_owned(),
+        _ => error.to_string(),
+    }
+}
+
+fn anyhow_io_reason(error: &anyhow::Error) -> String {
+    match error.downcast_ref::<io::Error>() {
+        Some(io_error) => io_error_reason(io_error),
+        None => format!("{error:#}"),
+    }
+}
+
+fn runtime_directory_unwritable_message(target: &str, path: &Path, reason: &str) -> String {
+    let folder = match target {
+        "data" => "Data",
+        "launchers" => "Launchers",
+        _ => "DesktopOrganizer",
+    };
+    let example = env::var_os("USERPROFILE")
+        .filter(|profile| !profile.is_empty())
+        .map(|profile| {
+            PathBuf::from(profile)
+                .join("DustDesk")
+                .join(folder)
+                .display()
+                .to_string()
+        })
+        .unwrap_or_else(|| format!("C:\\Users\\<用户名>\\DustDesk\\{folder}"));
+    format!(
+        "无法写入所选目录：{}（{reason}）。请选择当前用户有写入权限的文件夹，例如 {example}。C:\\Users 下其他用户或用管理员权限创建的文件夹、C 盘根目录、Program Files 通常不可写。",
+        store::without_verbatim_prefix(path).display()
+    )
 }
 
 fn runtime_migration_phase_index(phase: &str) -> usize {
@@ -14340,7 +14653,7 @@ fn main() {
                 let mut loading_visible_at = None;
                 let recovery_result =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        store::with_storage_mutation(recover_pending_runtime_migration_locked)?;
+                        recover_pending_runtime_migration_on_startup()?;
                         if let Err(error) =
                             with_lazy_window_operation(|| show_persisted_desktop_layout(&handle))
                         {
@@ -14582,4 +14895,357 @@ fn main() {
         }
         _ => {}
     });
+}
+
+#[cfg(test)]
+mod runtime_migration_tests {
+    use super::*;
+    use std::{
+        cell::{Cell, RefCell},
+        time::UNIX_EPOCH,
+    };
+
+    #[derive(Default)]
+    struct FakeJournalPersistence {
+        content: RefCell<Option<Vec<u8>>>,
+        saves: Cell<usize>,
+    }
+
+    impl FakeJournalPersistence {
+        fn with_journal(journal: &RuntimeMigrationJournal) -> Self {
+            let persistence = Self::default();
+            *persistence.content.borrow_mut() =
+                Some(serde_json::to_vec(journal).expect("serialize journal"));
+            persistence
+        }
+
+        fn stored(&self) -> Option<RuntimeMigrationJournal> {
+            self.content
+                .borrow()
+                .as_ref()
+                .map(|bytes| serde_json::from_slice(bytes).expect("parse journal"))
+        }
+    }
+
+    impl RuntimeMigrationJournalPersistence for FakeJournalPersistence {
+        fn load(&self) -> Result<Option<String>, String> {
+            Ok(self
+                .content
+                .borrow()
+                .as_ref()
+                .map(|bytes| String::from_utf8(bytes.clone()).expect("utf8 journal")))
+        }
+
+        fn save(&self, bytes: &[u8]) -> Result<(), String> {
+            self.saves.set(self.saves.get() + 1);
+            *self.content.borrow_mut() = Some(bytes.to_vec());
+            Ok(())
+        }
+
+        fn remove(&self) -> Result<(), String> {
+            *self.content.borrow_mut() = None;
+            Ok(())
+        }
+    }
+
+    /// Records the steps it ran; `fail_at` makes that step fail. `copy_and_verify` can run the real
+    /// copy so filesystem effects are observable.
+    #[derive(Default)]
+    struct FakeSteps {
+        fail_at: Option<&'static str>,
+        real_copy: bool,
+        calls: RefCell<Vec<&'static str>>,
+    }
+
+    impl FakeSteps {
+        fn failing_at(step: &'static str) -> Self {
+            Self {
+                fail_at: Some(step),
+                ..Self::default()
+            }
+        }
+
+        fn run(&self, step: &'static str) -> Result<(), String> {
+            self.calls.borrow_mut().push(step);
+            if self.fail_at == Some(step) {
+                return Err(format!("{step} 拒绝访问。 (os error 5)"));
+            }
+            Ok(())
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    impl RuntimeMigrationSteps for FakeSteps {
+        fn ensure_target_dirs(&self, _journal: &RuntimeMigrationJournal) -> Result<(), String> {
+            self.run("ensure")
+        }
+
+        fn copy_and_verify(&self, journal: &RuntimeMigrationJournal) -> Result<(), String> {
+            self.run("copy")?;
+            if self.real_copy {
+                AppRuntimeMigrationSteps.copy_and_verify(journal)?;
+            }
+            Ok(())
+        }
+
+        fn rewrite_paths(&self, _journal: &RuntimeMigrationJournal) -> Result<(), String> {
+            self.run("rewrite")
+        }
+
+        fn revert_rewritten_paths(&self, _journal: &RuntimeMigrationJournal) -> Result<(), String> {
+            self.run("revert")
+        }
+
+        fn switch_directory(&self, _journal: &RuntimeMigrationJournal) -> Result<(), String> {
+            self.run("switch")
+        }
+
+        fn cleanup_sources(&self, _journal: &RuntimeMigrationJournal) -> Result<(), String> {
+            self.run("cleanup")
+        }
+    }
+
+    fn test_dir(prefix: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("{prefix}-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create test dir");
+        dir
+    }
+
+    fn organizer_journal(phase: &str, old_root: &Path, new_root: &Path) -> RuntimeMigrationJournal {
+        RuntimeMigrationJournal {
+            target: "organizer".to_owned(),
+            phase: phase.to_owned(),
+            requested_path: new_root.display().to_string(),
+            old_data_dir: "X:\\DustDesk\\Data".to_owned(),
+            old_organizer_root: old_root.display().to_string(),
+            old_launchers_root: "X:\\DustDesk\\Launchers".to_owned(),
+            new_data_dir: "X:\\DustDesk\\Data".to_owned(),
+            new_organizer_root: new_root.display().to_string(),
+            new_launchers_root: "X:\\DustDesk\\Launchers".to_owned(),
+        }
+    }
+
+    fn sample_journal(phase: &str) -> RuntimeMigrationJournal {
+        organizer_journal(
+            phase,
+            Path::new("D:\\Software\\DustDesk\\DesktopOrganizer"),
+            Path::new("E:\\Target\\DesktopOrganizer"),
+        )
+    }
+
+    #[test]
+    fn unwritable_target_is_rejected_before_journal_is_written() {
+        let persistence = FakeJournalPersistence::default();
+        let steps = FakeSteps::default();
+        let error =
+            start_runtime_migration_with(sample_journal("prepared"), &persistence, &steps, |_| {
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            })
+            .expect_err("unwritable target must fail");
+
+        assert!(error.contains("无法写入所选目录：E:\\Target\\DesktopOrganizer（拒绝访问）"));
+        assert!(error.contains("DustDesk"));
+        assert!(error.contains("Program Files"));
+        assert_eq!(persistence.saves.get(), 0);
+        assert!(persistence.stored().is_none());
+        assert!(steps.calls().is_empty());
+    }
+
+    #[test]
+    fn target_that_cannot_be_created_is_rejected_without_journal() {
+        let root = test_dir("dustdesk-runtime-probe-blocked");
+        let blocker = root.join("not-a-folder");
+        fs::write(&blocker, b"file").expect("write blocker");
+        let new_root = blocker.join("DesktopOrganizer");
+        let persistence = FakeJournalPersistence::default();
+        let steps = FakeSteps::default();
+
+        let error = start_runtime_migration_with(
+            organizer_journal("prepared", &root.join("old"), &new_root),
+            &persistence,
+            &steps,
+            probe_runtime_directory_writable,
+        )
+        .expect_err("probe inside a file must fail");
+
+        assert!(error.contains(&new_root.display().to_string()));
+        assert_eq!(persistence.saves.get(), 0);
+        assert!(steps.calls().is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn write_probe_leaves_no_file_and_uses_internal_name() {
+        let root = test_dir("dustdesk-runtime-probe-ok");
+        probe_runtime_directory_writable(&root).expect("probe writable dir");
+        assert_eq!(fs::read_dir(&root).expect("read dir").count(), 0);
+        assert!(is_internal_transfer_path(
+            &root.join(format!(".dustdesk-transfer-{}-0.tmp", now_id()))
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepared_copy_failure_rolls_back_without_touching_source_or_existing_target() {
+        let root = test_dir("dustdesk-runtime-rollback");
+        let source = root.join("old");
+        let target = root.join("new");
+        fs::create_dir_all(source.join("工作")).expect("create source category");
+        fs::write(source.join("工作").join("a.txt"), b"source a").expect("write a");
+        fs::write(source.join("conflict.txt"), b"source version").expect("write conflict");
+        fs::create_dir_all(&target).expect("create target");
+        fs::write(target.join("conflict.txt"), b"existing target version").expect("write t");
+        fs::write(target.join("keep.txt"), b"keep me").expect("write keep");
+
+        let persistence = FakeJournalPersistence::default();
+        let steps = FakeSteps {
+            real_copy: true,
+            ..FakeSteps::default()
+        };
+        let outcome = start_runtime_migration_with(
+            organizer_journal("prepared", &source, &target),
+            &persistence,
+            &steps,
+            probe_runtime_directory_writable,
+        )
+        .expect("rollback is not an error outcome");
+
+        let RuntimeMigrationOutcome::RolledBack(message) = outcome else {
+            panic!("expected rollback, got {outcome:?}");
+        };
+        assert!(message.contains(&source.display().to_string()));
+        assert!(message.contains(&target.display().to_string()));
+        assert!(message.contains("已取消本次迁移，原目录和配置均未改动"));
+        assert!(message.contains("可以手动删除"));
+        assert!(persistence.stored().is_none());
+        assert_eq!(steps.calls(), vec!["ensure", "copy"]);
+
+        assert_eq!(
+            fs::read(source.join("工作").join("a.txt")).expect("source a"),
+            b"source a"
+        );
+        assert_eq!(
+            fs::read(source.join("conflict.txt")).expect("source conflict"),
+            b"source version"
+        );
+        assert_eq!(
+            fs::read(target.join("conflict.txt")).expect("target conflict"),
+            b"existing target version"
+        );
+        assert_eq!(fs::read(target.join("keep.txt")).expect("keep"), b"keep me");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn copied_rewrite_failure_reverts_paths_and_removes_journal() {
+        let persistence = FakeJournalPersistence::with_journal(&sample_journal("copied"));
+        let steps = FakeSteps::failing_at("rewrite");
+
+        let outcome =
+            recover_pending_runtime_migration_with(&persistence, &steps).expect("rollback outcome");
+
+        assert!(matches!(outcome, RuntimeMigrationOutcome::RolledBack(_)));
+        assert_eq!(steps.calls(), vec!["ensure", "rewrite", "revert"]);
+        assert!(persistence.stored().is_none());
+    }
+
+    #[test]
+    fn prepared_failure_before_rewrite_does_not_revert_paths() {
+        let persistence = FakeJournalPersistence::with_journal(&sample_journal("prepared"));
+        let steps = FakeSteps::failing_at("copy");
+
+        let outcome =
+            recover_pending_runtime_migration_with(&persistence, &steps).expect("rollback outcome");
+
+        assert!(matches!(outcome, RuntimeMigrationOutcome::RolledBack(_)));
+        assert_eq!(steps.calls(), vec!["ensure", "copy"]);
+        assert!(persistence.stored().is_none());
+    }
+
+    #[test]
+    fn rewritten_or_later_failures_are_not_rolled_back() {
+        for (phase, failing_step) in [("rewritten", "switch"), ("switched", "ensure")] {
+            let persistence = FakeJournalPersistence::with_journal(&sample_journal(phase));
+            let steps = FakeSteps::failing_at(failing_step);
+
+            let error = recover_pending_runtime_migration_with(&persistence, &steps)
+                .expect_err("late failure must surface");
+
+            assert!(error.contains("D:\\Software\\DustDesk\\DesktopOrganizer"));
+            assert!(error.contains("E:\\Target\\DesktopOrganizer"));
+            assert!(!steps.calls().contains(&"revert"));
+            assert_eq!(persistence.stored().expect("journal kept").phase, phase);
+        }
+    }
+
+    #[test]
+    fn rewrite_success_then_switch_failure_keeps_rewritten_journal() {
+        let persistence = FakeJournalPersistence::with_journal(&sample_journal("prepared"));
+        let steps = FakeSteps::failing_at("switch");
+
+        recover_pending_runtime_migration_with(&persistence, &steps)
+            .expect_err("switch failure must surface");
+
+        assert_eq!(steps.calls(), vec!["ensure", "copy", "rewrite", "switch"]);
+        assert_eq!(
+            persistence.stored().expect("journal kept").phase,
+            "rewritten"
+        );
+    }
+
+    #[test]
+    fn successful_migration_runs_all_phases_and_removes_journal() {
+        let persistence = FakeJournalPersistence::default();
+        let steps = FakeSteps::default();
+
+        let outcome =
+            start_runtime_migration_with(sample_journal("prepared"), &persistence, &steps, |_| {
+                Ok(())
+            })
+            .expect("migration succeeds");
+
+        assert_eq!(outcome, RuntimeMigrationOutcome::Completed);
+        assert_eq!(
+            steps.calls(),
+            vec!["ensure", "copy", "rewrite", "switch", "cleanup"]
+        );
+        assert!(persistence.stored().is_none());
+    }
+
+    #[test]
+    fn startup_recovery_continues_after_rolling_back_failed_journal() {
+        let persistence = FakeJournalPersistence::with_journal(&sample_journal("prepared"));
+        let steps = FakeSteps::failing_at("copy");
+        let mut events = Vec::new();
+
+        recover_runtime_migration_for_startup_with(&persistence, &steps, |event, details| {
+            events.push((event.to_owned(), details.to_owned()))
+        })
+        .expect("startup continues");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "runtime_migration_rolled_back");
+        assert!(events[0].1.contains("context=startup"));
+        assert!(persistence.stored().is_none());
+    }
+
+    #[test]
+    fn startup_recovery_still_fails_for_late_phase_journal() {
+        let persistence = FakeJournalPersistence::with_journal(&sample_journal("rewritten"));
+        let steps = FakeSteps::failing_at("switch");
+        let mut events = 0;
+
+        recover_runtime_migration_for_startup_with(&persistence, &steps, |_, _| events += 1)
+            .expect_err("late phase failure aborts startup recovery");
+
+        assert_eq!(events, 0);
+        assert!(persistence.stored().is_some());
+    }
 }

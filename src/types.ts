@@ -174,6 +174,7 @@ export interface AppSnapshot {
   desktop_items: DesktopItem[]
   launchers: LaunchItem[]
   clipboard: ClipboardHistoryItem[]
+  organizer_on_desktop_volume: boolean
 }
 
 export interface ScreenshotMonitor {

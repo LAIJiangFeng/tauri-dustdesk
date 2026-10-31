@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react"
-import { AppWindow, ArrowsClockwise, Camera, Copy, Desktop, DownloadSimple, FolderOpen, GearSix, HardDrives, Keyboard, MagnifyingGlass, PlayCircle, Plus, X } from "@phosphor-icons/react"
+import { AppWindow, ArrowsClockwise, Camera, Copy, Desktop, DownloadSimple, FolderOpen, GearSix, HardDrives, Keyboard, MagnifyingGlass, PlayCircle, Plus, Warning, X } from "@phosphor-icons/react"
 import { open } from "@tauri-apps/plugin-dialog"
 import { DesktopFrameControlPanel } from "@/components/dustdesk/desktop-frame-control-panel"
 import { ShortcutInput, useShortcutDraft } from "@/components/dustdesk/shortcut-input"
@@ -76,6 +76,9 @@ export function SettingsPage() {
       value: snapshot.organizer_root,
       target: "organizer" as const,
       icon: FolderOpen,
+      warning: snapshot.organizer_on_desktop_volume
+        ? ""
+        : "收纳目录与桌面不在同一磁盘，收纳大文件或文件夹需要跨盘复制，会很慢；建议改到桌面所在磁盘。",
     },
     {
       name: "快捷启动目录",
@@ -745,6 +748,12 @@ export function SettingsPage() {
                         <p className="mt-2 min-w-0 truncate font-mono text-[13px] leading-6 text-muted-foreground" title={row.value}>
                           {row.value || "等待读取"}
                         </p>
+                        {row.warning ? (
+                          <p className="mt-2 flex items-start gap-1.5 text-xs leading-5 text-amber-700 dark:text-amber-400">
+                            <Warning className="mt-0.5 size-3.5 shrink-0" weight="fill" />
+                            <span>{row.warning}</span>
+                          </p>
+                        ) : null}
                       </div>
                     </div>
                     <div className="mt-auto grid gap-2">

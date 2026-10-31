@@ -18,6 +18,9 @@ pub struct AppSnapshot {
     pub desktop_items: Vec<DesktopItem>,
     pub launchers: Vec<LaunchItem>,
     pub clipboard: Vec<ClipboardHistoryItem>,
+    /// False only when the organizer root is known to be on another volume than the desktop.
+    #[serde(default = "default_organizer_on_desktop_volume")]
+    pub organizer_on_desktop_volume: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -529,6 +532,10 @@ fn default_auto_check_updates() -> bool {
 }
 
 fn default_file_dialog_assist_enabled() -> bool {
+    true
+}
+
+fn default_organizer_on_desktop_volume() -> bool {
     true
 }
 

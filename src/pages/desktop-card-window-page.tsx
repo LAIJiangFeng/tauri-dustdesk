@@ -35,6 +35,7 @@ import { categoryBoxEntry, DesktopBoxItemList, recycleConfirmMessage, recycleRes
 import { DesktopEdgeHideMenuSection } from "@/components/dustdesk/desktop-edge-hide-menu-section"
 import { DesktopEdgeHideShell } from "@/components/dustdesk/desktop-edge-hide-shell"
 import { SettingsMenuSection } from "@/components/dustdesk/settings-menu-section"
+import { describeBackgroundTransfer, describeOwnTransfer, TransferProgress, useDesktopTransferProgress, type TransferProgressView } from "@/components/dustdesk/transfer-progress"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { useDesktopEdgeHide } from "@/hooks/use-desktop-edge-hide"
@@ -105,6 +106,14 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
   const [isMergingCategories, setIsMergingCategories] = useState(false)
   const [dropOperationLabel, setDropOperationLabel] = useState("")
   const desktopOperationLabel = isClassifyingDesktop ? notice || "正在智能收纳桌面..." : isRestoringDesktop ? notice || "正在还原桌面..." : isMergingCategories ? "正在合并分类..." : dropOperationLabel
+  const { ownTransfer, backgroundTransfer, trackTransfer } = useDesktopTransferProgress()
+  const desktopOperationView: TransferProgressView | null = !desktopOperationLabel
+    ? null
+    : isClassifyingDesktop || isRestoringDesktop
+      ? describeBackgroundTransfer(backgroundTransfer, desktopOperationLabel)
+      : isMergingCategories
+        ? { label: desktopOperationLabel, percent: null }
+        : describeOwnTransfer(ownTransfer, desktopOperationLabel)
   const pendingClassifyActionRef = useRef<"split-all" | null>(null)
   const previousSplitCategoryIndicesRef = useRef<number[]>([])
   const desktopOperationRef = useRef<{
@@ -288,7 +297,7 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
           ),
         )
         setDropOperationLabel(`正在${movedBetweenCategories ? "移动" : "收纳"} ${paths.length} 项到「${category?.name ?? "分类"}」...`)
-        const added = await addItemsToCategoryLight(index, paths)
+        const added = await trackTransfer(() => addItemsToCategoryLight(index, paths))
         setNotice(countNotice(movedBetweenCategories ? "已移动" : "已收纳", added, paths.length, "没有新增收纳项目"))
       }
     } catch (error) {
@@ -301,7 +310,7 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
   async function handleRestoreDragOut(path: string, position: DesktopDropPosition) {
     try {
       setDropOperationLabel(`正在识别拖拽目标：${displayPathName(path)}`)
-      const outcome = await completeInternalPathDragLight(index, path, position)
+      const outcome = await trackTransfer(() => completeInternalPathDragLight(index, path, position))
       if (outcome.action === "moved_to_category") {
         const targetName = snapshot.categories[outcome.target_category_index ?? -1]?.name ?? "目标分类"
         setNotice(`已移动到「${targetName}」：${displayPathName(path)}`)
@@ -729,7 +738,7 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
               onRestoreDragOut={handleRestoreDragOut}
             />
           )}
-          {desktopOperationLabel ? <WidgetOperationOverlay label={desktopOperationLabel} /> : null}
+          {desktopOperationView ? <WidgetOperationOverlay view={desktopOperationView} /> : null}
         </section>
         {notice ? (
           <div className="pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full bg-slate-950/70 px-3 py-1 text-xs text-white/80 ring-1 ring-white/10">{notice}</div>
@@ -750,13 +759,10 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
   )
 }
 
-function WidgetOperationOverlay({ label }: { label: string }) {
+function WidgetOperationOverlay({ view }: { view: TransferProgressView }) {
   return (
     <div data-edge-hide-hold="" className="no-drag pointer-events-none absolute inset-0 z-40 grid place-items-center bg-slate-950/60 backdrop-blur-md">
-      <div className="flex items-center gap-2 rounded-xl border border-white/15 bg-slate-950/90 px-3 py-2 text-xs font-semibold text-white shadow-2xl shadow-black/30">
-        <ArrowsClockwise className="size-4 animate-spin text-emerald-300" weight="duotone" />
-        <span>{label}</span>
-      </div>
+      <TransferProgress view={view} className="rounded-xl border border-white/15 bg-slate-950/90 px-3 py-2 text-xs font-semibold text-white shadow-2xl shadow-black/30" />
     </div>
   )
 }

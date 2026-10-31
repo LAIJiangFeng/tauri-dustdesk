@@ -43,6 +43,7 @@
 - 程序启动和每次桌面存储操作前必须串行恢复 transfer journal：未提交则还原源目录，已提交则继续清理隔离源。恢复、后台清理和新操作必须共用恢复锁，不能并发处理同一 journal。
 - `.dustdesk-transfer-*.tmp`、`.dustdesk-source-transfer-*.tmp` 和 transfer journal 都是内部事务数据，桌面扫描、分类、快捷启动、配置修复与还原候选列表必须统一过滤，不能显示成用户项目或写入配置。
 - 同卷移动只做顶层检查和基于目录枚举属性的 reparse 检查，然后直接原子 rename，不做全树 metadata/ADS 预检；只有 rename 返回 `ERROR_NOT_SAME_DEVICE` 才进入跨盘 staging 复制。同卷 rename 失败（如文件被占用）直接报错，不回退复制。
+- 收纳、卡片间移动、单项移回桌面、智能收纳、一键还原、退出还原、启动回收都要通过 `dustdesk://desktop-transfer-progress` 推送传输进度（第几项/共几项、当前项；跨盘复制时带已复制/总字节和已校验字节），已有 `dustdesk://desktop-operation` 文案的后台和 lifecycle 操作要在 message 里带上字节信息。同盘改名不得为进度额外扫描目录，只有真正进入跨盘复制时才按元数据统计该项大小。进度只读、尽力而为（约 250 ms 限流，开始和结束立即推送），推送失败、panic 或窗口关闭都不得影响传输与校验；工作线程需显式安装同一进度对象。前端只在本窗口操作进行期间显示自己的拖拽进度，结束后到达的事件忽略。
 
 ## 多窗口数据刷新
 

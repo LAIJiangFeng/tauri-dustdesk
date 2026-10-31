@@ -75,6 +75,9 @@ const TRAY_SCREENSHOT_DELAY: Duration = Duration::from_millis(220);
 const DESKTOP_OPERATION_EVENT: &str = "dustdesk://desktop-operation";
 const RUNTIME_MIGRATION_PROGRESS_EVENT: &str = "dustdesk://runtime-migration-progress";
 const RUNTIME_MIGRATION_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
+/// Progress of organizing/restoring desktop items, broadcast to every window.
+const DESKTOP_TRANSFER_PROGRESS_EVENT: &str = "dustdesk://desktop-transfer-progress";
+const DESKTOP_TRANSFER_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 /// Robocopy runs out of process; its staging folder is measured at most this often.
 const RUNTIME_MIGRATION_ROBOCOPY_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Buffer per side for full content comparison.
@@ -752,7 +755,9 @@ async fn add_item_to_category(
     path: String,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let result = add_items_to_category_impl(index, vec![path]);
+        let result = run_with_desktop_transfer_progress(&app, "archive", || {
+            add_items_to_category_impl(index, vec![path])
+        });
         emit_desktop_cards_changed(&app);
         result.map(|_| ())
     })
@@ -767,7 +772,9 @@ async fn add_items_to_category(
     paths: Vec<String>,
 ) -> Result<usize, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let result = add_items_to_category_impl(index, paths);
+        let result = run_with_desktop_transfer_progress(&app, "archive", || {
+            add_items_to_category_impl(index, paths)
+        });
         emit_desktop_cards_changed(&app);
         result
     })
@@ -793,7 +800,6 @@ fn add_items_to_category_impl(index: usize, paths: Vec<String>) -> Result<usize,
             .desktop_categories
             .get(index)
             .ok_or_else(|| "分类不存在".to_owned())?;
-        let category_name = config.desktop_categories[index].name.clone();
         let mut seen_source_paths = Vec::<String>::new();
         let source_paths = paths
             .into_iter()
@@ -823,43 +829,63 @@ fn add_items_to_category_impl(index: usize, paths: Vec<String>) -> Result<usize,
                 (path, position)
             })
             .collect::<Vec<_>>();
-        let mut added = 0usize;
-
-        for (path, desktop_icon_position) in paths_with_positions {
-            if !Path::new(&path).exists() {
-                continue;
-            }
-            let archived_path = archive_item_path(&store, &category_name, &path)?;
-
-            for category in &mut config.desktop_categories {
-                category.item_paths.retain(|item_path| {
-                    !same_path_text(item_path, &path) && !same_path_text(item_path, &archived_path)
-                });
-            }
-            remove_desktop_icon_position_for_path(&mut config.desktop_icon_positions, &path);
-            remove_desktop_icon_position_for_path(
-                &mut config.desktop_icon_positions,
-                &archived_path,
-            );
-            if let Some(position) = desktop_icon_position {
-                set_desktop_icon_position_for_path(
-                    &mut config.desktop_icon_positions,
-                    archived_path.clone(),
-                    position,
-                );
-            }
-
-            config.desktop_categories[index]
-                .item_paths
-                .push(archived_path);
-            added += 1;
-        }
+        let added = archive_paths_into_category(&store, &mut config, index, paths_with_positions)?;
 
         if added > 0 {
             store.save_config(&config).map_err(to_message)?;
         }
         Ok(added)
     })
+}
+
+/// Moves each path into category `index` and records it in `config`, reporting item progress
+/// to the active desktop transfer progress. Stops at the first failed move.
+fn archive_paths_into_category(
+    store: &AppStore,
+    config: &mut AppConfig,
+    index: usize,
+    paths_with_positions: Vec<(String, Option<DesktopIconPosition>)>,
+) -> Result<usize, String> {
+    let category_name = config
+        .desktop_categories
+        .get(index)
+        .ok_or_else(|| "分类不存在".to_owned())?
+        .name
+        .clone();
+    let total = paths_with_positions.len();
+    report_desktop_transfer_progress(|progress| progress.begin(total, &category_name));
+    let mut added = 0usize;
+
+    for (position, (path, desktop_icon_position)) in paths_with_positions.into_iter().enumerate() {
+        report_desktop_transfer_progress(|progress| {
+            progress.set_item(position + 1, total, Path::new(&path))
+        });
+        if !Path::new(&path).exists() {
+            continue;
+        }
+        let archived_path = archive_item_path(store, &category_name, &path)?;
+
+        for category in &mut config.desktop_categories {
+            category.item_paths.retain(|item_path| {
+                !same_path_text(item_path, &path) && !same_path_text(item_path, &archived_path)
+            });
+        }
+        remove_desktop_icon_position_for_path(&mut config.desktop_icon_positions, &path);
+        remove_desktop_icon_position_for_path(&mut config.desktop_icon_positions, &archived_path);
+        if let Some(position) = desktop_icon_position {
+            set_desktop_icon_position_for_path(
+                &mut config.desktop_icon_positions,
+                archived_path.clone(),
+                position,
+            );
+        }
+
+        config.desktop_categories[index]
+            .item_paths
+            .push(archived_path);
+        added += 1;
+    }
+    Ok(added)
 }
 
 #[tauri::command]
@@ -965,7 +991,9 @@ fn complete_internal_path_drag_impl(
                 let affected = if target_index == source_index {
                     0
                 } else {
-                    let affected = add_items_to_category_impl(target_index, vec![path])?;
+                    let affected = run_with_desktop_transfer_progress(app, "move", || {
+                        add_items_to_category_impl(target_index, vec![path])
+                    })?;
                     emit_desktop_cards_changed(app);
                     affected
                 };
@@ -1011,7 +1039,9 @@ fn complete_internal_path_drag_impl(
         }
     }
 
-    let restored = restore_item_to_desktop_impl(app, source_index, path, Some(position))?;
+    let restored = run_with_desktop_transfer_progress(app, "restore", || {
+        restore_item_to_desktop_impl(app, source_index, path, Some(position))
+    })?;
     Ok(InternalPathDragOutcome {
         action: "restored_to_desktop".to_owned(),
         target_category_index: None,
@@ -1054,7 +1084,9 @@ async fn restore_item_to_desktop(
     position: Option<DesktopDropPosition>,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        restore_item_to_desktop_impl(&app, index, path, position)
+        run_with_desktop_transfer_progress(&app, "restore", || {
+            restore_item_to_desktop_impl(&app, index, path, position)
+        })
     })
     .await
     .map_err(to_message)?
@@ -1085,6 +1117,10 @@ fn restore_item_to_desktop_impl(
                     &source.display().to_string(),
                 )
             });
+        report_desktop_transfer_progress(|progress| {
+            progress.begin(1, "");
+            progress.set_item(1, 1, &source);
+        });
         let restored_path = restore_path_to_desktop(&source, &desktop)?;
         remove_category_path_from_config(&mut config, index, &path)?;
         remove_desktop_icon_position_for_path(&mut config.desktop_icon_positions, &path);
@@ -1122,10 +1158,17 @@ async fn start_restore_all_to_desktop_task(app: tauri::AppHandle) -> Result<(), 
 fn start_restore_background_operation(app: tauri::AppHandle) -> Result<(), String> {
     start_desktop_background_operation(app.clone(), "restore", move || {
         let progress_app = app.clone();
-        let restored =
+        let relay = DesktopOperationProgressRelay::new(restore_progress_message, move |payload| {
+            emit_desktop_operation(&progress_app, payload)
+        });
+        let transfer = desktop_operation_transfer_progress(&app, "restore-all", &relay);
+        let item_relay = Arc::clone(&relay);
+        let item_transfer = Arc::clone(&transfer);
+        let result = with_desktop_transfer_progress(Some(Arc::clone(&transfer)), || {
             restore_all_organized_items_to_desktop_with_progress(move |current, total, path| {
-                emit_desktop_operation(
-                    &progress_app,
+                // Reported after an item finished; the next item is the one in progress.
+                item_transfer.set_item(current.saturating_add(1).min(total), total, path);
+                item_relay.publish_progress(
                     DesktopOperationPayload {
                         kind: "restore",
                         scope: "manual",
@@ -1138,8 +1181,13 @@ fn start_restore_background_operation(app: tauri::AppHandle) -> Result<(), Strin
                         current_path: path.display().to_string(),
                         category_counts: Vec::new(),
                     },
+                    &item_transfer.snapshot(),
                 );
-            })?;
+            })
+        });
+        relay.close();
+        transfer.complete(result.is_ok());
+        let restored = result?;
         Ok(DesktopOperationPayload {
             kind: "restore",
             scope: "manual",
@@ -1277,10 +1325,16 @@ async fn classify_desktop_items(app: tauri::AppHandle) -> Result<ClassifyResult,
 async fn start_classify_desktop_items_task(app: tauri::AppHandle) -> Result<(), String> {
     start_desktop_background_operation(app.clone(), "classify", move || {
         let progress_app = app.clone();
-        let result =
+        let relay = DesktopOperationProgressRelay::new(classify_progress_message, move |payload| {
+            emit_desktop_operation(&progress_app, payload)
+        });
+        let transfer = desktop_operation_transfer_progress(&app, "classify", &relay);
+        let item_relay = Arc::clone(&relay);
+        let item_transfer = Arc::clone(&transfer);
+        let result = with_desktop_transfer_progress(Some(Arc::clone(&transfer)), || {
             classify_desktop_items_with_progress(move |current, total, path, moved, skipped| {
-                emit_desktop_operation(
-                    &progress_app,
+                item_transfer.set_item(current, total, path);
+                item_relay.publish_progress(
                     DesktopOperationPayload {
                         kind: "classify",
                         scope: "manual",
@@ -1293,8 +1347,13 @@ async fn start_classify_desktop_items_task(app: tauri::AppHandle) -> Result<(), 
                         current_path: path.display().to_string(),
                         category_counts: Vec::new(),
                     },
+                    &item_transfer.snapshot(),
                 );
-            })?;
+            })
+        });
+        relay.close();
+        transfer.complete(result.is_ok());
+        let result = result?;
         let detail = result
             .category_counts
             .iter()
@@ -1450,6 +1509,8 @@ fn classify_desktop_items_with_progress(
             ),
         ];
         let (sender, receiver) = mpsc::channel();
+        let transfer_progress = active_desktop_transfer_progress();
+        report_desktop_transfer_progress(|progress| progress.begin(total, ""));
         let mut moved = 0usize;
         let mut handled = 0usize;
         let mut active = Vec::<ClassifyCandidate>::new();
@@ -1460,6 +1521,7 @@ fn classify_desktop_items_with_progress(
                     let queue = Arc::clone(&queue);
                     let sender = sender.clone();
                     let store = store.clone();
+                    let transfer_progress = transfer_progress.clone();
                     scope.spawn(move || loop {
                         let candidate = match queue.lock() {
                             Ok(mut queue) => queue.pop_front(),
@@ -1475,11 +1537,16 @@ fn classify_desktop_items_with_progress(
                         };
                         let _ = sender.send(ClassifyWorkerMessage::Started(candidate.clone()));
                         let item_started = Instant::now();
-                        let result = archive_item_path(
-                            &store,
-                            &candidate.category_name,
-                            &candidate.original_path,
-                        );
+                        // Copies of all workers add up in the shared progress; the name shown is
+                        // the most recently started copy.
+                        let result =
+                            with_desktop_transfer_progress(transfer_progress.clone(), || {
+                                archive_item_path(
+                                    &store,
+                                    &candidate.category_name,
+                                    &candidate.original_path,
+                                )
+                            });
                         let elapsed = item_started.elapsed();
                         if sender
                             .send(ClassifyWorkerMessage::Finished(candidate, result, elapsed))
@@ -2754,20 +2821,36 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// Installs `value` in a thread-local slot while `run` executes and restores the previous value
+/// afterwards, also when `run` panics.
+fn with_thread_local_slot<V: 'static, T>(
+    slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<V>>>,
+    value: Option<V>,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Restore<V: 'static> {
+        slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<V>>>,
+        previous: Option<V>,
+    }
+    impl<V: 'static> Drop for Restore<V> {
+        fn drop(&mut self) {
+            let previous = self.previous.take();
+            let _ = self.slot.try_with(|slot| *slot.borrow_mut() = previous);
+        }
+    }
+    let previous = slot.with(|slot| slot.replace(value));
+    let _restore = Restore { slot, previous };
+    run()
+}
+
 fn with_runtime_migration_progress<T>(
     progress: Arc<RuntimeMigrationProgress>,
     run: impl FnOnce() -> T,
 ) -> T {
-    struct Restore(Option<Arc<RuntimeMigrationProgress>>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            let previous = self.0.take();
-            ACTIVE_RUNTIME_MIGRATION_PROGRESS.with(|slot| *slot.borrow_mut() = previous);
-        }
-    }
-    let previous = ACTIVE_RUNTIME_MIGRATION_PROGRESS.with(|slot| slot.replace(Some(progress)));
-    let _restore = Restore(previous);
-    run()
+    let byte_progress: Arc<dyn TransferByteProgress> = progress.clone();
+    with_thread_local_slot(&ACTIVE_RUNTIME_MIGRATION_PROGRESS, Some(progress), || {
+        with_transfer_byte_progress(Some(byte_progress), run)
+    })
 }
 
 fn active_runtime_migration_progress() -> Option<Arc<RuntimeMigrationProgress>> {
@@ -2778,6 +2861,535 @@ fn report_runtime_migration_progress(report: impl FnOnce(&RuntimeMigrationProgre
     if let Some(progress) = active_runtime_migration_progress() {
         report(&progress);
     }
+}
+
+/// Byte counters fed by the shared copy helpers: the `CopyFile2` callback, the robocopy staging
+/// measurement and the single full content comparison. Runtime migrations and desktop transfers
+/// both implement it. Reporting only reads; it never changes how a transfer runs or verifies.
+trait TransferByteProgress: Send + Sync {
+    fn add_done(&self, bytes: u64, files: u64);
+    /// Raises the counters to at least the given values; never lowers them.
+    fn raise_done_to(&self, bytes: u64, files: u64);
+    fn add_verified(&self, bytes: u64);
+    fn done_counters(&self) -> (u64, u64);
+    /// Bytes and files of the item being copied when already measured, so robocopy does not walk
+    /// the source again.
+    fn item_totals(&self) -> Option<(u64, u64)> {
+        None
+    }
+}
+
+impl TransferByteProgress for RuntimeMigrationProgress {
+    fn add_done(&self, bytes: u64, files: u64) {
+        RuntimeMigrationProgress::add_done(self, bytes, files);
+    }
+
+    fn raise_done_to(&self, bytes: u64, files: u64) {
+        RuntimeMigrationProgress::raise_done_to(self, bytes, files);
+    }
+
+    fn add_verified(&self, bytes: u64) {
+        RuntimeMigrationProgress::add_verified(self, bytes);
+    }
+
+    fn done_counters(&self) -> (u64, u64) {
+        RuntimeMigrationProgress::done_counters(self)
+    }
+}
+
+thread_local! {
+    /// Byte progress of the copy running on this thread (a migration or one cross-volume desktop
+    /// item). Copies without one report nothing.
+    static ACTIVE_TRANSFER_BYTE_PROGRESS: std::cell::RefCell<Option<Arc<dyn TransferByteProgress>>> =
+        const { std::cell::RefCell::new(None) };
+    /// Progress of the desktop organize/restore operation running on this thread.
+    static ACTIVE_DESKTOP_TRANSFER_PROGRESS: std::cell::RefCell<Option<Arc<DesktopTransferProgress>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn with_transfer_byte_progress<T>(
+    progress: Option<Arc<dyn TransferByteProgress>>,
+    run: impl FnOnce() -> T,
+) -> T {
+    with_thread_local_slot(&ACTIVE_TRANSFER_BYTE_PROGRESS, progress, run)
+}
+
+fn active_transfer_byte_progress() -> Option<Arc<dyn TransferByteProgress>> {
+    ACTIVE_TRANSFER_BYTE_PROGRESS
+        .try_with(|slot| slot.borrow().clone())
+        .ok()
+        .flatten()
+}
+
+#[cfg(not(windows))]
+fn report_transfer_byte_progress(report: impl FnOnce(&dyn TransferByteProgress)) {
+    if let Some(progress) = active_transfer_byte_progress() {
+        report(progress.as_ref());
+    }
+}
+
+/// Installs the desktop operation progress for `run`. Worker threads must install the same
+/// progress themselves; thread-locals do not follow `std::thread::scope` spawns.
+fn with_desktop_transfer_progress<T>(
+    progress: Option<Arc<DesktopTransferProgress>>,
+    run: impl FnOnce() -> T,
+) -> T {
+    with_thread_local_slot(&ACTIVE_DESKTOP_TRANSFER_PROGRESS, progress, run)
+}
+
+fn active_desktop_transfer_progress() -> Option<Arc<DesktopTransferProgress>> {
+    ACTIVE_DESKTOP_TRANSFER_PROGRESS
+        .try_with(|slot| slot.borrow().clone())
+        .ok()
+        .flatten()
+}
+
+fn report_desktop_transfer_progress(report: impl FnOnce(&DesktopTransferProgress)) {
+    if let Some(progress) = active_desktop_transfer_progress() {
+        report(&progress);
+    }
+}
+
+/// Progress of one desktop organize/restore operation (archive, move, restore, classify,
+/// restore-all, exit-restore, restart-recollect). Bytes only exist while an item is really copied
+/// across volumes; same-volume renames only advance the item counters.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+struct DesktopTransferProgressPayload {
+    operation: String,
+    /// running / finished / failed
+    status: String,
+    /// Destination category name for archive/move; empty otherwise.
+    target: String,
+    /// 1-based position of the item being processed.
+    item_index: u64,
+    items_total: u64,
+    /// Display name of the current item; while copying, the most recently started copy.
+    current: String,
+    current_path: String,
+    /// True while at least one item is being copied across volumes.
+    copying: bool,
+    /// Sum over every copy in flight (several with parallel classify/restore-all).
+    bytes_done: u64,
+    bytes_total: u64,
+    verified_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct DesktopTransferCopyCounters {
+    bytes_done: u64,
+    bytes_total: u64,
+    files_done: u64,
+    files_total: u64,
+    verified_bytes: u64,
+}
+
+type DesktopTransferProgressSink = Box<dyn Fn(&DesktopTransferProgressPayload) + Send + Sync>;
+
+struct DesktopTransferProgress {
+    sink: DesktopTransferProgressSink,
+    interval: Duration,
+    state: Mutex<DesktopTransferProgressState>,
+    /// How often an item was measured for a cross-volume copy; renames never measure.
+    size_scans: std::sync::atomic::AtomicUsize,
+}
+
+struct DesktopTransferProgressState {
+    payload: DesktopTransferProgressPayload,
+    last_emit: Option<Instant>,
+    copies: BTreeMap<u64, DesktopTransferCopyCounters>,
+    next_copy_id: u64,
+}
+
+impl DesktopTransferProgress {
+    fn new(
+        operation: &str,
+        interval: Duration,
+        sink: impl Fn(&DesktopTransferProgressPayload) + Send + Sync + 'static,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            sink: Box::new(sink),
+            interval,
+            state: Mutex::new(DesktopTransferProgressState {
+                payload: DesktopTransferProgressPayload {
+                    operation: operation.to_owned(),
+                    status: "running".to_owned(),
+                    ..DesktopTransferProgressPayload::default()
+                },
+                last_emit: None,
+                copies: BTreeMap::new(),
+                next_copy_id: 0,
+            }),
+            size_scans: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// Applies `change`, recomputes the byte sums and emits when forced or when the throttle
+    /// interval has passed. Emitting is best effort: a failing or panicking sink is ignored.
+    fn update(&self, force: bool, change: impl FnOnce(&mut DesktopTransferProgressState)) {
+        let snapshot = {
+            let Ok(mut state) = self.state.lock() else {
+                return;
+            };
+            change(&mut state);
+            let (mut done, mut total, mut verified) = (0u64, 0u64, 0u64);
+            for counters in state.copies.values() {
+                done = done.saturating_add(counters.bytes_done.min(counters.bytes_total));
+                total = total.saturating_add(counters.bytes_total);
+                verified =
+                    verified.saturating_add(counters.verified_bytes.min(counters.bytes_total));
+            }
+            let copying = !state.copies.is_empty();
+            let payload = &mut state.payload;
+            payload.copying = copying;
+            payload.bytes_done = done;
+            payload.bytes_total = total;
+            payload.verified_bytes = verified;
+            let due = force
+                || state
+                    .last_emit
+                    .map_or(true, |last| last.elapsed() >= self.interval);
+            if !due {
+                return;
+            }
+            state.last_emit = Some(Instant::now());
+            state.payload.clone()
+        };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.sink)(&snapshot)));
+    }
+
+    /// Announces the operation (forced) with its item total and destination.
+    fn begin(&self, items_total: usize, target: &str) {
+        self.update(true, |state| {
+            state.payload.status = "running".to_owned();
+            state.payload.items_total = items_total as u64;
+            state.payload.item_index = items_total.min(1) as u64;
+            state.payload.target = target.to_owned();
+        });
+    }
+
+    /// Marks `path` as item `index` of `total`. The name only follows the item while no copy is
+    /// in flight, so a long copy keeps showing the item whose bytes are counted.
+    fn set_item(&self, index: usize, total: usize, path: &Path) {
+        self.update(false, |state| {
+            state.payload.item_index = index as u64;
+            state.payload.items_total = total as u64;
+            if state.copies.is_empty() {
+                state.payload.current = display_path_name(path);
+                state.payload.current_path = path.display().to_string();
+            }
+        });
+    }
+
+    /// Starts byte tracking for one cross-volume copy (forced emit).
+    fn begin_copy(
+        self: &Arc<Self>,
+        path: &Path,
+        bytes_total: u64,
+        files_total: u64,
+    ) -> DesktopTransferCopy {
+        let mut id = 0;
+        self.update(true, |state| {
+            id = state.next_copy_id;
+            state.next_copy_id += 1;
+            state.copies.insert(
+                id,
+                DesktopTransferCopyCounters {
+                    bytes_total,
+                    files_total,
+                    ..DesktopTransferCopyCounters::default()
+                },
+            );
+            state.payload.current = display_path_name(path);
+            state.payload.current_path = path.display().to_string();
+        });
+        DesktopTransferCopy {
+            owner: Arc::clone(self),
+            id,
+        }
+    }
+
+    fn update_copy(&self, id: u64, change: impl FnOnce(&mut DesktopTransferCopyCounters)) {
+        self.update(false, |state| {
+            if let Some(counters) = state.copies.get_mut(&id) {
+                change(counters);
+                counters.bytes_done = counters.bytes_done.min(counters.bytes_total);
+                counters.files_done = counters.files_done.min(counters.files_total);
+                counters.verified_bytes = counters.verified_bytes.min(counters.bytes_total);
+            }
+        });
+    }
+
+    /// Final forced emit; later reports from this operation are dropped by the windows.
+    fn complete(&self, success: bool) {
+        self.update(true, |state| {
+            state.copies.clear();
+            state.payload.status = if success { "finished" } else { "failed" }.to_owned();
+            if success {
+                state.payload.item_index = state.payload.items_total;
+            }
+        });
+    }
+
+    fn snapshot(&self) -> DesktopTransferProgressPayload {
+        self.state
+            .lock()
+            .map(|state| state.payload.clone())
+            .unwrap_or_default()
+    }
+}
+
+/// Byte progress handle of one cross-volume copy; dropping it ends the copy's byte tracking.
+struct DesktopTransferCopy {
+    owner: Arc<DesktopTransferProgress>,
+    id: u64,
+}
+
+impl DesktopTransferCopy {
+    /// After a successful move every byte has been copied (and verified when it was compared).
+    fn finish(&self, success: bool) {
+        if !success {
+            return;
+        }
+        self.owner.update(true, |state| {
+            if let Some(counters) = state.copies.get_mut(&self.id) {
+                counters.bytes_done = counters.bytes_total;
+                counters.files_done = counters.files_total;
+            }
+        });
+    }
+}
+
+impl Drop for DesktopTransferCopy {
+    fn drop(&mut self) {
+        let id = self.id;
+        self.owner.update(true, |state| {
+            state.copies.remove(&id);
+        });
+    }
+}
+
+impl TransferByteProgress for DesktopTransferCopy {
+    fn add_done(&self, bytes: u64, files: u64) {
+        self.owner.update_copy(self.id, |counters| {
+            counters.bytes_done = counters.bytes_done.saturating_add(bytes);
+            counters.files_done = counters.files_done.saturating_add(files);
+        });
+    }
+
+    fn raise_done_to(&self, bytes: u64, files: u64) {
+        self.owner.update_copy(self.id, |counters| {
+            counters.bytes_done = counters.bytes_done.max(bytes);
+            counters.files_done = counters.files_done.max(files);
+        });
+    }
+
+    fn add_verified(&self, bytes: u64) {
+        self.owner.update_copy(self.id, |counters| {
+            counters.verified_bytes = counters.verified_bytes.saturating_add(bytes);
+        });
+    }
+
+    fn done_counters(&self) -> (u64, u64) {
+        self.owner
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| {
+                state
+                    .copies
+                    .get(&self.id)
+                    .map(|counters| (counters.bytes_done, counters.files_done))
+            })
+            .unwrap_or_default()
+    }
+
+    fn item_totals(&self) -> Option<(u64, u64)> {
+        self.owner.state.lock().ok().and_then(|state| {
+            state
+                .copies
+                .get(&self.id)
+                .map(|counters| (counters.bytes_total, counters.files_total))
+        })
+    }
+}
+
+/// Byte detail of the copies in flight, e.g. `已复制 1.2 GB / 3.4 GB`.
+fn desktop_transfer_bytes_detail(payload: &DesktopTransferProgressPayload) -> Option<String> {
+    if !payload.copying || payload.bytes_total == 0 {
+        return None;
+    }
+    let mut detail = format!(
+        "已复制 {} / {}",
+        format_migration_bytes(payload.bytes_done),
+        format_migration_bytes(payload.bytes_total)
+    );
+    if payload.verified_bytes > 0 && payload.verified_bytes < payload.bytes_total {
+        detail.push_str(&format!(
+            "，已校验 {}",
+            format_migration_bytes(payload.verified_bytes)
+        ));
+    }
+    Some(detail)
+}
+
+fn message_with_transfer_detail(message: &str, payload: &DesktopTransferProgressPayload) -> String {
+    match desktop_transfer_bytes_detail(payload) {
+        Some(detail) => format!("{message}（{detail}）"),
+        None => message.to_owned(),
+    }
+}
+
+/// Runs a window-initiated transfer (archive, move, restore) with progress broadcast to every
+/// window. The final emit always happens, success or not.
+fn run_with_desktop_transfer_progress<T>(
+    app: &tauri::AppHandle,
+    operation: &str,
+    run: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let emitter = app.clone();
+    let progress = DesktopTransferProgress::new(
+        operation,
+        DESKTOP_TRANSFER_PROGRESS_INTERVAL,
+        move |payload| emit_desktop_transfer_progress(&emitter, payload),
+    );
+    progress.begin(0, "");
+    let result = with_desktop_transfer_progress(Some(progress.clone()), run);
+    progress.complete(result.is_ok());
+    result
+}
+
+fn emit_desktop_transfer_progress(
+    app: &tauri::AppHandle,
+    payload: &DesktopTransferProgressPayload,
+) {
+    let _ = app.emit(DESKTOP_TRANSFER_PROGRESS_EVENT, payload);
+}
+
+/// Republishes the latest desktop-operation progress message of a background or lifecycle
+/// operation with the byte detail of the copy in flight, so long cross-volume copies keep moving.
+struct DesktopOperationProgressRelay {
+    publish: Box<dyn Fn(DesktopOperationPayload) + Send + Sync>,
+    format: fn(usize, usize, &Path) -> String,
+    state: Mutex<DesktopOperationProgressRelayState>,
+}
+
+#[derive(Default)]
+struct DesktopOperationProgressRelayState {
+    last: Option<DesktopOperationPayload>,
+    last_message: String,
+    closed: bool,
+}
+
+impl DesktopOperationProgressRelay {
+    fn new(
+        format: fn(usize, usize, &Path) -> String,
+        publish: impl Fn(DesktopOperationPayload) + Send + Sync + 'static,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            publish: Box::new(publish),
+            format,
+            state: Mutex::new(DesktopOperationProgressRelayState::default()),
+        })
+    }
+
+    /// Publishes an item progress payload built by the operation, with byte detail when copying.
+    fn publish_progress(
+        &self,
+        mut payload: DesktopOperationPayload,
+        transfer: &DesktopTransferProgressPayload,
+    ) {
+        {
+            let Ok(mut state) = self.state.lock() else {
+                return;
+            };
+            if state.closed {
+                return;
+            }
+            state.last = Some(payload.clone());
+            payload.message = message_with_transfer_detail(&payload.message, transfer);
+            state.last_message = payload.message.clone();
+        }
+        (self.publish)(payload);
+    }
+
+    /// Called from the transfer progress sink; only byte updates of a copy in flight are relayed.
+    fn on_transfer(&self, transfer: &DesktopTransferProgressPayload) {
+        if transfer.status != "running" || !transfer.copying {
+            return;
+        }
+        let payload = {
+            let Ok(mut state) = self.state.lock() else {
+                return;
+            };
+            if state.closed {
+                return;
+            }
+            let Some(mut payload) = state.last.clone() else {
+                return;
+            };
+            let base = (self.format)(
+                transfer.item_index as usize,
+                transfer.items_total as usize,
+                Path::new(&transfer.current_path),
+            );
+            payload.message = message_with_transfer_detail(&base, transfer);
+            if payload.message == state.last_message {
+                return;
+            }
+            payload.current_path = transfer.current_path.clone();
+            state.last_message = payload.message.clone();
+            payload
+        };
+        (self.publish)(payload);
+    }
+
+    /// Stops relaying before the operation publishes its final status.
+    fn close(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.closed = true;
+        }
+    }
+}
+
+/// Transfer progress of a background/lifecycle operation that feeds both the transfer event and
+/// the operation's own desktop-operation messages.
+fn desktop_operation_transfer_progress(
+    app: &tauri::AppHandle,
+    operation: &str,
+    relay: &Arc<DesktopOperationProgressRelay>,
+) -> Arc<DesktopTransferProgress> {
+    let emitter = app.clone();
+    let relay = Arc::clone(relay);
+    let progress = DesktopTransferProgress::new(
+        operation,
+        DESKTOP_TRANSFER_PROGRESS_INTERVAL,
+        move |payload| {
+            emit_desktop_transfer_progress(&emitter, payload);
+            relay.on_transfer(payload);
+        },
+    );
+    progress.begin(0, "");
+    progress
+}
+
+/// Moves an item whose rename failed with a cross-volume error through the verified staging
+/// copy. Only here, inside a desktop operation, is the item measured (metadata only) so byte
+/// progress has a total; renames never reach this point.
+fn move_path_across_volumes(source: &Path, destination: &Path) -> Result<(), String> {
+    let Some(progress) = active_desktop_transfer_progress() else {
+        return move_path_via_staging(source, destination);
+    };
+    progress
+        .size_scans
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let (bytes_total, files_total) = transfer_tree_totals(source);
+    let copy = Arc::new(progress.begin_copy(source, bytes_total, files_total));
+    let byte_progress: Arc<dyn TransferByteProgress> = copy.clone();
+    let result = with_transfer_byte_progress(Some(byte_progress), || {
+        move_path_via_staging(source, destination)
+    });
+    copy.finish(result.is_ok());
+    result
 }
 
 /// Calls `on_file(len)` for every regular file below `path` using metadata only. Unreadable or
@@ -3840,6 +4452,7 @@ fn restore_desktop_organization_for_exit_core_with_progress(
                     .is_some_and(|path| valid_restart_desktop_path(&path, desktop))
         })
         .count();
+    report_desktop_transfer_progress(|progress| progress.begin(total, ""));
 
     for category_index in 0..marker.categories.len() {
         for item_index in 0..marker.categories[category_index].items.len() {
@@ -4021,6 +4634,7 @@ fn recollect_desktop_organization_from_restart_marker_core_with_progress(
         .iter()
         .map(|category| category.items.len())
         .sum();
+    report_desktop_transfer_progress(|progress| progress.begin(total, ""));
     let mut processed = 0usize;
     let mut claimed_category_indices = Vec::new();
 
@@ -4380,6 +4994,7 @@ fn restore_all_organized_items_to_desktop_impl(
             }
         };
         let total = restore_candidate_count(&config, &organizer_root, &desktop);
+        report_desktop_transfer_progress(|progress| progress.begin(total, ""));
         let mut seen_paths = Vec::<String>::new();
         let mut candidates = Vec::<RestoreCandidate>::new();
         let stored_icon_positions = config.desktop_icon_positions.clone();
@@ -4449,6 +5064,7 @@ fn restore_all_organized_items_to_desktop_impl(
         let worker_count = desktop_operation_worker_count(candidates.len());
         let queue = Arc::new(Mutex::new(VecDeque::from(candidates)));
         let (sender, receiver) = mpsc::channel();
+        let transfer_progress = active_desktop_transfer_progress();
         let mut restored = 0usize;
         let mut restored_icon_positions = Vec::<(PathBuf, DesktopIconPosition)>::new();
 
@@ -4457,6 +5073,7 @@ fn restore_all_organized_items_to_desktop_impl(
                 let queue = Arc::clone(&queue);
                 let sender = sender.clone();
                 let desktop = desktop.clone();
+                let transfer_progress = transfer_progress.clone();
                 scope.spawn(move || loop {
                     let candidate = match queue.lock() {
                         Ok(mut queue) => queue.pop_front(),
@@ -4468,7 +5085,9 @@ fn restore_all_organized_items_to_desktop_impl(
                     let Some(candidate) = candidate else {
                         return;
                     };
-                    let result = restore_path_to_desktop_silent(&candidate.source, &desktop);
+                    let result = with_desktop_transfer_progress(transfer_progress.clone(), || {
+                        restore_path_to_desktop_silent(&candidate.source, &desktop)
+                    });
                     if sender.send(Ok((candidate, result))).is_err() {
                         return;
                     }
@@ -7375,7 +7994,7 @@ fn move_path_with_mode(source: &Path, destination: &Path) -> Result<MovePathMode
         // Only a cross-volume move pays for the full metadata walk and verified staging copy.
         MoveRenameFailure::CrossVolume => {
             validate_transfer_source_tree(source)?;
-            move_path_via_staging(source, destination)?;
+            move_path_across_volumes(source, destination)?;
             Ok(MovePathMode::Copy)
         }
         // Same-volume failures below never fall back to copying.
@@ -9029,7 +9648,7 @@ fn compare_file_contents(left: &Path, right: &Path, report_progress: bool) -> Re
     let mut left_buffer = vec![0u8; CONTENT_COMPARE_BUFFER_BYTES];
     let mut right_buffer = vec![0u8; CONTENT_COMPARE_BUFFER_BYTES];
     let progress = report_progress
-        .then(active_runtime_migration_progress)
+        .then(active_transfer_byte_progress)
         .flatten();
 
     loop {
@@ -9119,11 +9738,13 @@ fn try_copy_directory_with_robocopy(source: &Path, destination: &Path) -> Result
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     let started = Instant::now();
-    let progress = active_runtime_migration_progress();
+    let progress = active_transfer_byte_progress();
     // Robocopy reports nothing back; the staging folder is measured at a low rate instead.
     let progress_base = progress.as_deref().map(|progress| {
         let (bytes_done, files_done) = progress.done_counters();
-        let (item_bytes, item_files) = transfer_tree_totals(source);
+        let (item_bytes, item_files) = progress
+            .item_totals()
+            .unwrap_or_else(|| transfer_tree_totals(source));
         (bytes_done, files_done, item_bytes, item_files)
     });
     let child = Command::new("robocopy.exe")
@@ -9232,7 +9853,7 @@ fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), String> {
 
 #[cfg(windows)]
 struct CopyFileProgressContext<'a> {
-    progress: &'a RuntimeMigrationProgress,
+    progress: &'a dyn TransferByteProgress,
     file_len: u64,
     reported: u64,
 }
@@ -9293,7 +9914,7 @@ fn copy_file_contents(source: &Path, destination: &Path) -> Result<(), String> {
     let mut parameters = COPYFILE2_EXTENDED_PARAMETERS::default();
     parameters.dwSize = size_of::<COPYFILE2_EXTENDED_PARAMETERS>() as u32;
     parameters.dwCopyFlags = COPY_FILE_FAIL_IF_EXISTS;
-    let progress = active_runtime_migration_progress();
+    let progress = active_transfer_byte_progress();
     let mut progress_context = progress.as_deref().map(|progress| CopyFileProgressContext {
         progress,
         file_len: metadata.len(),
@@ -9340,7 +9961,7 @@ fn copy_file_contents(source: &Path, destination: &Path) -> Result<(), String> {
         .map_err(to_message)?;
     io::copy(&mut source_file, &mut destination_file).map_err(to_message)?;
     destination_file.sync_all().map_err(to_message)?;
-    report_runtime_migration_progress(|progress| progress.add_done(metadata.len(), 1));
+    report_transfer_byte_progress(|progress| progress.add_done(metadata.len(), 1));
     copy_file_basic_metadata(source, &destination_file)
 }
 
@@ -14903,27 +15524,38 @@ fn request_real_app_exit(app: tauri::AppHandle) {
         );
         let _running_reset_guard = DesktopOperationRunningResetGuard;
         let progress_app = app.clone();
+        let relay = DesktopOperationProgressRelay::new(restore_progress_message, move |payload| {
+            publish_lifecycle_desktop_operation(&progress_app, payload, true)
+        });
+        let transfer = desktop_operation_transfer_progress(&app, "exit-restore", &relay);
+        let item_relay = Arc::clone(&relay);
+        let item_transfer = Arc::clone(&transfer);
         let restore_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            restore_desktop_organization_for_exit_with_progress(move |current, total, path| {
-                publish_lifecycle_desktop_operation(
-                    &progress_app,
-                    DesktopOperationPayload {
-                        kind: "restore",
-                        scope: "lifecycle",
-                        status: "progress",
-                        message: restore_progress_message(current, total, path),
-                        moved: 0,
-                        skipped: 0,
-                        restored: current,
-                        total,
-                        current_path: path.display().to_string(),
-                        category_counts: Vec::new(),
-                    },
-                    true,
-                );
+            with_desktop_transfer_progress(Some(Arc::clone(&transfer)), || {
+                restore_desktop_organization_for_exit_with_progress(move |current, total, path| {
+                    // Reported after an item finished; the next item is the one in progress.
+                    item_transfer.set_item(current.saturating_add(1).min(total), total, path);
+                    item_relay.publish_progress(
+                        DesktopOperationPayload {
+                            kind: "restore",
+                            scope: "lifecycle",
+                            status: "progress",
+                            message: restore_progress_message(current, total, path),
+                            moved: 0,
+                            skipped: 0,
+                            restored: current,
+                            total,
+                            current_path: path.display().to_string(),
+                            category_counts: Vec::new(),
+                        },
+                        &item_transfer.snapshot(),
+                    );
+                })
             })
         }))
         .unwrap_or_else(|_| Err("退出前还原桌面任务异常中断".to_owned()));
+        relay.close();
+        transfer.complete(restore_result.is_ok());
         keep_loading_effect_visible(loading_started_at, Duration::from_millis(850));
 
         let restored = match restore_result {
@@ -15242,6 +15874,16 @@ fn main() {
                 }
 
                 let progress_handle = handle.clone();
+                let relay = DesktopOperationProgressRelay::new(
+                    restart_recollect_progress_message,
+                    move |payload| {
+                        publish_lifecycle_desktop_operation(&progress_handle, payload, true)
+                    },
+                );
+                let transfer =
+                    desktop_operation_transfer_progress(&handle, "restart-recollect", &relay);
+                let item_relay = Arc::clone(&relay);
+                let item_transfer = Arc::clone(&transfer);
                 let mut loading_visible_at = None;
                 let recovery_result =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -15252,30 +15894,39 @@ fn main() {
                             eprintln!("failed to show startup operation overlay: {error}");
                         }
                         loading_visible_at = Some(Instant::now());
-                        recollect_desktop_organization_from_restart_marker_with_progress(
-                            move |current, total, path| {
-                                publish_lifecycle_desktop_operation(
-                                    &progress_handle,
-                                    DesktopOperationPayload {
-                                        kind: "classify",
-                                        scope: "lifecycle",
-                                        status: "progress",
-                                        message: restart_recollect_progress_message(
-                                            current, total, path,
-                                        ),
-                                        moved: current,
-                                        skipped: 0,
-                                        restored: 0,
+                        with_desktop_transfer_progress(Some(Arc::clone(&transfer)), || {
+                            recollect_desktop_organization_from_restart_marker_with_progress(
+                                move |current, total, path| {
+                                    // Reported after an item finished; the next one is in progress.
+                                    item_transfer.set_item(
+                                        current.saturating_add(1).min(total),
                                         total,
-                                        current_path: path.display().to_string(),
-                                        category_counts: Vec::new(),
-                                    },
-                                    true,
-                                );
-                            },
-                        )
+                                        path,
+                                    );
+                                    item_relay.publish_progress(
+                                        DesktopOperationPayload {
+                                            kind: "classify",
+                                            scope: "lifecycle",
+                                            status: "progress",
+                                            message: restart_recollect_progress_message(
+                                                current, total, path,
+                                            ),
+                                            moved: current,
+                                            skipped: 0,
+                                            restored: 0,
+                                            total,
+                                            current_path: path.display().to_string(),
+                                            category_counts: Vec::new(),
+                                        },
+                                        &item_transfer.snapshot(),
+                                    );
+                                },
+                            )
+                        })
                     }))
                     .unwrap_or_else(|_| Err("启动恢复任务异常中断".to_owned()));
+                relay.close();
+                transfer.complete(recovery_result.is_ok());
                 if let Some(visible_at) = loading_visible_at {
                     keep_loading_effect_visible(visible_at, Duration::from_millis(850));
                 }
@@ -16227,5 +16878,403 @@ mod runtime_migration_tests {
 
         assert_eq!(events, 0);
         assert!(persistence.stored().is_some());
+    }
+}
+
+#[cfg(test)]
+mod desktop_transfer_progress_tests {
+    use super::*;
+    use std::time::UNIX_EPOCH;
+
+    type Recorded = Arc<Mutex<Vec<DesktopTransferProgressPayload>>>;
+
+    /// Records every update (no throttling).
+    fn recording_progress(operation: &str) -> (Arc<DesktopTransferProgress>, Recorded) {
+        let recorded: Recorded = Arc::default();
+        let sink = recorded.clone();
+        let progress = DesktopTransferProgress::new(operation, Duration::ZERO, move |payload| {
+            sink.lock().expect("progress log").push(payload.clone());
+        });
+        (progress, recorded)
+    }
+
+    fn test_dir(prefix: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("{prefix}-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create test dir");
+        dir
+    }
+
+    fn pattern(len: usize, seed: u8) -> Vec<u8> {
+        (0..len)
+            .map(|index| (index as u8).wrapping_mul(31).wrapping_add(seed))
+            .collect()
+    }
+
+    /// A directory with a multi-chunk file, nested Unicode folders and small files.
+    fn write_source_tree(root: &Path) -> u64 {
+        let nested = root.join("\u{6cca}\u{9510}\u{79d1}\u{6280}").join("nested");
+        fs::create_dir_all(&nested).expect("create source tree");
+        let big = pattern(6 * 1024 * 1024 + 123, 7);
+        fs::write(root.join("big.bin"), &big).expect("write big file");
+        fs::write(nested.join("small.txt"), b"small content").expect("write small file");
+        fs::write(root.join("empty.txt"), b"").expect("write empty file");
+        (big.len() + b"small content".len()) as u64
+    }
+
+    fn tree_contents(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn walk(root: &Path, dir: &Path, output: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            for entry in fs::read_dir(dir).expect("read tree") {
+                let path = entry.expect("tree entry").path();
+                if path.is_dir() {
+                    walk(root, &path, output);
+                } else {
+                    let relative = path.strip_prefix(root).expect("relative").to_path_buf();
+                    output.insert(relative, fs::read(&path).expect("read file"));
+                }
+            }
+        }
+        let mut output = BTreeMap::new();
+        walk(root, root, &mut output);
+        output
+    }
+
+    fn assert_copy_progress(recorded: &Recorded, expected_total: u64) {
+        let recorded = recorded.lock().expect("progress log").clone();
+        let copying = recorded
+            .iter()
+            .filter(|payload| payload.copying)
+            .collect::<Vec<_>>();
+        assert!(!copying.is_empty(), "a cross-volume copy reports bytes");
+        let mut last = 0;
+        for payload in &copying {
+            assert_eq!(payload.bytes_total, expected_total);
+            assert!(payload.bytes_done >= last, "byte progress never decreases");
+            assert!(payload.bytes_done <= payload.bytes_total);
+            assert!(payload.verified_bytes <= payload.bytes_total);
+            last = payload.bytes_done;
+        }
+        assert_eq!(last, expected_total, "finished copy reports every byte");
+        let final_payload = recorded.last().expect("final payload");
+        assert!(!final_payload.copying, "finished copy leaves byte tracking");
+    }
+
+    #[test]
+    fn cross_volume_move_reports_monotonic_bytes_and_matches_a_move_without_progress() {
+        let root = test_dir("dustdesk-desktop-transfer-bytes");
+
+        // Reference: the same items moved without any progress installed.
+        let plain_dir = root.join("plain-source");
+        let plain_file = root.join("plain-file.bin");
+        write_source_tree(&plain_dir);
+        fs::write(&plain_file, pattern(3 * 1024 * 1024 + 5, 3)).expect("write plain file");
+        let expected_tree = tree_contents(&plain_dir);
+        let expected_file = fs::read(&plain_file).expect("read plain file");
+        move_path_across_volumes(&plain_dir, &root.join("plain-destination"))
+            .expect("move directory without progress");
+        move_path_across_volumes(&plain_file, &root.join("plain-file-destination.bin"))
+            .expect("move file without progress");
+
+        let source_dir = root.join("source");
+        let dir_total = write_source_tree(&source_dir);
+        let destination_dir = root.join("destination");
+        let (progress, recorded) = recording_progress("archive");
+        with_desktop_transfer_progress(Some(progress.clone()), || {
+            move_path_across_volumes(&source_dir, &destination_dir)
+        })
+        .expect("move directory with progress");
+        assert_copy_progress(&recorded, dir_total);
+        assert_eq!(
+            progress
+                .size_scans
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert!(!source_dir.exists(), "source directory is moved away");
+        assert_eq!(tree_contents(&destination_dir), expected_tree);
+        assert_eq!(
+            tree_contents(&root.join("plain-destination")),
+            tree_contents(&destination_dir)
+        );
+
+        let source_file = root.join("file.bin");
+        fs::write(&source_file, &expected_file).expect("write source file");
+        let destination_file = root.join("file-destination.bin");
+        let (progress, recorded) = recording_progress("restore");
+        with_desktop_transfer_progress(Some(progress), || {
+            move_path_across_volumes(&source_file, &destination_file)
+        })
+        .expect("move file with progress");
+        assert_copy_progress(&recorded, expected_file.len() as u64);
+        assert!(
+            recorded
+                .lock()
+                .expect("progress log")
+                .iter()
+                .any(|payload| payload.verified_bytes > 0),
+            "the single full comparison reports verified bytes"
+        );
+        assert!(!source_file.exists(), "source file is moved away");
+        assert_eq!(
+            fs::read(&destination_file).expect("read moved file"),
+            expected_file
+        );
+        assert_eq!(
+            fs::read(root.join("plain-file-destination.bin")).expect("read plain move"),
+            expected_file
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn panicking_progress_sink_does_not_affect_the_move() {
+        let root = test_dir("dustdesk-desktop-transfer-panic");
+        let source_dir = root.join("source");
+        write_source_tree(&source_dir);
+        let expected_tree = tree_contents(&source_dir);
+        let source_file = root.join("file.bin");
+        let file_content = pattern(2 * 1024 * 1024 + 9, 11);
+        fs::write(&source_file, &file_content).expect("write source file");
+        let progress = DesktopTransferProgress::new("archive", Duration::ZERO, |_| {
+            panic!("progress sink failure")
+        });
+
+        with_desktop_transfer_progress(Some(progress), || {
+            move_path_across_volumes(&source_dir, &root.join("destination"))?;
+            move_path_across_volumes(&source_file, &root.join("file-destination.bin"))
+        })
+        .expect("moves succeed although the sink panics");
+
+        assert!(!source_dir.exists());
+        assert!(!source_file.exists());
+        assert_eq!(tree_contents(&root.join("destination")), expected_tree);
+        assert_eq!(
+            fs::read(root.join("file-destination.bin")).expect("read moved file"),
+            file_content
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn same_volume_rename_does_not_measure_the_item() {
+        let root = test_dir("dustdesk-desktop-transfer-rename");
+        let source = root.join("source");
+        write_source_tree(&source);
+        let expected_tree = tree_contents(&source);
+        let (progress, recorded) = recording_progress("archive");
+
+        with_desktop_transfer_progress(Some(progress.clone()), || {
+            move_path(&source, &root.join("destination"))
+        })
+        .expect("same-volume rename");
+
+        assert_eq!(
+            progress
+                .size_scans
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a rename never walks the item for its size"
+        );
+        assert!(recorded
+            .lock()
+            .expect("progress log")
+            .iter()
+            .all(|payload| !payload.copying && payload.bytes_total == 0));
+        assert_eq!(tree_contents(&root.join("destination")), expected_tree);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn archiving_several_items_reports_item_positions() {
+        let root = test_dir("dustdesk-desktop-transfer-items");
+        let desktop = root.join("desktop");
+        let data = root.join("data");
+        let organizer = root.join("organizer");
+        let launchers = root.join("launchers");
+        for dir in [&desktop, &data, &organizer, &launchers] {
+            fs::create_dir_all(dir).expect("create test root");
+        }
+        let names = ["a.txt", "b.txt", "c.txt"];
+        let paths = names
+            .iter()
+            .map(|name| {
+                let path = desktop.join(name);
+                fs::write(&path, name.as_bytes()).expect("write desktop item");
+                (path.display().to_string(), None)
+            })
+            .collect::<Vec<_>>();
+        let store = AppStore::for_test(data, organizer.clone(), launchers);
+        let mut config = AppConfig {
+            desktop_categories: vec![DeskCategory {
+                name: "\u{6587}\u{6863}".to_owned(),
+                ..DeskCategory::default()
+            }],
+            ..AppConfig::default()
+        };
+        let (progress, recorded) = recording_progress("archive");
+
+        let added = with_desktop_transfer_progress(Some(progress.clone()), || {
+            archive_paths_into_category(&store, &mut config, 0, paths)
+        })
+        .expect("archive items");
+        progress.complete(true);
+
+        assert_eq!(added, 3);
+        assert_eq!(config.desktop_categories[0].item_paths.len(), 3);
+        let recorded = recorded.lock().expect("progress log").clone();
+        let positions = recorded
+            .iter()
+            .filter(|payload| payload.status == "running" && !payload.current.is_empty())
+            .map(|payload| (payload.item_index, payload.current.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            positions,
+            vec![
+                (1, "a".to_owned()),
+                (2, "b".to_owned()),
+                (3, "c".to_owned()),
+            ]
+        );
+        assert!(recorded
+            .iter()
+            .all(|payload| payload.target == "\u{6587}\u{6863}" && payload.items_total == 3));
+        let last = recorded.last().expect("final payload");
+        assert_eq!(last.status, "finished");
+        assert_eq!(last.item_index, 3);
+        for name in names {
+            assert!(!desktop.join(name).exists());
+            assert!(organizer.join("\u{6587}\u{6863}").join(name).exists());
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn copying_payload(done: u64, total: u64, verified: u64) -> DesktopTransferProgressPayload {
+        DesktopTransferProgressPayload {
+            operation: "restart-recollect".to_owned(),
+            status: "running".to_owned(),
+            item_index: 3,
+            items_total: 107,
+            current: "\u{6cca}\u{9510}\u{79d1}\u{6280}".to_owned(),
+            current_path:
+                "D:\\DesktopOrganizer\\\u{6587}\u{6863}\\\u{6cca}\u{9510}\u{79d1}\u{6280}"
+                    .to_owned(),
+            copying: true,
+            bytes_done: done,
+            bytes_total: total,
+            verified_bytes: verified,
+            ..DesktopTransferProgressPayload::default()
+        }
+    }
+
+    const GB_1_2: u64 = 1_288_490_189;
+    const GB_3_4: u64 = 3_650_722_202;
+
+    #[test]
+    fn transfer_messages_carry_byte_detail_only_while_copying() {
+        let payload = copying_payload(GB_1_2, GB_3_4, 0);
+        assert_eq!(
+            desktop_transfer_bytes_detail(&payload).as_deref(),
+            Some("\u{5df2}\u{590d}\u{5236} 1.2 GB / 3.4 GB")
+        );
+        assert_eq!(
+            message_with_transfer_detail(
+                &restart_recollect_progress_message(3, 107, Path::new(&payload.current_path)),
+                &payload
+            ),
+            "\u{6b63}\u{5728}\u{6062}\u{590d}\u{6536}\u{7eb3}\u{5206}\u{7c7b} 3/107\u{ff1a}\u{6cca}\u{9510}\u{79d1}\u{6280}\u{ff08}\u{5df2}\u{590d}\u{5236} 1.2 GB / 3.4 GB\u{ff09}"
+        );
+        assert_eq!(
+            desktop_transfer_bytes_detail(&copying_payload(GB_3_4, GB_3_4, GB_1_2)).as_deref(),
+            Some("\u{5df2}\u{590d}\u{5236} 3.4 GB / 3.4 GB\u{ff0c}\u{5df2}\u{6821}\u{9a8c} 1.2 GB")
+        );
+        let idle = DesktopTransferProgressPayload {
+            copying: false,
+            ..copying_payload(0, 0, 0)
+        };
+        assert_eq!(desktop_transfer_bytes_detail(&idle), None);
+        assert_eq!(
+            message_with_transfer_detail("\u{6b63}\u{5728}\u{8fd8}\u{539f}", &idle),
+            "\u{6b63}\u{5728}\u{8fd8}\u{539f}"
+        );
+    }
+
+    #[test]
+    fn operation_relay_republishes_byte_detail_until_closed() {
+        let published = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = published.clone();
+        let relay = DesktopOperationProgressRelay::new(classify_progress_message, move |payload| {
+            sink.lock().expect("published").push(payload.message);
+        });
+        let idle = DesktopTransferProgressPayload {
+            copying: false,
+            ..copying_payload(0, 0, 0)
+        };
+        // Bytes before any item message have nothing to attach to.
+        relay.on_transfer(&copying_payload(1, 10, 0));
+        relay.publish_progress(
+            DesktopOperationPayload {
+                kind: "classify",
+                scope: "manual",
+                status: "progress",
+                message: classify_progress_message(12, 40, Path::new("C:\\Desktop\\a.txt")),
+                moved: 11,
+                skipped: 0,
+                restored: 0,
+                total: 40,
+                current_path: "C:\\Desktop\\a.txt".to_owned(),
+                category_counts: Vec::new(),
+            },
+            &idle,
+        );
+        let mut copying = copying_payload(GB_1_2, GB_3_4, 0);
+        copying.item_index = 12;
+        copying.items_total = 40;
+        relay.on_transfer(&copying);
+        // Identical text is not published twice; idle updates are ignored.
+        relay.on_transfer(&copying);
+        relay.on_transfer(&idle);
+        relay.close();
+        relay.on_transfer(&copying_payload(GB_3_4, GB_3_4, 0));
+
+        let published = published.lock().expect("published").clone();
+        assert_eq!(
+            published,
+            vec![
+                "\u{6b63}\u{5728}\u{6536}\u{7eb3} 12/40\u{ff1a}a".to_owned(),
+                "\u{6b63}\u{5728}\u{6536}\u{7eb3} 12/40\u{ff1a}\u{6cca}\u{9510}\u{79d1}\u{6280}\u{ff08}\u{5df2}\u{590d}\u{5236} 1.2 GB / 3.4 GB\u{ff09}".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn concurrent_copies_add_up_and_show_the_latest_item() {
+        let (progress, recorded) = recording_progress("classify");
+        progress.begin(2, "");
+        let first = progress.begin_copy(Path::new("C:\\Desktop\\first"), 100, 1);
+        let second = progress.begin_copy(Path::new("C:\\Desktop\\second"), 50, 1);
+        first.add_done(40, 0);
+        second.add_done(20, 0);
+        let snapshot = progress.snapshot();
+        assert_eq!((snapshot.bytes_done, snapshot.bytes_total), (60, 150));
+        assert_eq!(snapshot.current, "second");
+        first.finish(true);
+        drop(first);
+        let snapshot = progress.snapshot();
+        assert_eq!((snapshot.bytes_done, snapshot.bytes_total), (20, 50));
+        assert!(snapshot.copying);
+        drop(second);
+        assert!(!progress.snapshot().copying);
+        progress.complete(true);
+        assert_eq!(
+            recorded
+                .lock()
+                .expect("progress log")
+                .last()
+                .map(|payload| payload.status.clone()),
+            Some("finished".to_owned())
+        );
     }
 }

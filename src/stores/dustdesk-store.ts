@@ -20,6 +20,8 @@ import type {
   OrganizerDirectoryVolumeCheck,
   RuntimeMigrationPhase,
   RuntimeMigrationProgress,
+  DesktopTransferOperation,
+  DesktopTransferProgress,
   RecycleCategoryItemsResult,
   RestoreItemsResult,
   SearchItem,
@@ -608,6 +610,29 @@ export function normalizeRuntimeMigrationProgress(value: unknown): RuntimeMigrat
     files_total: asCount(raw.files_total),
     verified_bytes: asCount(raw.verified_bytes),
     current: asString(raw.current),
+  }
+}
+
+const desktopTransferOperations: DesktopTransferOperation[] = ["archive", "move", "restore", "classify", "restore-all", "exit-restore", "restart-recollect"]
+
+export function normalizeDesktopTransferProgress(value: unknown): DesktopTransferProgress | null {
+  if (!value || typeof value !== "object") return null
+  const raw = asRecord(value)
+  const operation = asString(raw.operation) as DesktopTransferOperation
+  if (!desktopTransferOperations.includes(operation)) return null
+  const status = asString(raw.status)
+  return {
+    operation,
+    status: status === "finished" || status === "failed" ? status : "running",
+    target: asString(raw.target),
+    item_index: asCount(raw.item_index),
+    items_total: asCount(raw.items_total),
+    current: asString(raw.current),
+    current_path: asString(raw.current_path),
+    copying: raw.copying === true,
+    bytes_done: asCount(raw.bytes_done),
+    bytes_total: asCount(raw.bytes_total),
+    verified_bytes: asCount(raw.verified_bytes),
   }
 }
 

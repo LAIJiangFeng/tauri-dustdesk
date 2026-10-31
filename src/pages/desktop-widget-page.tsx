@@ -41,6 +41,7 @@ import { categoryBoxEntry, DesktopBoxItemList, recycleConfirmMessage, recycleRes
 import { DesktopEdgeHideMenuSection } from "@/components/dustdesk/desktop-edge-hide-menu-section"
 import { DesktopEdgeHideShell } from "@/components/dustdesk/desktop-edge-hide-shell"
 import { SettingsMenuSection } from "@/components/dustdesk/settings-menu-section"
+import { describeBackgroundTransfer, describeOwnTransfer, TransferProgress, useDesktopTransferProgress, type TransferProgressView } from "@/components/dustdesk/transfer-progress"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { useDesktopEdgeHide } from "@/hooks/use-desktop-edge-hide"
@@ -116,6 +117,7 @@ export function DesktopWidgetPage() {
   const addLaunchersLight = useDustDeskStore((state) => state.addLaunchersLight)
   const removeLauncher = useDustDeskStore((state) => state.removeLauncher)
   const completeInternalPathDragLight = useDustDeskStore((state) => state.completeInternalPathDragLight)
+  const restoreItemsToDesktopLight = useDustDeskStore((state) => state.restoreItemsToDesktopLight)
   const startRestoreAllToDesktopTask = useDustDeskStore((state) => state.startRestoreAllToDesktopTask)
   const showPathInFolder = useDustDeskStore((state) => state.showPathInFolder)
   const startClassifyDesktopItemsTask = useDustDeskStore((state) => state.startClassifyDesktopItemsTask)
@@ -139,6 +141,14 @@ export function DesktopWidgetPage() {
   const [isMergingCategories, setIsMergingCategories] = useState(false)
   const [dropOperationLabel, setDropOperationLabel] = useState("")
   const desktopOperationLabel = isClassifyingDesktop ? notice || "正在智能收纳桌面..." : isRestoringDesktop ? notice || "正在还原桌面..." : isMergingCategories ? "正在合并分类..." : dropOperationLabel
+  const { ownTransfer, ownPosition, backgroundTransfer, trackTransfer, setOwnPosition } = useDesktopTransferProgress()
+  const desktopOperationView: TransferProgressView | null = !desktopOperationLabel
+    ? null
+    : isClassifyingDesktop || isRestoringDesktop
+      ? describeBackgroundTransfer(backgroundTransfer, desktopOperationLabel)
+      : isMergingCategories
+        ? { label: desktopOperationLabel, percent: null }
+        : describeOwnTransfer(ownTransfer, desktopOperationLabel, ownPosition)
   const edgeHide = useDesktopEdgeHide({
     fallbackLabel: "desktop-widget",
     busy: openSettingsId !== "" || Boolean(desktopOperationLabel) || isClassifyingDesktop || isRestoringDesktop || isMergingCategories,
@@ -435,7 +445,7 @@ export function DesktopWidgetPage() {
           ),
         )
         setDropOperationLabel(`正在${movedBetweenCategories ? "移动" : "收纳"} ${paths.length} 项到「${targetName}」...`)
-        const added = await addItemsToCategoryLight(target.index, paths)
+        const added = await trackTransfer(() => addItemsToCategoryLight(target.index, paths))
         setActiveCategoryId(`category:${target.index}`)
         setNotice(countNotice(`${movedBetweenCategories ? "已移动" : "已收纳"}到「${targetName}」`, added, paths.length, "没有新增收纳项目"))
       }
@@ -449,7 +459,7 @@ export function DesktopWidgetPage() {
   async function handleRestoreDragOut(index: number, path: string, position: DesktopDropPosition) {
     try {
       setDropOperationLabel(`正在识别拖拽目标：${displayPathName(path)}`)
-      const outcome = await completeInternalPathDragLight(index, path, position)
+      const outcome = await trackTransfer(() => completeInternalPathDragLight(index, path, position))
       if (outcome.action === "moved_to_category") {
         const targetName = snapshot.categories[outcome.target_category_index ?? -1]?.name ?? "目标分类"
         setActiveCategoryId(`category:${outcome.target_category_index ?? index}`)
@@ -463,6 +473,19 @@ export function DesktopWidgetPage() {
       }
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error))
+    } finally {
+      setDropOperationLabel("")
+    }
+  }
+
+  /** Context menu restore: one backend call per item, so the page supplies the i/N position. */
+  async function handleRestoreItems(categoryIndex: number, paths: string[]) {
+    try {
+      setDropOperationLabel(`正在移回桌面 ${paths.length} 项...`)
+      const result = await trackTransfer(() =>
+        restoreItemsToDesktopLight(categoryIndex, paths, (index, total, path) => setOwnPosition({ index, total, name: displayPathName(path) })),
+      )
+      return restoreResultNotice(result)
     } finally {
       setDropOperationLabel("")
     }
@@ -902,11 +925,12 @@ export function DesktopWidgetPage() {
               onOpen={openPath}
               onShowInFolder={showPathInFolder}
               onRestoreDragOut={handleRestoreDragOut}
+              onRestoreItems={handleRestoreItems}
             />
           ) : (
             <EmptyDropHint title="分类都已拆出" detail="在设置里点一键合并分类，就会回到这个分类组。" />
           )}
-          {desktopOperationLabel ? <WidgetOperationOverlay label={desktopOperationLabel} /> : null}
+          {desktopOperationView ? <WidgetOperationOverlay view={desktopOperationView} /> : null}
         </section>
         {notice ? (
           <div className="pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full bg-slate-950/70 px-3 py-1 text-xs text-white/80 ring-1 ring-white/10">{notice}</div>
@@ -927,13 +951,10 @@ export function DesktopWidgetPage() {
   )
 }
 
-function WidgetOperationOverlay({ label }: { label: string }) {
+function WidgetOperationOverlay({ view }: { view: TransferProgressView }) {
   return (
     <div data-edge-hide-hold="" className="no-drag pointer-events-none absolute inset-0 z-40 grid place-items-center bg-slate-950/60 backdrop-blur-md">
-      <div className="flex items-center gap-2 rounded-xl border border-white/15 bg-slate-950/90 px-3 py-2 text-xs font-semibold text-white shadow-2xl shadow-black/30">
-        <ArrowsClockwise className="size-4 animate-spin text-emerald-300" weight="duotone" />
-        <span>{label}</span>
-      </div>
+      <TransferProgress view={view} className="rounded-xl border border-white/15 bg-slate-950/90 px-3 py-2 text-xs font-semibold text-white shadow-2xl shadow-black/30" />
     </div>
   )
 }
@@ -1528,6 +1549,7 @@ function CategoryItems({
   onOpen,
   onShowInFolder,
   onRestoreDragOut,
+  onRestoreItems,
 }: {
   category?: { name: string; item_details: DesktopItem[] }
   categoryIndex: number
@@ -1535,8 +1557,8 @@ function CategoryItems({
   onOpen: (path: string) => Promise<void>
   onShowInFolder: (path: string) => Promise<void>
   onRestoreDragOut: (index: number, path: string, position: DesktopDropPosition) => Promise<void>
+  onRestoreItems: (index: number, paths: string[]) => Promise<string>
 }) {
-  const restoreItemsToDesktopLight = useDustDeskStore((state) => state.restoreItemsToDesktopLight)
   const deleteCategoryItemsToRecycleBinLight = useDustDeskStore((state) => state.deleteCategoryItemsToRecycleBinLight)
   const renameCategoryItemLight = useDustDeskStore((state) => state.renameCategoryItemLight)
   const items = category?.item_details ?? []
@@ -1572,7 +1594,7 @@ function CategoryItems({
         {
           label: "移回桌面",
           icon: "restore",
-          onSelect: () => run(async () => restoreResultNotice(await restoreItemsToDesktopLight(categoryIndex, paths))),
+          onSelect: () => run(() => onRestoreItems(categoryIndex, paths)),
         },
         common.remove,
         common.properties,

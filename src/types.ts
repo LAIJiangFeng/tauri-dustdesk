@@ -199,6 +199,26 @@ export interface RuntimeMigrationProgress {
   current: string
 }
 
+export type DesktopTransferOperation = "archive" | "move" | "restore" | "classify" | "restore-all" | "exit-restore" | "restart-recollect"
+
+/** Payload of `dustdesk://desktop-transfer-progress`, broadcast to every window. */
+export interface DesktopTransferProgress {
+  operation: DesktopTransferOperation
+  status: "running" | "finished" | "failed"
+  /** Destination category for archive/move. */
+  target: string
+  /** 1-based position of the item being processed. */
+  item_index: number
+  items_total: number
+  current: string
+  current_path: string
+  /** True while an item is copied across volumes; byte counters are only meaningful then. */
+  copying: boolean
+  bytes_done: number
+  bytes_total: number
+  verified_bytes: number
+}
+
 export interface ScreenshotMonitor {
   index: number
   x: number

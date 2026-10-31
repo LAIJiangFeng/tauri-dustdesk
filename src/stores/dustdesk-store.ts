@@ -20,6 +20,8 @@ import type {
   OrganizerDirectoryVolumeCheck,
   RuntimeMigrationPhase,
   RuntimeMigrationProgress,
+  DesktopTransferOperation,
+  DesktopTransferProgress,
   RecycleCategoryItemsResult,
   RestoreItemsResult,
   SearchItem,
@@ -611,6 +613,29 @@ export function normalizeRuntimeMigrationProgress(value: unknown): RuntimeMigrat
   }
 }
 
+const desktopTransferOperations: DesktopTransferOperation[] = ["archive", "move", "restore", "classify", "restore-all", "exit-restore", "restart-recollect"]
+
+export function normalizeDesktopTransferProgress(value: unknown): DesktopTransferProgress | null {
+  if (!value || typeof value !== "object") return null
+  const raw = asRecord(value)
+  const operation = asString(raw.operation) as DesktopTransferOperation
+  if (!desktopTransferOperations.includes(operation)) return null
+  const status = asString(raw.status)
+  return {
+    operation,
+    status: status === "finished" || status === "failed" ? status : "running",
+    target: asString(raw.target),
+    item_index: asCount(raw.item_index),
+    items_total: asCount(raw.items_total),
+    current: asString(raw.current),
+    current_path: asString(raw.current_path),
+    copying: raw.copying === true,
+    bytes_done: asCount(raw.bytes_done),
+    bytes_total: asCount(raw.bytes_total),
+    verified_bytes: asCount(raw.verified_bytes),
+  }
+}
+
 export function normalizeUpdateNotice(value: unknown): AppUpdateInfo | null {
   if (!value || typeof value !== "object") return null
   const update = normalizeUpdateInfo(value)
@@ -957,7 +982,8 @@ interface DustDeskState {
   removeItemFromCategory: (index: number, path: string) => Promise<void>
   restoreItemToDesktop: (index: number, path: string, position?: DesktopDropPosition) => Promise<string>
   restoreItemToDesktopLight: (index: number, path: string, position?: DesktopDropPosition) => Promise<string>
-  restoreItemsToDesktopLight: (index: number, paths: string[]) => Promise<RestoreItemsResult>
+  /** `onItem` runs before each item (1-based) so the caller can show `i/N` progress. */
+  restoreItemsToDesktopLight: (index: number, paths: string[], onItem?: (index: number, total: number, path: string) => void) => Promise<RestoreItemsResult>
   deleteCategoryItemsToRecycleBinLight: (index: number, paths: string[]) => Promise<RecycleCategoryItemsResult>
   copyPathsToClipboard: (paths: string[]) => Promise<number>
   copyTextToClipboard: (text: string) => Promise<void>
@@ -1291,9 +1317,14 @@ export const useDustDeskStore = create<DustDeskState>()(
       void get().loadDesktopSnapshot({ force: true })
       return restored
     },
-    restoreItemsToDesktopLight: async (index, paths) => {
+    restoreItemsToDesktopLight: async (index, paths, onItem) => {
       const result: RestoreItemsResult = { restored: 0, errors: [] }
-      for (const path of paths) {
+      for (const [position, path] of paths.entries()) {
+        try {
+          onItem?.(position + 1, paths.length, path)
+        } catch {
+          // Progress display must never stop the restore.
+        }
         try {
           await call<string>("restore_item_to_desktop", restoreDesktopArgs(index, path))
           result.restored += 1

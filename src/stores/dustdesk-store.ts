@@ -18,6 +18,8 @@ import type {
   DesktopWindowLayout,
   LaunchItem,
   OrganizerDirectoryVolumeCheck,
+  RuntimeMigrationPhase,
+  RuntimeMigrationProgress,
   RecycleCategoryItemsResult,
   RestoreItemsResult,
   SearchItem,
@@ -582,6 +584,30 @@ function normalizeSearchOverlay(value: unknown): SearchOverlayData {
       .filter(Boolean),
     recent: asArray(raw.recent ?? raw.Recent).map(normalizeSearchItem),
     frequent: asArray(raw.frequent ?? raw.Frequent).map(normalizeSearchItem),
+  }
+}
+
+const runtimeMigrationPhases: RuntimeMigrationPhase[] = ["scanning", "copying", "verifying", "switching", "cleaning", "done"]
+
+function asCount(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0
+}
+
+export function normalizeRuntimeMigrationProgress(value: unknown): RuntimeMigrationProgress | null {
+  if (!value || typeof value !== "object") return null
+  const raw = asRecord(value)
+  const phase = asString(raw.phase) as RuntimeMigrationPhase
+  if (!runtimeMigrationPhases.includes(phase)) return null
+  const target = asString(raw.target)
+  return {
+    target: target === "data" || target === "organizer" || target === "launchers" ? target : "",
+    phase,
+    bytes_done: asCount(raw.bytes_done),
+    bytes_total: asCount(raw.bytes_total),
+    files_done: asCount(raw.files_done),
+    files_total: asCount(raw.files_total),
+    verified_bytes: asCount(raw.verified_bytes),
+    current: asString(raw.current),
   }
 }
 

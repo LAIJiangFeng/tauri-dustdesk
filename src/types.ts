@@ -177,6 +177,11 @@ export interface AppSnapshot {
   organizer_on_desktop_volume: boolean
 }
 
+export interface OrganizerDirectoryVolumeCheck {
+  same_volume_as_desktop: boolean
+  desktop_drive: string
+}
+
 export interface ScreenshotMonitor {
   index: number
   x: number

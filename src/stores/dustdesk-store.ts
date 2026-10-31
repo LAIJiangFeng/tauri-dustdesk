@@ -17,6 +17,7 @@ import type {
   DesktopOperationStatus,
   DesktopWindowLayout,
   LaunchItem,
+  OrganizerDirectoryVolumeCheck,
   RecycleCategoryItemsResult,
   RestoreItemsResult,
   SearchItem,
@@ -970,6 +971,7 @@ interface DustDeskState {
   hideCurrentWindow: () => Promise<void>
   openSpecial: (target: "organizer" | "launchers" | "data" | "desktop") => Promise<void>
   updateRuntimeDirectory: (target: "organizer" | "launchers" | "data", path: string) => Promise<AppSnapshot>
+  checkOrganizerDirectoryVolume: (path: string) => Promise<OrganizerDirectoryVolumeCheck>
   openPath: (path: string) => Promise<void>
   openPathAsAdministrator: (path: string) => Promise<void>
   showPathInFolder: (path: string) => Promise<void>
@@ -1521,6 +1523,14 @@ export const useDustDeskStore = create<DustDeskState>()(
       })
       void get().resolveSnapshotIcons({ includeDesktopItems: true })
       return snapshot
+    },
+    checkOrganizerDirectoryVolume: async (path) => {
+      const raw = (await call<unknown>("check_organizer_directory_volume", { path })) as RawRecord | undefined
+      // An undetermined volume counts as the desktop volume, so no warning is shown.
+      return {
+        same_volume_as_desktop: asBoolean(raw?.same_volume_as_desktop, true),
+        desktop_drive: asString(raw?.desktop_drive),
+      }
     },
     openPath: async (path) => {
       await call("open_path", { path })

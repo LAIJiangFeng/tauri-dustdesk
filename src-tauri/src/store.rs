@@ -13,9 +13,6 @@ use serde::{de::DeserializeOwned, Serialize};
 
 use crate::models::{AppConfig, ClipboardData, LaunchData, SearchHistoryData};
 
-const ORGANIZER_DIR_NAME: &str = "DesktopOrganizer";
-const ORGANIZER_VOLUME_SWITCH_MARKER_FILE: &str = "organizer-volume-auto-switch.json";
-
 static ATOMIC_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static STORAGE_MUTATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -66,17 +63,10 @@ impl AppStore {
             install_root.join("Data"),
             &[settings_root.join("Data")],
         )?;
-        // `open()` runs for nearly every command, so the desktop is only resolved when no organizer
-        // path has been persisted yet.
-        let organizer_default = if settings_root.join("organizer-path.txt").exists() {
-            install_root.join(ORGANIZER_DIR_NAME)
-        } else {
-            initial_organizer_root(&install_root)
-        };
         let organizer_root = configured_path(
             &settings_root,
             "organizer-path.txt",
-            organizer_default,
+            install_root.join("DesktopOrganizer"),
             &[settings_root.join("Data").join("DesktopOrganizer")],
         )?;
         let launchers_root = configured_path(
@@ -157,26 +147,6 @@ impl AppStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
         }
-    }
-
-    pub fn settings_root() -> Result<PathBuf> {
-        app_settings_root()
-    }
-
-    pub fn install_root() -> Result<PathBuf> {
-        app_install_root()
-    }
-
-    /// The one-time marker means the organizer root must no longer be switched automatically,
-    /// either because the switch already happened or because the user picked a directory.
-    pub fn organizer_volume_switch_marker_exists() -> Result<bool> {
-        let path = organizer_volume_switch_marker_path()?;
-        path.try_exists()
-            .with_context(|| format!("check {}", path.display()))
-    }
-
-    pub fn save_organizer_volume_switch_marker(bytes: &[u8]) -> Result<()> {
-        atomic_write(&organizer_volume_switch_marker_path()?, bytes)
     }
 
     pub fn with_runtime_directory(&self, target: &str, path: &Path) -> Result<Self> {
@@ -333,10 +303,6 @@ fn desktop_organization_restart_path() -> Result<PathBuf> {
     Ok(app_settings_root()?.join("desktop-organization-restart.json"))
 }
 
-fn organizer_volume_switch_marker_path() -> Result<PathBuf> {
-    Ok(app_settings_root()?.join(ORGANIZER_VOLUME_SWITCH_MARKER_FILE))
-}
-
 fn app_install_root() -> Result<PathBuf> {
     let executable = env::current_exe().context("current executable path is unavailable")?;
     executable
@@ -368,70 +334,6 @@ fn configured_path(
     }
 
     Ok(default_dir)
-}
-
-/// Organizer root for an installation that never persisted one. Keeping it on the desktop volume
-/// lets organizing and restoring use renames instead of cross-volume copies.
-fn initial_organizer_root(install_root: &Path) -> PathBuf {
-    let desktop = crate::user_desktop();
-    let local_app_data = env::var_os("LOCALAPPDATA").map(PathBuf::from);
-    let desktop_volume_root = desktop.as_deref().and_then(volume_root_path);
-    select_default_organizer_root(
-        desktop.as_deref(),
-        install_root,
-        local_app_data.as_deref(),
-        desktop_volume_root.as_deref(),
-        |left, right| paths_share_volume(left, right) == Some(true),
-        can_create_directory,
-    )
-}
-
-/// Picks the default organizer root: the first candidate that shares the desktop volume and can
-/// be created, otherwise `<install>\DesktopOrganizer`.
-pub fn select_default_organizer_root(
-    desktop: Option<&Path>,
-    install_root: &Path,
-    local_app_data: Option<&Path>,
-    desktop_volume_root: Option<&Path>,
-    same_volume: impl Fn(&Path, &Path) -> bool,
-    can_create: impl Fn(&Path) -> bool,
-) -> PathBuf {
-    desktop
-        .and_then(|desktop| {
-            desktop_volume_organizer_root(
-                desktop,
-                install_root,
-                local_app_data,
-                desktop_volume_root,
-                same_volume,
-                can_create,
-            )
-        })
-        .unwrap_or_else(|| install_root.join(ORGANIZER_DIR_NAME))
-}
-
-/// First organizer root candidate on the desktop volume that can be created, in the order
-/// `<install>\DesktopOrganizer`, `%LOCALAPPDATA%\DustDesk\DesktopOrganizer`,
-/// `<desktop volume root>\DustDesk\DesktopOrganizer`.
-pub fn desktop_volume_organizer_root(
-    desktop: &Path,
-    install_root: &Path,
-    local_app_data: Option<&Path>,
-    desktop_volume_root: Option<&Path>,
-    same_volume: impl Fn(&Path, &Path) -> bool,
-    can_create: impl Fn(&Path) -> bool,
-) -> Option<PathBuf> {
-    let mut candidates = vec![install_root.join(ORGANIZER_DIR_NAME)];
-    candidates.extend(local_app_data.map(|root| root.join("DustDesk").join(ORGANIZER_DIR_NAME)));
-    candidates
-        .extend(desktop_volume_root.map(|root| root.join("DustDesk").join(ORGANIZER_DIR_NAME)));
-    candidates
-        .into_iter()
-        .find(|candidate| same_volume(candidate, desktop) && can_create(candidate))
-}
-
-pub fn can_create_directory(path: &Path) -> bool {
-    fs::create_dir_all(path).is_ok() && path.is_dir()
 }
 
 /// Whether both paths are stored on the same volume, judging a missing path by its nearest
@@ -650,116 +552,6 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
-    }
-
-    fn same_test_drive(left: &Path, right: &Path) -> bool {
-        let drive = |path: &Path| {
-            path.to_string_lossy()
-                .chars()
-                .next()
-                .map(|drive| drive.to_ascii_uppercase())
-        };
-        drive(left).is_some() && drive(left) == drive(right)
-    }
-
-    #[test]
-    fn default_organizer_root_keeps_install_directory_on_desktop_volume() {
-        let selected = select_default_organizer_root(
-            Some(Path::new(r"C:\Users\me\Desktop")),
-            Path::new(r"C:\Apps\DustDesk"),
-            Some(Path::new(r"C:\Users\me\AppData\Local")),
-            Some(Path::new(r"C:\")),
-            same_test_drive,
-            |_| true,
-        );
-
-        assert_eq!(
-            selected,
-            PathBuf::from(r"C:\Apps\DustDesk\DesktopOrganizer")
-        );
-    }
-
-    #[test]
-    fn default_organizer_root_uses_local_app_data_when_install_is_on_another_volume() {
-        let selected = select_default_organizer_root(
-            Some(Path::new(r"C:\Users\me\Desktop")),
-            Path::new(r"D:\Software\DustDesk"),
-            Some(Path::new(r"C:\Users\me\AppData\Local")),
-            Some(Path::new(r"C:\")),
-            same_test_drive,
-            |_| true,
-        );
-
-        assert_eq!(
-            selected,
-            PathBuf::from(r"C:\Users\me\AppData\Local\DustDesk\DesktopOrganizer")
-        );
-    }
-
-    #[test]
-    fn default_organizer_root_uses_desktop_volume_root_when_other_candidates_differ() {
-        let selected = select_default_organizer_root(
-            Some(Path::new(r"E:\Redirected\Desktop")),
-            Path::new(r"D:\Software\DustDesk"),
-            Some(Path::new(r"C:\Users\me\AppData\Local")),
-            Some(Path::new(r"E:\")),
-            same_test_drive,
-            |_| true,
-        );
-
-        assert_eq!(selected, PathBuf::from(r"E:\DustDesk\DesktopOrganizer"));
-    }
-
-    #[test]
-    fn default_organizer_root_skips_desktop_volume_candidates_that_cannot_be_created() {
-        let local_app_data = PathBuf::from(r"C:\Users\me\AppData\Local");
-        let selected = select_default_organizer_root(
-            Some(Path::new(r"C:\Users\me\Desktop")),
-            Path::new(r"D:\Software\DustDesk"),
-            Some(&local_app_data),
-            Some(Path::new(r"C:\")),
-            same_test_drive,
-            |candidate| !candidate.starts_with(&local_app_data),
-        );
-
-        assert_eq!(selected, PathBuf::from(r"C:\DustDesk\DesktopOrganizer"));
-    }
-
-    #[test]
-    fn default_organizer_root_falls_back_to_install_directory() {
-        let install_root = Path::new(r"D:\Software\DustDesk");
-        let fallback = install_root.join("DesktopOrganizer");
-        let desktop = Path::new(r"C:\Users\me\Desktop");
-        let local_app_data = Path::new(r"C:\Users\me\AppData\Local");
-
-        let nothing_creatable = select_default_organizer_root(
-            Some(desktop),
-            install_root,
-            Some(local_app_data),
-            Some(Path::new(r"C:\")),
-            same_test_drive,
-            |_| false,
-        );
-        let nothing_on_desktop_volume = select_default_organizer_root(
-            Some(Path::new(r"F:\Desktop")),
-            install_root,
-            Some(local_app_data),
-            None,
-            same_test_drive,
-            |_| true,
-        );
-        let desktop_unknown = select_default_organizer_root(
-            None,
-            install_root,
-            Some(local_app_data),
-            Some(Path::new(r"C:\")),
-            |_, _| true,
-            |_| true,
-        );
-
-        assert_eq!(nothing_creatable, fallback);
-        assert_eq!(nothing_on_desktop_volume, fallback);
-        assert_eq!(desktop_unknown, fallback);
     }
 
     #[cfg(windows)]

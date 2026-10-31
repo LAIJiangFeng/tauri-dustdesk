@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import { AppWindow, ArrowsClockwise, Camera, Copy, Desktop, DownloadSimple, FolderOpen, GearSix, HardDrives, Keyboard, MagnifyingGlass, PlayCircle, Plus, Warning, X } from "@phosphor-icons/react"
 import { confirm, open } from "@tauri-apps/plugin-dialog"
 import { DesktopFrameControlPanel } from "@/components/dustdesk/desktop-frame-control-panel"
@@ -9,8 +9,8 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { safeListen } from "@/lib/tauri-window"
-import { normalizeUpdateNotice, useDustDeskStore } from "@/stores/dustdesk-store"
-import type { AppUpdateInfo } from "@/types"
+import { normalizeRuntimeMigrationProgress, normalizeUpdateNotice, useDustDeskStore } from "@/stores/dustdesk-store"
+import type { AppUpdateInfo, RuntimeMigrationProgress } from "@/types"
 
 type RuntimeDirectoryTarget = "data" | "organizer" | "launchers"
 
@@ -48,6 +48,8 @@ export function SettingsPage() {
   const [isRecordingSearchShortcut, setIsRecordingSearchShortcut] = useState(false)
   const [isSavingSearch, setIsSavingSearch] = useState(false)
   const [savingDirectoryTarget, setSavingDirectoryTarget] = useState<RuntimeDirectoryTarget | "">("")
+  const [migrationProgress, setMigrationProgress] = useState<RuntimeMigrationProgress | null>(null)
+  const migrationInFlightRef = useRef(false)
   const [directoryError, setDirectoryError] = useState("")
   const [directorySuccess, setDirectorySuccess] = useState("")
   const [searchError, setSearchError] = useState("")
@@ -128,6 +130,24 @@ export function SettingsPage() {
       unlisten?.()
     }
   }, [getUpdateNotice])
+
+  useEffect(() => {
+    let disposed = false
+    let unlisten: (() => void) | undefined
+    void safeListen<unknown>("dustdesk://runtime-migration-progress", (event) => {
+      // Late events after the command settled must not bring the progress back.
+      if (disposed || !migrationInFlightRef.current) return
+      const progress = normalizeRuntimeMigrationProgress(event.payload)
+      if (progress) setMigrationProgress(progress)
+    }).then((dispose) => {
+      if (disposed) dispose?.()
+      else unlisten = dispose
+    })
+    return () => {
+      disposed = true
+      unlisten?.()
+    }
+  }, [])
 
   const saveShortcut = async (shortcut: string) => {
     const nextShortcut = shortcut.trim()
@@ -253,12 +273,16 @@ export function SettingsPage() {
       }
 
       setSavingDirectoryTarget(target)
+      setMigrationProgress(null)
+      migrationInFlightRef.current = true
       const snapshot = await updateRuntimeDirectory(target, selected)
       setSearchPathsDraft(snapshot.settings.search_paths)
       setDirectorySuccess(`${runtimeDirectoryLabel(target)}已修改`)
     } catch (reason) {
       setDirectoryError(reason instanceof Error ? reason.message : String(reason))
     } finally {
+      migrationInFlightRef.current = false
+      setMigrationProgress(null)
       setSavingDirectoryTarget("")
     }
   }
@@ -761,6 +785,7 @@ export function SettingsPage() {
                         <p className="mt-2 min-w-0 truncate font-mono text-[13px] leading-6 text-muted-foreground" title={row.value}>
                           {row.value || "等待读取"}
                         </p>
+                        {isSavingDirectory ? <RuntimeMigrationProgressView progress={migrationProgress} /> : null}
                         {row.warning ? (
                           <p className="mt-2 flex items-start gap-1.5 text-xs leading-5 text-amber-700 dark:text-amber-400">
                             <Warning className="mt-0.5 size-3.5 shrink-0" weight="fill" />
@@ -790,6 +815,79 @@ export function SettingsPage() {
       </CardContent>
     </Card>
   )
+}
+
+function RuntimeMigrationProgressView({ progress }: { progress: RuntimeMigrationProgress | null }) {
+  const percent = progress ? runtimeMigrationPercent(progress) : null
+  return (
+    <div className="mt-3 grid gap-1.5" role="status" aria-live="polite">
+      <div className="h-1.5 overflow-hidden rounded-full bg-muted">
+        <div
+          className={percent === null ? "h-full w-1/3 animate-pulse rounded-full bg-primary" : "h-full rounded-full bg-primary transition-[width] duration-200"}
+          style={percent === null ? undefined : { width: `${percent}%` }}
+        />
+      </div>
+      <p className="break-all text-xs leading-5 text-muted-foreground">{progress ? runtimeMigrationProgressText(progress) : "正在准备迁移"}</p>
+      <p className="flex items-center gap-1.5 text-xs leading-5 text-amber-700 dark:text-amber-400">
+        <Warning className="size-3.5 shrink-0" weight="fill" />
+        <span>迁移中，请不要退出 DustDesk</span>
+      </p>
+    </div>
+  )
+}
+
+/** Copying counts copy and its single content comparison as two halves of the bar. */
+function runtimeMigrationPercent(progress: RuntimeMigrationProgress): number | null {
+  if (progress.phase === "done") return 100
+  if (progress.phase === "scanning" || progress.phase === "switching") return null
+  if (progress.bytes_total > 0) {
+    const done = progress.phase === "copying" ? (progress.bytes_done + progress.verified_bytes) / 2 : progress.bytes_done
+    return Math.min(100, (done / progress.bytes_total) * 100)
+  }
+  if (progress.files_total > 0) return Math.min(100, (progress.files_done / progress.files_total) * 100)
+  return null
+}
+
+function formatMigrationBytes(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`
+  const units = ["KB", "MB", "GB", "TB"]
+  let value = bytes / 1024
+  let unit = 0
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024
+    unit += 1
+  }
+  return `${value.toFixed(1)} ${units[unit]}`
+}
+
+function formatMigrationCount(count: number) {
+  return count.toLocaleString("en-US")
+}
+
+function runtimeMigrationProgressText(progress: RuntimeMigrationProgress) {
+  const amounts = `${formatMigrationBytes(progress.bytes_done)} / ${formatMigrationBytes(progress.bytes_total)}（${formatMigrationCount(progress.files_done)} / ${formatMigrationCount(progress.files_total)} 个文件）`
+  let text: string
+  switch (progress.phase) {
+    case "scanning":
+      text = `正在统计迁移内容：${formatMigrationBytes(progress.bytes_total)}，${formatMigrationCount(progress.files_total)} 个文件`
+      break
+    case "copying":
+      text = `正在复制 ${amounts}`
+      if (progress.verified_bytes > 0) text += `，已校验 ${formatMigrationBytes(progress.verified_bytes)}`
+      break
+    case "verifying":
+      text = `正在校验 ${amounts}`
+      break
+    case "switching":
+      text = "正在切换到新目录"
+      break
+    case "cleaning":
+      text = `正在清理旧目录 ${amounts}`
+      break
+    default:
+      return "目录迁移完成"
+  }
+  return progress.current ? `${text}：${progress.current}` : text
 }
 
 function runtimeDirectoryLabel(target: RuntimeDirectoryTarget) {

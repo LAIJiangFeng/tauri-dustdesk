@@ -182,6 +182,23 @@ export interface OrganizerDirectoryVolumeCheck {
   desktop_drive: string
 }
 
+export type RuntimeMigrationTarget = "data" | "organizer" | "launchers"
+
+export type RuntimeMigrationPhase = "scanning" | "copying" | "verifying" | "switching" | "cleaning" | "done"
+
+/** Payload of `dustdesk://runtime-migration-progress`. */
+export interface RuntimeMigrationProgress {
+  target: RuntimeMigrationTarget | ""
+  phase: RuntimeMigrationPhase
+  bytes_done: number
+  bytes_total: number
+  files_done: number
+  files_total: number
+  /** Bytes whose full content comparison finished while copying. */
+  verified_bytes: number
+  current: string
+}
+
 export interface ScreenshotMonitor {
   index: number
   x: number

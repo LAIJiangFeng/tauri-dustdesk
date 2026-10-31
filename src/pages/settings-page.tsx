@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react"
 import { AppWindow, ArrowsClockwise, Camera, Copy, Desktop, DownloadSimple, FolderOpen, GearSix, HardDrives, Keyboard, MagnifyingGlass, PlayCircle, Plus, Warning, X } from "@phosphor-icons/react"
-import { open } from "@tauri-apps/plugin-dialog"
+import { confirm, open } from "@tauri-apps/plugin-dialog"
 import { DesktopFrameControlPanel } from "@/components/dustdesk/desktop-frame-control-panel"
 import { ShortcutInput, useShortcutDraft } from "@/components/dustdesk/shortcut-input"
 import { Badge } from "@/components/ui/badge"
@@ -18,6 +18,7 @@ export function SettingsPage() {
   const snapshot = useDustDeskStore((state) => state.snapshot)
   const openSpecial = useDustDeskStore((state) => state.openSpecial)
   const updateRuntimeDirectory = useDustDeskStore((state) => state.updateRuntimeDirectory)
+  const checkOrganizerDirectoryVolume = useDustDeskStore((state) => state.checkOrganizerDirectoryVolume)
   const updateClipboardShortcut = useDustDeskStore((state) => state.updateClipboardShortcut)
   const updateClipboardHistoryLimit = useDustDeskStore((state) => state.updateClipboardHistoryLimit)
   const updateSearchSettings = useDustDeskStore((state) => state.updateSearchSettings)
@@ -238,6 +239,18 @@ export function SettingsPage() {
         defaultPath: currentPath || undefined,
       })
       if (typeof selected !== "string") return
+
+      if (target === "organizer") {
+        const volume = await checkOrganizerDirectoryVolume(selected)
+        if (!volume.same_volume_as_desktop) {
+          const drive = volume.desktop_drive ? `（${volume.desktop_drive}）` : ""
+          const confirmed = await confirm(
+            `所选目录不在桌面所在的磁盘${drive}。收纳大文件或文件夹时需要跨盘复制，可能比较慢；切换时也会把现有收纳内容复制到新目录。确定使用这个目录吗？`,
+            { title: "选择收纳目录", kind: "warning", okLabel: "确定", cancelLabel: "取消" },
+          )
+          if (!confirmed) return
+        }
+      }
 
       setSavingDirectoryTarget(target)
       const snapshot = await updateRuntimeDirectory(target, selected)

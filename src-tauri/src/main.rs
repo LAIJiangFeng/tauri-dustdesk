@@ -76,10 +76,6 @@ const DESKTOP_OPERATION_EVENT: &str = "dustdesk://desktop-operation";
 const CATEGORY_ORDER_CHANGED_EVENT: &str = "dustdesk://category-order-changed";
 const DESKTOP_WINDOW_STATE_CHANGED_EVENT: &str = "dustdesk://desktop-window-state-changed";
 const DESKTOP_ORGANIZATION_RESTART_SCHEMA_VERSION: u32 = 1;
-const ORGANIZER_VOLUME_SWITCH_ORIGIN: &str = "organizer-volume-switch";
-const ORGANIZER_VOLUME_SWITCH_MARKER_SCHEMA_VERSION: u32 = 1;
-const ORGANIZER_VOLUME_SWITCH_MAX_BYTES: u64 = 1024 * 1024 * 1024;
-const ORGANIZER_VOLUME_SWITCH_MAX_ENTRIES: u64 = 20_000;
 const UPDATE_RELEASE_API_URL: &str =
     "https://api.github.com/repos/LAIJiangFeng/tauri-dustdesk/releases/latest";
 const UPDATE_RELEASES_URL_PREFIX: &str = "https://github.com/LAIJiangFeng/tauri-dustdesk/releases";
@@ -268,105 +264,6 @@ struct RuntimeMigrationJournal {
     new_data_dir: String,
     new_organizer_root: String,
     new_launchers_root: String,
-    /// Set when DustDesk started the migration on its own; such a migration never fails startup.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    origin: Option<String>,
-}
-
-impl RuntimeMigrationJournal {
-    fn is_organizer_volume_switch(&self) -> bool {
-        self.target == "organizer" && self.origin.as_deref() == Some(ORGANIZER_VOLUME_SWITCH_ORIGIN)
-    }
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct OrganizerVolumeSwitchMarker {
-    schema_version: u32,
-    reason: &'static str,
-    previous_organizer_root: String,
-    organizer_root: String,
-    recorded_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum OrganizerVolumeSwitchSkip {
-    MarkerPresent,
-    DesktopUnavailable,
-    AlreadyOnDesktopVolume,
-    VolumeUnknown,
-    CustomDirectory,
-    TransferRecoveryFailed(String),
-    PendingTransferJournals(usize),
-    ContentScanFailed(String),
-    InterruptedTransferData(u64),
-    TooLarge { entries: u64, bytes: u64 },
-    NoDesktopVolumeTarget,
-    TargetNotEmpty(PathBuf),
-}
-
-impl OrganizerVolumeSwitchSkip {
-    /// Skips that are the steady state and not worth a diagnostic line on every startup.
-    fn is_routine(&self) -> bool {
-        matches!(self, Self::MarkerPresent | Self::AlreadyOnDesktopVolume)
-    }
-
-    fn describe(&self) -> String {
-        match self {
-            Self::MarkerPresent => "已记录过收纳目录选择".to_owned(),
-            Self::DesktopUnavailable => "没有找到桌面路径".to_owned(),
-            Self::AlreadyOnDesktopVolume => "收纳目录已在桌面所在磁盘".to_owned(),
-            Self::VolumeUnknown => "无法识别收纳目录或桌面所在磁盘".to_owned(),
-            Self::CustomDirectory => "收纳目录由用户指定，不自动切换".to_owned(),
-            Self::TransferRecoveryFailed(error) => format!("迁移日志恢复失败：{error}"),
-            Self::PendingTransferJournals(count) => format!("仍有 {count} 条未完成的迁移日志"),
-            Self::ContentScanFailed(error) => format!("无法统计原收纳目录：{error}"),
-            Self::InterruptedTransferData(count) => {
-                format!("原收纳目录仍有 {count} 个未清理的内部迁移临时项目")
-            }
-            Self::TooLarge { entries, bytes } => {
-                format!("原收纳目录内容过多（{entries} 项，{bytes} 字节）")
-            }
-            Self::NoDesktopVolumeTarget => "桌面所在磁盘上没有可用的收纳目录位置".to_owned(),
-            Self::TargetNotEmpty(target) => {
-                format!("新收纳目录已有其它内容：{}", target.display())
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum OrganizerVolumeSwitchPlan {
-    Switch { target: PathBuf },
-    Skip(OrganizerVolumeSwitchSkip),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum OrganizerVolumeSwitchOutcome {
-    Switched { from: PathBuf, to: PathBuf },
-    Skipped(OrganizerVolumeSwitchSkip),
-}
-
-#[derive(Debug, Clone)]
-struct OrganizerVolumeSwitchContext {
-    marker_present: bool,
-    organizer_root: PathBuf,
-    desktop: Option<PathBuf>,
-    install_root: PathBuf,
-    settings_root: PathBuf,
-    local_app_data: Option<PathBuf>,
-    desktop_volume_root: Option<PathBuf>,
-    transfer_journal_root: PathBuf,
-    max_entries: u64,
-    max_bytes: u64,
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct DirectoryContentScan {
-    entries: u64,
-    bytes: u64,
-    internal_entries: u64,
-    exceeded: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1968,6 +1865,50 @@ fn parse_semver_like(version: &str) -> [u64; 3] {
     output
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct OrganizerDirectoryVolumeCheck {
+    same_volume_as_desktop: bool,
+    desktop_drive: String,
+}
+
+/// Lets settings warn before the organizer root moves off the desktop volume, where organizing
+/// large items needs cross-volume copies instead of renames.
+#[tauri::command]
+async fn check_organizer_directory_volume(
+    path: String,
+) -> Result<OrganizerDirectoryVolumeCheck, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = PathBuf::from(path.trim());
+        let desktop = user_desktop();
+        let same_volume = desktop
+            .as_deref()
+            .and_then(|desktop| store::paths_share_volume(&path, desktop));
+        let desktop_root = desktop.as_deref().and_then(store::volume_root_path);
+        organizer_directory_volume_check(same_volume, desktop_root.as_deref())
+    })
+    .await
+    .map_err(to_message)
+}
+
+/// An undetermined volume counts as the desktop volume so no warning is shown.
+fn organizer_directory_volume_check(
+    same_volume: Option<bool>,
+    desktop_volume_root: Option<&Path>,
+) -> OrganizerDirectoryVolumeCheck {
+    let desktop_drive = desktop_volume_root
+        .map(|root| {
+            root.display()
+                .to_string()
+                .trim_end_matches(['\\', '/'])
+                .to_owned()
+        })
+        .unwrap_or_default();
+    OrganizerDirectoryVolumeCheck {
+        same_volume_as_desktop: same_volume.unwrap_or(true),
+        desktop_drive,
+    }
+}
+
 #[tauri::command]
 async fn update_runtime_directory(target: String, path: String) -> Result<AppSnapshot, String> {
     tauri::async_runtime::spawn_blocking(move || update_runtime_directory_impl(target, path))
@@ -2001,29 +1942,8 @@ fn update_runtime_directory_locked(target: String, path: String) -> Result<(), S
     let requested_path = PathBuf::from(path);
     validate_runtime_directory_target(&target, &requested_path, &old_store)?;
 
-    let journal = prepare_runtime_migration_journal(&target, &requested_path, &old_store, None)?;
-    if target == "organizer" {
-        // A directory chosen in settings is the user's decision; never switch it automatically.
-        record_organizer_volume_switch_marker(
-            "manual",
-            &journal.old_organizer_root,
-            &journal.new_organizer_root,
-        )?;
-    }
-    save_runtime_migration_journal(&journal)?;
-    complete_runtime_migration_journal(journal)?;
-
-    Ok(())
-}
-
-fn prepare_runtime_migration_journal(
-    target: &str,
-    requested_path: &Path,
-    old_store: &AppStore,
-    origin: Option<&str>,
-) -> Result<RuntimeMigrationJournal, String> {
     let prospective_store = old_store
-        .with_runtime_directory(target, requested_path)
+        .with_runtime_directory(&target, &requested_path)
         .map_err(to_message)?;
     prospective_store
         .ensure_runtime_dirs()
@@ -2032,8 +1952,8 @@ fn prepare_runtime_migration_journal(
     // must use the plain form that `AppStore::open()` reports, or they will not match later.
     let journal_path = |path: PathBuf| store::without_verbatim_prefix(&path).display().to_string();
 
-    Ok(RuntimeMigrationJournal {
-        target: target.to_owned(),
+    let journal = RuntimeMigrationJournal {
+        target,
         phase: "prepared".to_owned(),
         requested_path: requested_path.display().to_string(),
         old_data_dir: journal_path(old_store.data_dir()),
@@ -2042,8 +1962,11 @@ fn prepare_runtime_migration_journal(
         new_data_dir: journal_path(prospective_store.data_dir()),
         new_organizer_root: journal_path(prospective_store.organizer_root()),
         new_launchers_root: journal_path(prospective_store.launchers_root()),
-        origin: origin.map(str::to_owned),
-    })
+    };
+    save_runtime_migration_journal(&journal)?;
+    complete_runtime_migration_journal(journal)?;
+
+    Ok(())
 }
 
 fn recover_pending_runtime_migration_locked() -> Result<(), String> {
@@ -2052,60 +1975,6 @@ fn recover_pending_runtime_migration_locked() -> Result<(), String> {
     };
     let journal: RuntimeMigrationJournal = serde_json::from_str(&content).map_err(to_message)?;
     complete_runtime_migration_journal(journal)
-}
-
-/// Startup variant of `recover_pending_runtime_migration_locked`: an automatic organizer switch
-/// interrupted by a crash is finished or rolled back, but it never fails startup.
-fn recover_pending_runtime_migration_on_startup_locked() -> Result<(), String> {
-    let Some(content) = AppStore::load_runtime_migration_journal().map_err(to_message)? else {
-        return Ok(());
-    };
-    let journal: RuntimeMigrationJournal = serde_json::from_str(&content).map_err(to_message)?;
-    if !journal.is_organizer_volume_switch() {
-        return complete_runtime_migration_journal(journal);
-    }
-
-    if runtime_migration_phase_index(&journal.phase) < runtime_migration_phase_index("copied") {
-        // Nothing was rewritten yet and the old directory is still active, so the switch is
-        // simply discarded; the startup check decides again whether to start it over.
-        let result = AppStore::remove_runtime_migration_journal().map_err(to_message);
-        if result.is_ok() {
-            discard_abandoned_organizer_copy(
-                Path::new(&journal.new_organizer_root),
-                Path::new(&journal.old_organizer_root),
-            );
-        }
-        append_desktop_diagnostic(
-            "organizer_volume_switch_discarded",
-            &format!(
-                "to=\"{}\" error=\"{}\"",
-                diagnostic_value(&journal.new_organizer_root),
-                diagnostic_value(&result.err().unwrap_or_default())
-            ),
-        );
-        return Ok(());
-    }
-
-    let from = journal.old_organizer_root.clone();
-    let to = journal.new_organizer_root.clone();
-    match run_organizer_volume_switch_journal(journal) {
-        Ok(()) => {
-            append_desktop_diagnostic(
-                "organizer_volume_switch_resumed",
-                &format!(
-                    "from=\"{}\" to=\"{}\"",
-                    diagnostic_value(&from),
-                    diagnostic_value(&to)
-                ),
-            );
-            record_organizer_volume_switch_marker_best_effort(&from, &to);
-        }
-        Err(error) => append_desktop_diagnostic(
-            "organizer_volume_switch_failed",
-            &format!("phase=resume error=\"{}\"", diagnostic_value(&error)),
-        ),
-    }
-    Ok(())
 }
 
 fn complete_runtime_migration_journal(mut journal: RuntimeMigrationJournal) -> Result<(), String> {
@@ -2258,26 +2127,6 @@ fn rewrite_runtime_migration_paths(
     }
 }
 
-fn runtime_migration_copy_pairs(journal: &RuntimeMigrationJournal) -> Vec<(PathBuf, PathBuf)> {
-    let old_data_dir = PathBuf::from(&journal.old_data_dir);
-    let old_organizer_root = PathBuf::from(&journal.old_organizer_root);
-    let old_launchers_root = PathBuf::from(&journal.old_launchers_root);
-    let new_data_dir = PathBuf::from(&journal.new_data_dir);
-    let new_organizer_root = PathBuf::from(&journal.new_organizer_root);
-    let new_launchers_root = PathBuf::from(&journal.new_launchers_root);
-
-    match journal.target.as_str() {
-        "data" => vec![
-            (old_data_dir, new_data_dir),
-            (old_organizer_root, new_organizer_root),
-            (old_launchers_root, new_launchers_root),
-        ],
-        "organizer" => vec![(old_organizer_root, new_organizer_root)],
-        "launchers" => vec![(old_launchers_root, new_launchers_root)],
-        _ => Vec::new(),
-    }
-}
-
 /// Restart marker sources must stay inside the active organizer root, otherwise startup can no
 /// longer recollect them. Rewritten paths no longer match the old root, so repeating is a no-op.
 fn rewrite_restart_marker_path_prefixes(
@@ -2314,457 +2163,23 @@ fn rewrite_restart_marker_path_prefixes(
     Ok(())
 }
 
-fn record_organizer_volume_switch_marker(
-    reason: &'static str,
-    previous_organizer_root: &str,
-    organizer_root: &str,
-) -> Result<(), String> {
-    let marker = OrganizerVolumeSwitchMarker {
-        schema_version: ORGANIZER_VOLUME_SWITCH_MARKER_SCHEMA_VERSION,
-        reason,
-        previous_organizer_root: previous_organizer_root.to_owned(),
-        organizer_root: organizer_root.to_owned(),
-        recorded_at: now_local_string(),
-    };
-    let bytes = serde_json::to_vec_pretty(&marker).map_err(to_message)?;
-    AppStore::save_organizer_volume_switch_marker(&bytes).map_err(to_message)
-}
+fn runtime_migration_copy_pairs(journal: &RuntimeMigrationJournal) -> Vec<(PathBuf, PathBuf)> {
+    let old_data_dir = PathBuf::from(&journal.old_data_dir);
+    let old_organizer_root = PathBuf::from(&journal.old_organizer_root);
+    let old_launchers_root = PathBuf::from(&journal.old_launchers_root);
+    let new_data_dir = PathBuf::from(&journal.new_data_dir);
+    let new_organizer_root = PathBuf::from(&journal.new_organizer_root);
+    let new_launchers_root = PathBuf::from(&journal.new_launchers_root);
 
-fn record_organizer_volume_switch_marker_best_effort(from: &str, to: &str) {
-    // The new root already shares the desktop volume, so a missing marker only costs one more
-    // check on the next startup.
-    if let Err(error) = record_organizer_volume_switch_marker("auto", from, to) {
-        append_desktop_diagnostic(
-            "organizer_volume_switch_marker_failed",
-            &format!("error=\"{}\"", diagnostic_value(&error)),
-        );
-    }
-}
-
-/// Startup step between runtime migration recovery and restart recollection: moves a legacy
-/// default organizer root that is on another volume than the desktop onto the desktop volume,
-/// once. It never fails startup; skips and failures only leave diagnostics.
-fn switch_legacy_organizer_to_desktop_volume(app: &tauri::AppHandle) {
-    let started = Instant::now();
-    let result = store::with_storage_mutation(|| {
-        switch_legacy_organizer_to_desktop_volume_locked(|target| {
-            publish_lifecycle_desktop_operation(
-                app,
-                DesktopOperationPayload {
-                    kind: "classify",
-                    scope: "lifecycle",
-                    status: "progress",
-                    message: "正在把收纳目录迁移到桌面所在磁盘…".to_owned(),
-                    moved: 0,
-                    skipped: 0,
-                    restored: 0,
-                    total: 0,
-                    current_path: target.display().to_string(),
-                    category_counts: Vec::new(),
-                },
-                true,
-            );
-        })
-    });
-    match result {
-        Ok(OrganizerVolumeSwitchOutcome::Switched { from, to }) => append_desktop_diagnostic(
-            "organizer_volume_switch_finished",
-            &format!(
-                "elapsed_ms={} from=\"{}\" to=\"{}\"",
-                started.elapsed().as_millis(),
-                diagnostic_value(&from.display().to_string()),
-                diagnostic_value(&to.display().to_string())
-            ),
-        ),
-        Ok(OrganizerVolumeSwitchOutcome::Skipped(reason)) => {
-            if !reason.is_routine() {
-                append_desktop_diagnostic(
-                    "organizer_volume_switch_skipped",
-                    &format!("reason=\"{}\"", diagnostic_value(&reason.describe())),
-                );
-            }
-        }
-        Err(error) => append_desktop_diagnostic(
-            "organizer_volume_switch_failed",
-            &format!(
-                "elapsed_ms={} error=\"{}\"",
-                started.elapsed().as_millis(),
-                diagnostic_value(&error)
-            ),
-        ),
-    }
-}
-
-fn switch_legacy_organizer_to_desktop_volume_locked(
-    on_migration_started: impl FnOnce(&Path),
-) -> Result<OrganizerVolumeSwitchOutcome, String> {
-    let _guard = RUNTIME_DIRECTORY_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .map_err(|_| "运行目录迁移锁已损坏".to_owned())?;
-    if AppStore::load_runtime_migration_journal()
-        .map_err(to_message)?
-        .is_some()
-    {
-        return Err("仍有未完成的运行目录迁移，暂不切换收纳目录".to_owned());
-    }
-
-    let store = AppStore::open().map_err(to_message)?;
-    let desktop = user_desktop();
-    let context = OrganizerVolumeSwitchContext {
-        marker_present: AppStore::organizer_volume_switch_marker_exists().map_err(to_message)?,
-        organizer_root: store.organizer_root(),
-        desktop_volume_root: desktop.as_deref().and_then(store::volume_root_path),
-        desktop,
-        install_root: AppStore::install_root().map_err(to_message)?,
-        settings_root: AppStore::settings_root().map_err(to_message)?,
-        local_app_data: env::var_os("LOCALAPPDATA").map(PathBuf::from),
-        transfer_journal_root: transfer_quarantine_journal_root()?,
-        max_entries: ORGANIZER_VOLUME_SWITCH_MAX_ENTRIES,
-        max_bytes: ORGANIZER_VOLUME_SWITCH_MAX_BYTES,
-    };
-    let data_dir = store.data_dir();
-    let launchers_root = store.launchers_root();
-    let usable_target = |candidate: &Path| {
-        !paths_overlap(candidate, &data_dir)
-            && !paths_overlap(candidate, &launchers_root)
-            && store::can_create_directory(candidate)
-    };
-    let target = match plan_organizer_volume_switch(
-        &context,
-        store::paths_share_volume,
-        usable_target,
-        || recover_transfer_quarantine_journals_strict(true),
-    ) {
-        OrganizerVolumeSwitchPlan::Switch { target } => target,
-        OrganizerVolumeSwitchPlan::Skip(reason) => {
-            return Ok(OrganizerVolumeSwitchOutcome::Skipped(reason));
-        }
-    };
-    validate_runtime_directory_target("organizer", &target, &store)?;
-    store.ensure_runtime_dirs().map_err(to_message)?;
-
-    on_migration_started(&target);
-    let journal = prepare_runtime_migration_journal(
-        "organizer",
-        &target,
-        &store,
-        Some(ORGANIZER_VOLUME_SWITCH_ORIGIN),
-    )?;
-    save_runtime_migration_journal(&journal)?;
-    let from = journal.old_organizer_root.clone();
-    let to = journal.new_organizer_root.clone();
-    run_organizer_volume_switch_journal(journal)?;
-    record_organizer_volume_switch_marker_best_effort(&from, &to);
-    Ok(OrganizerVolumeSwitchOutcome::Switched {
-        from: PathBuf::from(from),
-        to: PathBuf::from(to),
-    })
-}
-
-/// Decides whether the organizer root may move to the desktop volume automatically. Only a
-/// legacy default root on another volume qualifies, and only while it is nearly empty, which is
-/// the normal state after an exit restored every organized item to the desktop.
-fn plan_organizer_volume_switch(
-    context: &OrganizerVolumeSwitchContext,
-    same_volume: impl Fn(&Path, &Path) -> Option<bool>,
-    can_create: impl Fn(&Path) -> bool,
-    recover_transfer_journals: impl FnOnce() -> Result<(), String>,
-) -> OrganizerVolumeSwitchPlan {
-    use OrganizerVolumeSwitchPlan::Skip;
-    use OrganizerVolumeSwitchSkip as Reason;
-
-    if context.marker_present {
-        return Skip(Reason::MarkerPresent);
-    }
-    let Some(desktop) = context.desktop.as_deref() else {
-        return Skip(Reason::DesktopUnavailable);
-    };
-    match same_volume(&context.organizer_root, desktop) {
-        Some(false) => {}
-        Some(true) => return Skip(Reason::AlreadyOnDesktopVolume),
-        None => return Skip(Reason::VolumeUnknown),
-    }
-    if !is_legacy_default_organizer_root(
-        &context.organizer_root,
-        &context.install_root,
-        &context.settings_root,
-    ) {
-        return Skip(Reason::CustomDirectory);
-    }
-
-    // Transfer journals are the authority for in-flight moves: recover them first and require
-    // that none is left before the organizer root may move.
-    if let Err(error) = recover_transfer_journals() {
-        return Skip(Reason::TransferRecoveryFailed(error));
-    }
-    match pending_transfer_journal_count(&context.transfer_journal_root) {
-        Ok(0) => {}
-        Ok(count) => return Skip(Reason::PendingTransferJournals(count)),
-        Err(error) => return Skip(Reason::TransferRecoveryFailed(error)),
-    }
-
-    let scan = match scan_directory_contents(
-        &context.organizer_root,
-        context.max_entries,
-        context.max_bytes,
-    ) {
-        Ok(scan) => scan,
-        Err(error) => return Skip(Reason::ContentScanFailed(error)),
-    };
-    if scan.exceeded {
-        return Skip(Reason::TooLarge {
-            entries: scan.entries,
-            bytes: scan.bytes,
-        });
-    }
-    if scan.internal_entries > 0 {
-        // The runtime migration copies whole directories, internal transfer leftovers included.
-        // Staging leftovers are cleaned after startup, so a later startup can switch.
-        return Skip(Reason::InterruptedTransferData(scan.internal_entries));
-    }
-
-    let Some(target) = store::desktop_volume_organizer_root(
-        desktop,
-        &context.install_root,
-        context.local_app_data.as_deref(),
-        context.desktop_volume_root.as_deref(),
-        |candidate, desktop| same_volume(candidate, desktop) == Some(true),
-        can_create,
-    ) else {
-        return Skip(Reason::NoDesktopVolumeTarget);
-    };
-    // Leftover files would be adopted into categories after the switch.
-    if directory_has_user_content(&target) {
-        return Skip(Reason::TargetNotEmpty(target));
-    }
-    OrganizerVolumeSwitchPlan::Switch { target }
-}
-
-/// Organizer roots that earlier versions chose on their own, as opposed to a directory the user
-/// picked. Development builds share `%APPDATA%\DustDesk` with installed builds, so any
-/// `DesktopOrganizer` next to a `dustdesk-tauri.exe` counts as well.
-fn is_legacy_default_organizer_root(
-    organizer_root: &Path,
-    install_root: &Path,
-    settings_root: &Path,
-) -> bool {
-    if same_path_for_move(organizer_root, &install_root.join("DesktopOrganizer"))
-        || same_path_for_move(
-            organizer_root,
-            &settings_root.join("Data").join("DesktopOrganizer"),
-        )
-    {
-        return true;
-    }
-    organizer_root.file_name().is_some_and(|name| {
-        name.to_string_lossy()
-            .eq_ignore_ascii_case("DesktopOrganizer")
-    }) && organizer_root
-        .parent()
-        .is_some_and(|parent| parent.join("dustdesk-tauri.exe").is_file())
-}
-
-fn pending_transfer_journal_count(journal_root: &Path) -> Result<usize, String> {
-    let entries = match fs::read_dir(journal_root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
-        Err(error) => return Err(to_message(error)),
-    };
-    let mut count = 0;
-    for entry in entries {
-        let name = entry.map_err(to_message)?.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with("source-transfer-") && name.ends_with(".json") {
-            count += 1;
-        }
-    }
-    Ok(count)
-}
-
-fn is_internal_transfer_temp_name(name: &std::ffi::OsStr) -> bool {
-    let name = name.to_string_lossy().to_ascii_lowercase();
-    name.starts_with(".dustdesk-") && name.ends_with(".tmp")
-}
-
-/// Counts entries and file bytes below `root` without following links. Internal
-/// `.dustdesk-*.tmp` transfer directories are only counted separately, never measured.
-fn scan_directory_contents(
-    root: &Path,
-    max_entries: u64,
-    max_bytes: u64,
-) -> Result<DirectoryContentScan, String> {
-    let mut scan = DirectoryContentScan::default();
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(directory) = pending.pop() {
-        let entries = match fs::read_dir(&directory) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound && directory == root => {
-                return Ok(scan);
-            }
-            Err(error) => return Err(format!("{}：{error}", directory.display())),
-        };
-        for entry in entries {
-            let entry = entry.map_err(to_message)?;
-            if is_internal_transfer_temp_name(&entry.file_name()) {
-                scan.internal_entries += 1;
-                continue;
-            }
-            let path = entry.path();
-            let metadata = fs::symlink_metadata(&path)
-                .map_err(|error| format!("{}：{error}", path.display()))?;
-            scan.entries += 1;
-            if metadata.is_dir() && !metadata_is_reparse_point(&metadata) {
-                pending.push(path);
-            } else if metadata.is_file() {
-                scan.bytes = scan.bytes.saturating_add(metadata.len());
-            }
-            if scan.entries > max_entries || scan.bytes > max_bytes {
-                scan.exceeded = true;
-                return Ok(scan);
-            }
-        }
-    }
-    Ok(scan)
-}
-
-/// Whether `root` holds anything besides empty folders, `desktop.ini` and internal transfer
-/// leftovers. Anything unreadable counts as content.
-fn directory_has_user_content(root: &Path) -> bool {
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(directory) = pending.pop() {
-        let entries = match fs::read_dir(&directory) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(_) => return true,
-        };
-        for entry in entries {
-            let Ok(entry) = entry else {
-                return true;
-            };
-            let path = entry.path();
-            if is_internal_transfer_temp_name(&entry.file_name()) || is_desktop_ini_path(&path) {
-                continue;
-            }
-            match fs::symlink_metadata(&path) {
-                Ok(metadata) if metadata.is_dir() && !metadata_is_reparse_point(&metadata) => {
-                    pending.push(path);
-                }
-                _ => return true,
-            }
-        }
-    }
-    false
-}
-
-/// Runs an automatic organizer switch to completion. When it fails, the switch is finished if the
-/// new root already took effect, otherwise rolled back so the old root stays authoritative.
-fn run_organizer_volume_switch_journal(journal: RuntimeMigrationJournal) -> Result<(), String> {
-    let error = match complete_runtime_migration_journal(journal.clone()) {
-        Ok(()) => return Ok(()),
-        Err(error) => error,
-    };
-    match settle_failed_organizer_volume_switch(&journal) {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(format!("{error}；已回滚，继续使用原收纳目录")),
-        Err(rollback_error) => Err(format!("{error}；回滚未完成：{rollback_error}")),
-    }
-}
-
-/// Returns `Ok(true)` when the new root is already active and `Ok(false)` after a rollback.
-fn settle_failed_organizer_volume_switch(
-    journal: &RuntimeMigrationJournal,
-) -> Result<bool, String> {
-    let old_root = PathBuf::from(&journal.old_organizer_root);
-    let new_root = PathBuf::from(&journal.new_organizer_root);
-    let persisted = AppStore::load_runtime_migration_journal()
-        .map_err(to_message)?
-        .map(|content| serde_json::from_str::<RuntimeMigrationJournal>(&content))
-        .transpose()
-        .map_err(to_message)?;
-    let active_root = AppStore::open().map_err(to_message)?.organizer_root();
-    if same_path_for_move(&active_root, &new_root) {
-        // Only cleanup of the old root is left; a remaining journal is finished on a later start.
-        if let Some(persisted) = persisted {
-            if let Err(error) = complete_runtime_migration_journal(persisted) {
-                append_desktop_diagnostic(
-                    "organizer_volume_switch_cleanup_deferred",
-                    &format!("error=\"{}\"", diagnostic_value(&error)),
-                );
-            }
-        }
-        return Ok(true);
-    }
-
-    let paths_may_be_rewritten = persisted.as_ref().is_none_or(|persisted| {
-        runtime_migration_phase_index(&persisted.phase) >= runtime_migration_phase_index("copied")
-    });
-    if paths_may_be_rewritten {
-        if let Some(mut persisted) = persisted.clone() {
-            // If the rollback is interrupted, finishing the switch must redo the whole rewrite.
-            set_runtime_migration_phase(&mut persisted, "copied")?;
-        }
-        let old_store = AppStore::from_runtime_dirs(
-            PathBuf::from(&journal.old_data_dir),
-            old_root.clone(),
-            PathBuf::from(&journal.old_launchers_root),
-        );
-        rewrite_runtime_migration_paths(&reversed_runtime_migration_journal(journal), &old_store)?;
-    }
-    if let Some(mut persisted) = persisted {
-        // The old root is used again from here on, so a leftover journal must copy afresh.
-        set_runtime_migration_phase(&mut persisted, "prepared")?;
-    }
-    AppStore::remove_runtime_migration_journal().map_err(to_message)?;
-    discard_abandoned_organizer_copy(&new_root, &old_root);
-    Ok(false)
-}
-
-fn reversed_runtime_migration_journal(
-    journal: &RuntimeMigrationJournal,
-) -> RuntimeMigrationJournal {
-    RuntimeMigrationJournal {
-        target: journal.target.clone(),
-        phase: journal.phase.clone(),
-        requested_path: journal.old_organizer_root.clone(),
-        old_data_dir: journal.new_data_dir.clone(),
-        old_organizer_root: journal.new_organizer_root.clone(),
-        old_launchers_root: journal.new_launchers_root.clone(),
-        new_data_dir: journal.old_data_dir.clone(),
-        new_organizer_root: journal.old_organizer_root.clone(),
-        new_launchers_root: journal.old_launchers_root.clone(),
-        origin: journal.origin.clone(),
-    }
-}
-
-/// Best-effort removal of what an abandoned switch copied into `copy_root`. Only items verified
-/// identical to their counterpart in the still active `source_root` are deleted.
-fn discard_abandoned_organizer_copy(copy_root: &Path, source_root: &Path) {
-    if same_path_for_move(copy_root, source_root) {
-        return;
-    }
-    let mut staging_parents = vec![copy_root.to_path_buf()];
-    staging_parents.extend(
-        fs::read_dir(copy_root)
-            .into_iter()
-            .flat_map(|entries| entries.flatten())
-            .filter(|entry| entry.file_type().is_ok_and(|file_type| file_type.is_dir()))
-            .map(|entry| entry.path())
-            .filter(|path| !is_internal_transfer_path(path)),
-    );
-    for parent in &staging_parents {
-        // Staging directories of the failed copy never hold the only copy of anything.
-        cleanup_stale_transfer_staging_dirs(parent, Duration::ZERO);
-    }
-    if let Err(error) = remove_verified_directory_contents(copy_root, source_root) {
-        append_desktop_diagnostic(
-            "organizer_volume_switch_copy_kept",
-            &format!(
-                "path=\"{}\" error=\"{}\"",
-                diagnostic_value(&copy_root.display().to_string()),
-                diagnostic_value(&error)
-            ),
-        );
+    match journal.target.as_str() {
+        "data" => vec![
+            (old_data_dir, new_data_dir),
+            (old_organizer_root, new_organizer_root),
+            (old_launchers_root, new_launchers_root),
+        ],
+        "organizer" => vec![(old_organizer_root, new_organizer_root)],
+        "launchers" => vec![(old_launchers_root, new_launchers_root)],
+        _ => Vec::new(),
     }
 }
 
@@ -10600,42 +10015,28 @@ mod tests {
     }
 
     #[test]
-    fn legacy_default_organizer_roots_are_recognized_but_custom_roots_are_not() {
-        let root = unique_test_dir("dustdesk-legacy-organizer-root");
-        let install_root = root.join("install");
-        let settings_root = root.join("appdata").join("DustDesk");
-        let debug_root = root.join("src-tauri").join("target").join("debug");
-        let custom_parent = root.join("custom");
-        for path in [&install_root, &settings_root, &debug_root, &custom_parent] {
-            fs::create_dir_all(path).expect("create legacy root test directory");
-        }
-        fs::write(debug_root.join("dustdesk-tauri.exe"), b"exe").expect("write test exe");
-
-        for legacy in [
-            install_root.join("DesktopOrganizer"),
-            install_root.join("desktoporganizer"),
-            settings_root.join("Data").join("DesktopOrganizer"),
-            debug_root.join("DesktopOrganizer"),
-        ] {
-            assert!(
-                is_legacy_default_organizer_root(&legacy, &install_root, &settings_root),
-                "{} should be a legacy default",
-                legacy.display()
-            );
-        }
-        for custom in [
-            custom_parent.join("DesktopOrganizer"),
-            custom_parent.join("Organizer"),
-            debug_root.join("MyOrganizer"),
-            install_root.join("Data").join("DesktopOrganizer"),
-        ] {
-            assert!(
-                !is_legacy_default_organizer_root(&custom, &install_root, &settings_root),
-                "{} should be a user choice",
-                custom.display()
-            );
-        }
-        let _ = fs::remove_dir_all(root);
+    fn organizer_directory_volume_check_reports_drive_and_treats_unknown_as_same_volume() {
+        assert_eq!(
+            organizer_directory_volume_check(Some(false), Some(Path::new(r"C:\"))),
+            OrganizerDirectoryVolumeCheck {
+                same_volume_as_desktop: false,
+                desktop_drive: "C:".to_owned(),
+            }
+        );
+        assert_eq!(
+            organizer_directory_volume_check(Some(true), Some(Path::new(r"D:\"))),
+            OrganizerDirectoryVolumeCheck {
+                same_volume_as_desktop: true,
+                desktop_drive: "D:".to_owned(),
+            }
+        );
+        assert_eq!(
+            organizer_directory_volume_check(None, None),
+            OrganizerDirectoryVolumeCheck {
+                same_volume_as_desktop: true,
+                desktop_drive: String::new(),
+            }
+        );
     }
 
     #[test]
@@ -10730,311 +10131,6 @@ mod tests {
         assert_eq!(unchanged.save_calls.get(), 0);
         assert!(missing.current().is_none());
         assert_eq!(missing.save_calls.get(), 0);
-    }
-
-    #[test]
-    fn organizer_volume_switch_moves_small_legacy_root_to_desktop_volume() {
-        let root = unique_test_dir("dustdesk-organizer-switch");
-        let context = organizer_switch_test_context(&root);
-        let category = context.organizer_root.join("docs");
-        fs::create_dir_all(&category).expect("create category");
-        fs::write(category.join("left-behind.txt"), b"small").expect("write item");
-        let recovered = Cell::new(false);
-
-        let plan = plan_organizer_volume_switch(
-            &context,
-            organizer_switch_test_volumes(&root),
-            store::can_create_directory,
-            || {
-                recovered.set(true);
-                Ok(())
-            },
-        );
-
-        assert!(recovered.get(), "transfer journals must be recovered first");
-        assert_eq!(
-            plan,
-            OrganizerVolumeSwitchPlan::Switch {
-                target: root
-                    .join("volume-c")
-                    .join("local")
-                    .join("DustDesk")
-                    .join("DesktopOrganizer"),
-            }
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn organizer_volume_switch_skips_roots_over_the_size_or_entry_limit() {
-        let root = unique_test_dir("dustdesk-organizer-switch-limits");
-        let context = organizer_switch_test_context(&root);
-        let category = context.organizer_root.join("docs");
-        fs::create_dir_all(&category).expect("create category");
-        fs::write(category.join("large.bin"), vec![7u8; 65]).expect("write large item");
-
-        let too_large = plan_organizer_switch_for_test(&context, &root);
-        fs::remove_file(category.join("large.bin")).expect("remove large item");
-        for index in 0..4 {
-            fs::write(category.join(format!("item-{index}.txt")), b"x").expect("write item");
-        }
-        let too_many = plan_organizer_switch_for_test(&context, &root);
-
-        assert_eq!(
-            too_large,
-            OrganizerVolumeSwitchPlan::Skip(OrganizerVolumeSwitchSkip::TooLarge {
-                entries: 2,
-                bytes: 65
-            })
-        );
-        assert_eq!(
-            too_many,
-            OrganizerVolumeSwitchPlan::Skip(OrganizerVolumeSwitchSkip::TooLarge {
-                entries: 5,
-                bytes: 4
-            })
-        );
-        assert!(
-            !root
-                .join("volume-c")
-                .join("local")
-                .join("DustDesk")
-                .exists(),
-            "skipped switches must not create the new organizer root"
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn organizer_volume_switch_ignores_internal_transfer_data_in_limits_but_waits_for_it() {
-        let root = unique_test_dir("dustdesk-organizer-switch-internal");
-        let context = organizer_switch_test_context(&root);
-        let staging = context
-            .organizer_root
-            .join("docs")
-            .join(".dustdesk-transfer-s1a2b-0.tmp");
-        fs::create_dir_all(&staging).expect("create staging leftover");
-        fs::write(staging.join("payload.bin"), vec![1u8; 4096]).expect("write staging payload");
-
-        let plan = plan_organizer_switch_for_test(&context, &root);
-
-        assert_eq!(
-            plan,
-            OrganizerVolumeSwitchPlan::Skip(OrganizerVolumeSwitchSkip::InterruptedTransferData(1))
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn organizer_volume_switch_skips_when_marker_exists() {
-        let root = unique_test_dir("dustdesk-organizer-switch-marker");
-        let context = OrganizerVolumeSwitchContext {
-            marker_present: true,
-            ..organizer_switch_test_context(&root)
-        };
-        let recovered = Cell::new(false);
-
-        let plan = plan_organizer_volume_switch(
-            &context,
-            organizer_switch_test_volumes(&root),
-            store::can_create_directory,
-            || {
-                recovered.set(true);
-                Ok(())
-            },
-        );
-
-        assert_eq!(
-            plan,
-            OrganizerVolumeSwitchPlan::Skip(OrganizerVolumeSwitchSkip::MarkerPresent)
-        );
-        assert!(!recovered.get());
-        assert!(!root
-            .join("volume-c")
-            .join("local")
-            .join("DustDesk")
-            .exists());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn organizer_volume_switch_waits_until_transfer_journals_are_cleared() {
-        let root = unique_test_dir("dustdesk-organizer-switch-journals");
-        let context = organizer_switch_test_context(&root);
-        fs::create_dir_all(&context.transfer_journal_root).expect("create journal root");
-        fs::write(
-            context
-                .transfer_journal_root
-                .join("source-transfer-s1a2b-0.json"),
-            b"{}",
-        )
-        .expect("write pending journal");
-        fs::write(
-            context
-                .transfer_journal_root
-                .join("source-transfer-s1a2b-0.committed"),
-            b"committed\n",
-        )
-        .expect("write committed marker");
-        let recovered = Cell::new(false);
-
-        let pending = plan_organizer_volume_switch(
-            &context,
-            organizer_switch_test_volumes(&root),
-            store::can_create_directory,
-            || {
-                recovered.set(true);
-                Ok(())
-            },
-        );
-        let failed_recovery = plan_organizer_volume_switch(
-            &context,
-            organizer_switch_test_volumes(&root),
-            store::can_create_directory,
-            || Err("journal locked".to_owned()),
-        );
-
-        assert!(
-            recovered.get(),
-            "pending journals are counted after recovery"
-        );
-        assert_eq!(
-            pending,
-            OrganizerVolumeSwitchPlan::Skip(OrganizerVolumeSwitchSkip::PendingTransferJournals(1))
-        );
-        assert_eq!(
-            failed_recovery,
-            OrganizerVolumeSwitchPlan::Skip(OrganizerVolumeSwitchSkip::TransferRecoveryFailed(
-                "journal locked".to_owned()
-            ))
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn organizer_volume_switch_leaves_custom_or_same_volume_roots_alone() {
-        let root = unique_test_dir("dustdesk-organizer-switch-custom");
-        let context = organizer_switch_test_context(&root);
-        let custom = OrganizerVolumeSwitchContext {
-            organizer_root: root.join("volume-d").join("MyOrganizer"),
-            ..context.clone()
-        };
-        let same_volume = OrganizerVolumeSwitchContext {
-            organizer_root: root
-                .join("volume-c")
-                .join("install")
-                .join("DesktopOrganizer"),
-            install_root: root.join("volume-c").join("install"),
-            ..context.clone()
-        };
-        let unknown_volume = OrganizerVolumeSwitchContext {
-            organizer_root: root.join("elsewhere").join("DesktopOrganizer"),
-            install_root: root.join("elsewhere"),
-            ..context.clone()
-        };
-
-        assert_eq!(
-            plan_organizer_switch_for_test(&custom, &root),
-            OrganizerVolumeSwitchPlan::Skip(OrganizerVolumeSwitchSkip::CustomDirectory)
-        );
-        assert_eq!(
-            plan_organizer_switch_for_test(&same_volume, &root),
-            OrganizerVolumeSwitchPlan::Skip(OrganizerVolumeSwitchSkip::AlreadyOnDesktopVolume)
-        );
-        assert_eq!(
-            plan_organizer_switch_for_test(&unknown_volume, &root),
-            OrganizerVolumeSwitchPlan::Skip(OrganizerVolumeSwitchSkip::VolumeUnknown)
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn organizer_volume_switch_requires_an_empty_target_on_the_desktop_volume() {
-        let root = unique_test_dir("dustdesk-organizer-switch-target");
-        let context = organizer_switch_test_context(&root);
-        let target = root
-            .join("volume-c")
-            .join("local")
-            .join("DustDesk")
-            .join("DesktopOrganizer");
-        fs::create_dir_all(target.join("empty-category")).expect("create empty category");
-        fs::write(target.join("desktop.ini"), b"[.ShellClassInfo]").expect("write desktop.ini");
-
-        let empty_target = plan_organizer_switch_for_test(&context, &root);
-        fs::write(target.join("empty-category").join("stale.txt"), b"stale")
-            .expect("write stale item");
-        let used_target = plan_organizer_switch_for_test(&context, &root);
-        let no_target = plan_organizer_switch_for_test(
-            &OrganizerVolumeSwitchContext {
-                local_app_data: None,
-                desktop_volume_root: None,
-                ..context.clone()
-            },
-            &root,
-        );
-
-        assert_eq!(
-            empty_target,
-            OrganizerVolumeSwitchPlan::Switch {
-                target: target.clone()
-            }
-        );
-        assert_eq!(
-            used_target,
-            OrganizerVolumeSwitchPlan::Skip(OrganizerVolumeSwitchSkip::TargetNotEmpty(target))
-        );
-        assert_eq!(
-            no_target,
-            OrganizerVolumeSwitchPlan::Skip(OrganizerVolumeSwitchSkip::NoDesktopVolumeTarget)
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    /// `volume-c` holds the desktop and local app data, `volume-d` the legacy install directory.
-    fn organizer_switch_test_context(root: &Path) -> OrganizerVolumeSwitchContext {
-        let install_root = root.join("volume-d").join("install");
-        let organizer_root = install_root.join("DesktopOrganizer");
-        let desktop = root.join("volume-c").join("desktop");
-        let local_app_data = root.join("volume-c").join("local");
-        for path in [&organizer_root, &desktop, &local_app_data] {
-            fs::create_dir_all(path).expect("create organizer switch test directory");
-        }
-        OrganizerVolumeSwitchContext {
-            marker_present: false,
-            organizer_root,
-            desktop: Some(desktop),
-            install_root,
-            settings_root: root.join("appdata").join("DustDesk"),
-            local_app_data: Some(local_app_data),
-            desktop_volume_root: Some(root.join("volume-c")),
-            transfer_journal_root: root.join("transfer-journals"),
-            max_entries: 4,
-            max_bytes: 64,
-        }
-    }
-
-    fn organizer_switch_test_volumes(root: &Path) -> impl Fn(&Path, &Path) -> Option<bool> {
-        let volumes = [root.join("volume-c"), root.join("volume-d")];
-        move |left, right| {
-            let volume = |path: &Path| {
-                volumes
-                    .iter()
-                    .position(|volume| is_path_within(path, volume))
-            };
-            Some(volume(left)? == volume(right)?)
-        }
-    }
-
-    fn plan_organizer_switch_for_test(
-        context: &OrganizerVolumeSwitchContext,
-        root: &Path,
-    ) -> OrganizerVolumeSwitchPlan {
-        plan_organizer_volume_switch(
-            context,
-            organizer_switch_test_volumes(root),
-            store::can_create_directory,
-            || Ok(()),
-        )
     }
 
     #[test]
@@ -15244,16 +14340,13 @@ fn main() {
                 let mut loading_visible_at = None;
                 let recovery_result =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        store::with_storage_mutation(
-                            recover_pending_runtime_migration_on_startup_locked,
-                        )?;
+                        store::with_storage_mutation(recover_pending_runtime_migration_locked)?;
                         if let Err(error) =
                             with_lazy_window_operation(|| show_persisted_desktop_layout(&handle))
                         {
                             eprintln!("failed to show startup operation overlay: {error}");
                         }
                         loading_visible_at = Some(Instant::now());
-                        switch_legacy_organizer_to_desktop_volume(&handle);
                         recollect_desktop_organization_from_restart_marker_with_progress(
                             move |current, total, path| {
                                 publish_lifecycle_desktop_operation(
@@ -15404,6 +14497,7 @@ fn main() {
             create_desktop_entries,
             open_special,
             update_runtime_directory,
+            check_organizer_directory_volume,
             check_for_updates,
             open_update_download,
             update_notice::get_update_notice,

@@ -117,6 +117,7 @@ export function DesktopWidgetPage() {
   const addLaunchersLight = useDustDeskStore((state) => state.addLaunchersLight)
   const removeLauncher = useDustDeskStore((state) => state.removeLauncher)
   const completeInternalPathDragLight = useDustDeskStore((state) => state.completeInternalPathDragLight)
+  const restoreItemsToDesktopLight = useDustDeskStore((state) => state.restoreItemsToDesktopLight)
   const startRestoreAllToDesktopTask = useDustDeskStore((state) => state.startRestoreAllToDesktopTask)
   const showPathInFolder = useDustDeskStore((state) => state.showPathInFolder)
   const startClassifyDesktopItemsTask = useDustDeskStore((state) => state.startClassifyDesktopItemsTask)
@@ -140,14 +141,14 @@ export function DesktopWidgetPage() {
   const [isMergingCategories, setIsMergingCategories] = useState(false)
   const [dropOperationLabel, setDropOperationLabel] = useState("")
   const desktopOperationLabel = isClassifyingDesktop ? notice || "正在智能收纳桌面..." : isRestoringDesktop ? notice || "正在还原桌面..." : isMergingCategories ? "正在合并分类..." : dropOperationLabel
-  const { ownTransfer, backgroundTransfer, trackTransfer } = useDesktopTransferProgress()
+  const { ownTransfer, ownPosition, backgroundTransfer, trackTransfer, setOwnPosition } = useDesktopTransferProgress()
   const desktopOperationView: TransferProgressView | null = !desktopOperationLabel
     ? null
     : isClassifyingDesktop || isRestoringDesktop
       ? describeBackgroundTransfer(backgroundTransfer, desktopOperationLabel)
       : isMergingCategories
         ? { label: desktopOperationLabel, percent: null }
-        : describeOwnTransfer(ownTransfer, desktopOperationLabel)
+        : describeOwnTransfer(ownTransfer, desktopOperationLabel, ownPosition)
   const edgeHide = useDesktopEdgeHide({
     fallbackLabel: "desktop-widget",
     busy: openSettingsId !== "" || Boolean(desktopOperationLabel) || isClassifyingDesktop || isRestoringDesktop || isMergingCategories,
@@ -472,6 +473,19 @@ export function DesktopWidgetPage() {
       }
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error))
+    } finally {
+      setDropOperationLabel("")
+    }
+  }
+
+  /** Context menu restore: one backend call per item, so the page supplies the i/N position. */
+  async function handleRestoreItems(categoryIndex: number, paths: string[]) {
+    try {
+      setDropOperationLabel(`正在移回桌面 ${paths.length} 项...`)
+      const result = await trackTransfer(() =>
+        restoreItemsToDesktopLight(categoryIndex, paths, (index, total, path) => setOwnPosition({ index, total, name: displayPathName(path) })),
+      )
+      return restoreResultNotice(result)
     } finally {
       setDropOperationLabel("")
     }
@@ -911,6 +925,7 @@ export function DesktopWidgetPage() {
               onOpen={openPath}
               onShowInFolder={showPathInFolder}
               onRestoreDragOut={handleRestoreDragOut}
+              onRestoreItems={handleRestoreItems}
             />
           ) : (
             <EmptyDropHint title="分类都已拆出" detail="在设置里点一键合并分类，就会回到这个分类组。" />
@@ -1534,6 +1549,7 @@ function CategoryItems({
   onOpen,
   onShowInFolder,
   onRestoreDragOut,
+  onRestoreItems,
 }: {
   category?: { name: string; item_details: DesktopItem[] }
   categoryIndex: number
@@ -1541,8 +1557,8 @@ function CategoryItems({
   onOpen: (path: string) => Promise<void>
   onShowInFolder: (path: string) => Promise<void>
   onRestoreDragOut: (index: number, path: string, position: DesktopDropPosition) => Promise<void>
+  onRestoreItems: (index: number, paths: string[]) => Promise<string>
 }) {
-  const restoreItemsToDesktopLight = useDustDeskStore((state) => state.restoreItemsToDesktopLight)
   const deleteCategoryItemsToRecycleBinLight = useDustDeskStore((state) => state.deleteCategoryItemsToRecycleBinLight)
   const renameCategoryItemLight = useDustDeskStore((state) => state.renameCategoryItemLight)
   const items = category?.item_details ?? []
@@ -1578,7 +1594,7 @@ function CategoryItems({
         {
           label: "移回桌面",
           icon: "restore",
-          onSelect: () => run(async () => restoreResultNotice(await restoreItemsToDesktopLight(categoryIndex, paths))),
+          onSelect: () => run(() => onRestoreItems(categoryIndex, paths)),
         },
         common.remove,
         common.properties,

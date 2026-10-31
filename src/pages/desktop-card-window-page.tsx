@@ -85,6 +85,7 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
   const addItemsToCategoryLight = useDustDeskStore((state) => state.addItemsToCategoryLight)
   const addLaunchersLight = useDustDeskStore((state) => state.addLaunchersLight)
   const completeInternalPathDragLight = useDustDeskStore((state) => state.completeInternalPathDragLight)
+  const restoreItemsToDesktopLight = useDustDeskStore((state) => state.restoreItemsToDesktopLight)
   const startRestoreAllToDesktopTask = useDustDeskStore((state) => state.startRestoreAllToDesktopTask)
   const showPathInFolder = useDustDeskStore((state) => state.showPathInFolder)
   const startClassifyDesktopItemsTask = useDustDeskStore((state) => state.startClassifyDesktopItemsTask)
@@ -106,14 +107,14 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
   const [isMergingCategories, setIsMergingCategories] = useState(false)
   const [dropOperationLabel, setDropOperationLabel] = useState("")
   const desktopOperationLabel = isClassifyingDesktop ? notice || "正在智能收纳桌面..." : isRestoringDesktop ? notice || "正在还原桌面..." : isMergingCategories ? "正在合并分类..." : dropOperationLabel
-  const { ownTransfer, backgroundTransfer, trackTransfer } = useDesktopTransferProgress()
+  const { ownTransfer, ownPosition, backgroundTransfer, trackTransfer, setOwnPosition } = useDesktopTransferProgress()
   const desktopOperationView: TransferProgressView | null = !desktopOperationLabel
     ? null
     : isClassifyingDesktop || isRestoringDesktop
       ? describeBackgroundTransfer(backgroundTransfer, desktopOperationLabel)
       : isMergingCategories
         ? { label: desktopOperationLabel, percent: null }
-        : describeOwnTransfer(ownTransfer, desktopOperationLabel)
+        : describeOwnTransfer(ownTransfer, desktopOperationLabel, ownPosition)
   const pendingClassifyActionRef = useRef<"split-all" | null>(null)
   const previousSplitCategoryIndicesRef = useRef<number[]>([])
   const desktopOperationRef = useRef<{
@@ -302,6 +303,19 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
       }
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error))
+    } finally {
+      setDropOperationLabel("")
+    }
+  }
+
+  /** Context menu restore: one backend call per item, so the page supplies the i/N position. */
+  async function handleRestoreItems(categoryIndex: number, paths: string[]) {
+    try {
+      setDropOperationLabel(`正在移回桌面 ${paths.length} 项...`)
+      const result = await trackTransfer(() =>
+        restoreItemsToDesktopLight(categoryIndex, paths, (index, total, path) => setOwnPosition({ index, total, name: displayPathName(path) })),
+      )
+      return restoreResultNotice(result)
     } finally {
       setDropOperationLabel("")
     }
@@ -736,6 +750,7 @@ export function DesktopCardWindowPage({ routeKind, routeIndex }: DesktopCardWind
               onOpen={openPath}
               onShowInFolder={showPathInFolder}
               onRestoreDragOut={handleRestoreDragOut}
+              onRestoreItems={handleRestoreItems}
             />
           )}
           {desktopOperationView ? <WidgetOperationOverlay view={desktopOperationView} /> : null}
@@ -944,6 +959,7 @@ function CategoryItems({
   onOpen,
   onShowInFolder,
   onRestoreDragOut,
+  onRestoreItems,
 }: {
   items: DesktopItem[]
   categoryIndex: number
@@ -951,8 +967,8 @@ function CategoryItems({
   onOpen: (path: string) => Promise<void>
   onShowInFolder: (path: string) => Promise<void>
   onRestoreDragOut: (path: string, position: DesktopDropPosition) => Promise<void>
+  onRestoreItems: (index: number, paths: string[]) => Promise<string>
 }) {
-  const restoreItemsToDesktopLight = useDustDeskStore((state) => state.restoreItemsToDesktopLight)
   const deleteCategoryItemsToRecycleBinLight = useDustDeskStore((state) => state.deleteCategoryItemsToRecycleBinLight)
   const renameCategoryItemLight = useDustDeskStore((state) => state.renameCategoryItemLight)
   if (items.length === 0) {
@@ -987,7 +1003,7 @@ function CategoryItems({
         {
           label: "移回桌面",
           icon: "restore",
-          onSelect: () => run(async () => restoreResultNotice(await restoreItemsToDesktopLight(categoryIndex, paths))),
+          onSelect: () => run(() => onRestoreItems(categoryIndex, paths)),
         },
         common.remove,
         common.properties,

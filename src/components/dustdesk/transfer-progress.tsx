@@ -18,6 +18,16 @@ export interface TransferProgressView {
 }
 
 /**
+ * Item position supplied by the page when it runs several single-item commands in a row (multi
+ * restore), where each backend call only knows about itself (1/1).
+ */
+export interface TransferItemPosition {
+  index: number
+  total: number
+  name: string
+}
+
+/**
  * Transfer progress for one WebView. `ownTransfer` only follows drops started by this window
  * while `trackTransfer` runs; events arriving after the command settled are ignored.
  * `backgroundTransfer` follows classify / restore-all / exit-restore / restart-recollect.
@@ -25,6 +35,7 @@ export interface TransferProgressView {
 export function useDesktopTransferProgress() {
   const [ownTransfer, setOwnTransfer] = useState<DesktopTransferProgressPayload | null>(null)
   const [backgroundTransfer, setBackgroundTransfer] = useState<DesktopTransferProgressPayload | null>(null)
+  const [ownPosition, setOwnPositionState] = useState<TransferItemPosition | null>(null)
   const ownTokenRef = useRef(0)
   const nextTokenRef = useRef(0)
 
@@ -56,17 +67,24 @@ export function useDesktopTransferProgress() {
     const token = nextTokenRef.current
     ownTokenRef.current = token
     setOwnTransfer(null)
+    setOwnPositionState(null)
     try {
       return await run()
     } finally {
       if (ownTokenRef.current === token) {
         ownTokenRef.current = 0
         setOwnTransfer(null)
+        setOwnPositionState(null)
       }
     }
   }, [])
 
-  return { ownTransfer, backgroundTransfer, trackTransfer }
+  /** Only takes effect while a tracked transfer runs; cleared when it settles. */
+  const setOwnPosition = useCallback((position: TransferItemPosition) => {
+    if (ownTokenRef.current) setOwnPositionState(position)
+  }, [])
+
+  return { ownTransfer, ownPosition, backgroundTransfer, trackTransfer, setOwnPosition }
 }
 
 export function formatTransferBytes(bytes: number) {
@@ -100,7 +118,12 @@ export function transferPercent(progress: DesktopTransferProgressPayload | null)
 }
 
 /** Label for a drop started by this window, e.g. `正在收纳 2/5 项到「文档」：泊锐科技`. */
-export function describeOwnTransfer(progress: DesktopTransferProgressPayload | null, fallbackLabel: string): TransferProgressView {
+export function describeOwnTransfer(
+  progress: DesktopTransferProgressPayload | null,
+  fallbackLabel: string,
+  itemPosition?: TransferItemPosition | null,
+): TransferProgressView {
+  if (itemPosition) return describePositionedRestore(progress, itemPosition)
   if (!progress || !progress.current) return { label: fallbackLabel, percent: null }
   const position = progress.items_total > 0 ? ` ${Math.max(1, progress.item_index)}/${progress.items_total} 项` : ""
   const target = progress.target || "分类"
@@ -119,6 +142,21 @@ export function describeOwnTransfer(progress: DesktopTransferProgressPayload | n
       label = fallbackLabel
   }
   return { label, detail: transferBytesDetail(progress), percent: transferPercent(progress) }
+}
+
+/**
+ * `正在移回桌面 2/5 项：泊锐科技` for a multi restore. The page's position wins over the backend's
+ * per-call 1/1, and stays in place between items when the per-item finished event clears progress.
+ */
+function describePositionedRestore(progress: DesktopTransferProgressPayload | null, position: TransferItemPosition): TransferProgressView {
+  const running = progress?.operation === "restore" && progress.status === "running" ? progress : null
+  const name = running?.copying && running.current ? running.current : position.name
+  const label = position.total > 1 ? `正在移回桌面 ${position.index}/${position.total} 项：${name}` : `正在移回桌面：${name}`
+  const detail = transferBytesDetail(running)
+  let percent: number | null = null
+  if (running?.copying && running.bytes_total > 0) percent = Math.min(100, (running.bytes_done / running.bytes_total) * 100)
+  else if (position.total > 1) percent = Math.min(100, (Math.max(0, position.index - 1) / position.total) * 100)
+  return { label, detail, percent }
 }
 
 /** Background/lifecycle operations already carry byte detail in their message. */

@@ -982,7 +982,8 @@ interface DustDeskState {
   removeItemFromCategory: (index: number, path: string) => Promise<void>
   restoreItemToDesktop: (index: number, path: string, position?: DesktopDropPosition) => Promise<string>
   restoreItemToDesktopLight: (index: number, path: string, position?: DesktopDropPosition) => Promise<string>
-  restoreItemsToDesktopLight: (index: number, paths: string[]) => Promise<RestoreItemsResult>
+  /** `onItem` runs before each item (1-based) so the caller can show `i/N` progress. */
+  restoreItemsToDesktopLight: (index: number, paths: string[], onItem?: (index: number, total: number, path: string) => void) => Promise<RestoreItemsResult>
   deleteCategoryItemsToRecycleBinLight: (index: number, paths: string[]) => Promise<RecycleCategoryItemsResult>
   copyPathsToClipboard: (paths: string[]) => Promise<number>
   copyTextToClipboard: (text: string) => Promise<void>
@@ -1316,9 +1317,14 @@ export const useDustDeskStore = create<DustDeskState>()(
       void get().loadDesktopSnapshot({ force: true })
       return restored
     },
-    restoreItemsToDesktopLight: async (index, paths) => {
+    restoreItemsToDesktopLight: async (index, paths, onItem) => {
       const result: RestoreItemsResult = { restored: 0, errors: [] }
-      for (const path of paths) {
+      for (const [position, path] of paths.entries()) {
+        try {
+          onItem?.(position + 1, paths.length, path)
+        } catch {
+          // Progress display must never stop the restore.
+        }
         try {
           await call<string>("restore_item_to_desktop", restoreDesktopArgs(index, path))
           result.restored += 1

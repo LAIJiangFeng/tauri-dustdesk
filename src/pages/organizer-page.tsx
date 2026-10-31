@@ -46,6 +46,7 @@ export function OrganizerPage() {
   const getDesktopOperationStatus = useDustDeskStore((state) => state.getDesktopOperationStatus)
   const addItemsToCategoryLight = useDustDeskStore((state) => state.addItemsToCategoryLight)
   const completeInternalPathDragLight = useDustDeskStore((state) => state.completeInternalPathDragLight)
+  const restoreItemToDesktop = useDustDeskStore((state) => state.restoreItemToDesktop)
   const mergeDesktopWidgets = useDustDeskStore((state) => state.mergeDesktopWidgets)
   const [query, setQuery] = useState("")
   const [notice, setNotice] = useState<string | null>(null)
@@ -84,14 +85,14 @@ export function OrganizerPage() {
       : isMergingCategories
         ? "正在合并分类..."
         : dropOperationLabel
-  const { ownTransfer, backgroundTransfer, trackTransfer } = useDesktopTransferProgress()
+  const { ownTransfer, ownPosition, backgroundTransfer, trackTransfer, setOwnPosition } = useDesktopTransferProgress()
   const desktopOperationView: TransferProgressView | null = !desktopOperationLabel
     ? null
     : isClassifyingDesktop || isRestoringDesktop
       ? describeBackgroundTransfer(backgroundTransfer, desktopOperationLabel)
       : isMergingCategories
         ? { label: desktopOperationLabel, percent: null }
-        : describeOwnTransfer(ownTransfer, desktopOperationLabel)
+        : describeOwnTransfer(ownTransfer, desktopOperationLabel, ownPosition)
   const category = snapshot.categories[selectedCategory]
   const desktopItems = deferredQuery ? snapshot.desktop_items.filter((item) => `${item.name} ${item.path} ${item.extension}`.toLowerCase().includes(deferredQuery)) : snapshot.desktop_items
   const handleClassifyDesktopItems = async () => {
@@ -215,6 +216,22 @@ export function OrganizerPage() {
       setDropOperationLabel(`正在${action} ${paths.length} 项到「${targetCategory.name}」...`)
       const added = await trackTransfer(() => addItemsToCategoryLight(targetIndex, paths))
       setNotice(countNotice(movedBetweenCategories ? "已移动" : "已收纳", added, paths.length, "没有新增收纳项目"))
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : String(error))
+    } finally {
+      setDropOperationLabel("")
+    }
+  }
+
+  /** Menu "移回桌面" and the "移回" button; shows the overlay with transfer progress. */
+  async function handleCategoryRestore(categoryIndex: number, path: string) {
+    try {
+      setDropOperationLabel(`正在移回桌面：${displayPathName(path)}`)
+      const restored = await trackTransfer(() => {
+        setOwnPosition({ index: 1, total: 1, name: displayPathName(path) })
+        return restoreItemToDesktop(categoryIndex, path)
+      })
+      setNotice(`已移回桌面：${displayPathName(restored || path)}`)
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error))
     } finally {
@@ -667,7 +684,7 @@ export function OrganizerPage() {
             {category && category.item_details.length > 0 ? (
               <div className="grid grid-cols-[repeat(auto-fill,minmax(126px,1fr))] gap-3">
                 {category.item_details.map((item) => (
-                  <CategoryItemTile key={item.path} item={item} categoryIndex={selectedCategory} onRestoreDragOut={handleCategoryRestoreDragOut} />
+                  <CategoryItemTile key={item.path} item={item} categoryIndex={selectedCategory} onRestoreDragOut={handleCategoryRestoreDragOut} onRestore={handleCategoryRestore} />
                 ))}
               </div>
             ) : (
@@ -774,13 +791,14 @@ function CategoryItemTile({
   item,
   categoryIndex,
   onRestoreDragOut,
+  onRestore,
 }: {
   item: DesktopItem
   categoryIndex: number
   onRestoreDragOut: (categoryIndex: number, path: string, position: DesktopDropPosition) => Promise<void>
+  onRestore: (categoryIndex: number, path: string) => Promise<void>
 }) {
   const openPath = useDustDeskStore((state) => state.openPath)
-  const restoreItemToDesktop = useDustDeskStore((state) => state.restoreItemToDesktop)
   const showPathInFolder = useDustDeskStore((state) => state.showPathInFolder)
 
   return (
@@ -801,7 +819,7 @@ function CategoryItemTile({
           label: "移回桌面",
           icon: "restore",
           onSelect: async () => {
-            await restoreItemToDesktop(categoryIndex, item.path)
+            await onRestore(categoryIndex, item.path)
           },
         },
       ]}
@@ -828,7 +846,7 @@ function CategoryItemTile({
             variant="outline"
             onClick={(event) => {
               event.stopPropagation()
-              void restoreItemToDesktop(categoryIndex, item.path)
+              void onRestore(categoryIndex, item.path)
             }}
           >
             <X className="size-3" weight="bold" />

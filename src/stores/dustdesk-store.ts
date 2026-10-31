@@ -55,6 +55,7 @@ const emptySnapshot: AppSnapshot = {
   desktop_items: [],
   launchers: [],
   clipboard: [],
+  organizer_on_desktop_volume: true,
 }
 
 const hiddenDesktopFrames: DesktopFrameVisibility = {
@@ -205,6 +206,7 @@ const demoSnapshot: AppSnapshot = {
     { name: "Apifox", path: "C:\\Users\\Desktop\\Apifox.lnk" },
   ],
   clipboard: [],
+  organizer_on_desktop_volume: true,
 }
 
 type InvokeArgs = Record<string, unknown>
@@ -466,6 +468,7 @@ function normalizeSnapshot(value: unknown): AppSnapshot {
     }),
     launchers: asArray(raw.launchers ?? raw.Launchers).map(normalizeLauncher),
     clipboard: asArray(raw.clipboard ?? raw.Clipboard).map(normalizeClipboardItem),
+    organizer_on_desktop_volume: asBoolean(raw.organizer_on_desktop_volume ?? raw.OrganizerOnDesktopVolume, true),
   }
   hydrateSnapshotIcons(snapshot)
   return snapshot

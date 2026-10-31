@@ -28,7 +28,9 @@
 - 桌面来源的文件、文件夹、快捷方式加入收纳分类时必须使用迁移语义，物理移动到 `DesktopOrganizer/<分类名>`，桌面与收纳箱之间同一入口只允许存在一份，不能重复保留。
 - 分类配置里的路径如果已经不存在，应在加载快照时自动从分类中清理，避免收纳目录清空后卡片里仍显示幽灵项目。
 - 获取桌面路径优先使用 Windows Known Folder（包含重定向/OneDrive 桌面和公共桌面），不要只拼 `%USERPROFILE%\Desktop`。
-- 默认数据目录、收纳目录、快捷启动目录应创建在软件安装目录下，分别为 `Data`、`DesktopOrganizer`、`Launchers`。用户自定义目录路径可以继续写入 `%APPDATA%\DustDesk` 下的路径设置文件用于持久化。
+- 默认数据目录、快捷启动目录仍创建在软件安装目录下，分别为 `Data`、`Launchers`。收纳目录默认必须与 Windows 桌面同卷：首次运行（`organizer-path.txt` 不存在）时按 `<安装目录>\DesktopOrganizer` → `%LOCALAPPDATA%\DustDesk\DesktopOrganizer` → `<桌面所在卷根>\DustDesk\DesktopOrganizer` 的顺序选第一个与桌面同卷且可创建的目录，都不满足才回退到 `<安装目录>\DesktopOrganizer`。`AppStore::open()` 调用频繁，只有路径文件缺失时才解析桌面和卷。用户自定义目录路径可以继续写入 `%APPDATA%\DustDesk` 下的路径设置文件用于持久化。
+- 旧版本自动写入的收纳目录（`<当前安装目录>\DesktopOrganizer`、`%APPDATA%\DustDesk\Data\DesktopOrganizer`，或父目录里有 `dustdesk-tauri.exe` 的 `DesktopOrganizer`）若与桌面不同卷，启动时在恢复运行目录迁移之后、按重启收纳标记回收之前，通过运行目录迁移 journal（`RuntimeMigrationJournal`）一次性自动切换到上述同卷目录。前提：transfer journal 已全部恢复且没有剩余记录；旧目录忽略 `.dustdesk-*.tmp` 后不超过 1 GiB、不超过 20000 项（仍有内部迁移临时项时推迟到以后启动）；新目录没有其它文件；`%APPDATA%\DustDesk\organizer-volume-auto-switch.json` 不存在。运行目录迁移改写收纳目录路径时必须同步原子改写重启收纳标记里的 `source_path`。自动切换失败要回滚到旧目录并只写诊断，绝不能阻塞启动；成功后写入该一次性标记。
+- 用户在设置页手动选择的收纳目录不自动切换：手动修改收纳目录时同样写入 `organizer-volume-auto-switch.json`。
 
 ## 跨盘收纳迁移与崩溃恢复
 

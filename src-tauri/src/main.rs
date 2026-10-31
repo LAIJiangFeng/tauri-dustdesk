@@ -6540,14 +6540,18 @@ fn move_path_with_mode(source: &Path, destination: &Path) -> Result<MovePathMode
             move_path_via_staging(source, destination)?;
             Ok(MovePathMode::Copy)
         }
+        // Same-volume failures below never fall back to copying.
         MoveRenameFailure::InUse => Err(format!(
             "项目或其中的文件正被其它程序占用，请关闭相关程序后重试：{}（{rename_error}）",
+            source.display()
+        )),
+        MoveRenameFailure::AccessDenied => Err(format!(
+            "无法移动：项目或其中的文件正被其它程序占用，或当前权限不足（公共桌面的项目需要以管理员身份运行 DustDesk）：{}（{rename_error}）",
             source.display()
         )),
         MoveRenameFailure::DestinationExists => {
             Err(format!("目标项目已存在：{}", destination.display()))
         }
-        // Same-volume failures never fall back to copying.
         MoveRenameFailure::Other => Err(format!(
             "移动项目失败：{} -> {}：{rename_error}",
             source.display(),
@@ -6600,8 +6604,11 @@ enum MoveRenameError {
 enum MoveRenameFailure {
     /// Only this case may fall back to the verified staging copy.
     CrossVolume,
-    /// The item or something inside it is open in another program.
+    /// ERROR_SHARING_VIOLATION: the item or something inside it is open in another program.
     InUse,
+    /// ERROR_ACCESS_DENIED: a handle inside a directory blocks the rename, or the user lacks
+    /// delete permission (for example Public Desktop items without elevation).
+    AccessDenied,
     DestinationExists,
     Other,
 }
@@ -6615,7 +6622,8 @@ fn classify_move_rename_error(raw_os_error: Option<i32>) -> MoveRenameFailure {
 
     match raw_os_error.and_then(|code| u32::try_from(code).ok()) {
         Some(ERROR_NOT_SAME_DEVICE) => MoveRenameFailure::CrossVolume,
-        Some(ERROR_SHARING_VIOLATION | ERROR_ACCESS_DENIED) => MoveRenameFailure::InUse,
+        Some(ERROR_SHARING_VIOLATION) => MoveRenameFailure::InUse,
+        Some(ERROR_ACCESS_DENIED) => MoveRenameFailure::AccessDenied,
         Some(ERROR_ALREADY_EXISTS | ERROR_FILE_EXISTS) => MoveRenameFailure::DestinationExists,
         _ => MoveRenameFailure::Other,
     }
@@ -11077,7 +11085,8 @@ mod tests {
         let error = move_path(&source, &destination).expect_err("busy same-volume move must fail");
         drop(busy);
 
-        // Only the direct rename-failure branch produces this message; staging would not.
+        // NTFS reports ERROR_ACCESS_DENIED for this rename. Only the direct rename-failure
+        // branch produces this message; the staging copy would fail with a different error.
         assert!(
             error.contains("正被其它程序占用"),
             "unexpected error: {error}"
@@ -11109,7 +11118,7 @@ mod tests {
         );
         assert_eq!(
             classify_move_rename_error(Some(5)),
-            MoveRenameFailure::InUse
+            MoveRenameFailure::AccessDenied
         );
         assert_eq!(
             classify_move_rename_error(Some(32)),

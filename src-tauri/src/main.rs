@@ -7138,8 +7138,54 @@ fn unique_destination(destination_dir: &Path, source: &Path) -> PathBuf {
 }
 
 fn move_path(source: &Path, destination: &Path) -> Result<(), String> {
+    let started = Instant::now();
+    let result = move_path_with_mode(source, destination);
+    match &result {
+        Ok(mode) => append_desktop_diagnostic(
+            "move_path_finished",
+            &format!(
+                "mode={} elapsed_ms={} source=\"{}\" destination=\"{}\"",
+                mode.as_str(),
+                started.elapsed().as_millis(),
+                diagnostic_value(&source.display().to_string()),
+                diagnostic_value(&destination.display().to_string())
+            ),
+        ),
+        Err(error) => append_desktop_diagnostic(
+            "move_path_failed",
+            &format!(
+                "elapsed_ms={} source=\"{}\" destination=\"{}\" error=\"{}\"",
+                started.elapsed().as_millis(),
+                diagnostic_value(&source.display().to_string()),
+                diagnostic_value(&destination.display().to_string()),
+                diagnostic_value(error)
+            ),
+        ),
+    }
+    result.map(|_| ())
+}
+
+#[derive(Clone, Copy)]
+enum MovePathMode {
+    /// Source and destination already name the same item.
+    Unchanged,
+    Rename,
+    Copy,
+}
+
+impl MovePathMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unchanged => "none",
+            Self::Rename => "rename",
+            Self::Copy => "copy",
+        }
+    }
+}
+
+fn move_path_with_mode(source: &Path, destination: &Path) -> Result<MovePathMode, String> {
     if same_path_for_move(source, destination) {
-        return Ok(());
+        return Ok(MovePathMode::Unchanged);
     }
     if !source.exists() {
         return Err(format!("源项目不存在：{}", source.display()));
@@ -7154,16 +7200,179 @@ fn move_path(source: &Path, destination: &Path) -> Result<(), String> {
     if destination.exists() {
         return Err(format!("目标项目已存在：{}", destination.display()));
     }
-    validate_transfer_source_tree(source)?;
+    // A same-volume rename keeps every byte, EA and named stream, so it only needs the cheap
+    // link checks; the full metadata/ADS walk is reserved for the cross-volume copy below.
+    validate_move_source_reparse_points(source)?;
 
-    if rename_path_no_replace(source, destination).is_ok() {
-        return Ok(());
-    }
+    let rename_error = match rename_path_no_replace_for_move(source, destination) {
+        Ok(()) => return Ok(MovePathMode::Rename),
+        Err(MoveRenameError::Rejected(message)) => return Err(message),
+        Err(MoveRenameError::Os(error)) => error,
+    };
     if destination.exists() {
         return Err(format!("目标项目已存在：{}", destination.display()));
     }
+    match classify_move_rename_error(rename_error.raw_os_error()) {
+        // Only a cross-volume move pays for the full metadata walk and verified staging copy.
+        MoveRenameFailure::CrossVolume => {
+            validate_transfer_source_tree(source)?;
+            move_path_via_staging(source, destination)?;
+            Ok(MovePathMode::Copy)
+        }
+        // Same-volume failures below never fall back to copying.
+        MoveRenameFailure::InUse => Err(format!(
+            "项目或其中的文件正被其它程序占用，请关闭相关程序后重试：{}（{rename_error}）",
+            source.display()
+        )),
+        MoveRenameFailure::AccessDenied => Err(format!(
+            "无法移动：项目或其中的文件正被其它程序占用，或当前权限不足（公共桌面的项目需要以管理员身份运行 DustDesk）：{}（{rename_error}）",
+            source.display()
+        )),
+        MoveRenameFailure::DestinationExists => {
+            Err(format!("目标项目已存在：{}", destination.display()))
+        }
+        MoveRenameFailure::Other => Err(format!(
+            "移动项目失败：{} -> {}：{rename_error}",
+            source.display(),
+            destination.display()
+        )),
+    }
+}
 
-    move_path_via_staging(source, destination)
+/// Cheap pre-rename check for `move_path`: rejects symlinks and junctions at the top level and
+/// anywhere inside a directory. Nested entries are judged by the attributes that directory
+/// enumeration already returned (FindNextFileW on Windows), so no entry is opened individually.
+fn validate_move_source_reparse_points(source: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(source).map_err(to_message)?;
+    validate_move_source_entry(source, &metadata)?;
+    let mut pending = Vec::new();
+    if metadata.is_dir() {
+        pending.push(source.to_path_buf());
+    }
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory).map_err(to_message)? {
+            let entry = entry.map_err(to_message)?;
+            // On Windows DirEntry::metadata comes from the enumeration record without a syscall.
+            let metadata = entry.metadata().map_err(to_message)?;
+            let path = entry.path();
+            validate_move_source_entry(&path, &metadata)?;
+            if metadata.is_dir() {
+                pending.push(path);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_move_source_entry(path: &Path, metadata: &fs::Metadata) -> Result<(), String> {
+    reject_transfer_reparse_point(path, metadata)?;
+    if !metadata.is_dir() && !metadata.is_file() {
+        return Err(format!("不支持移动此项目：{}", path.display()));
+    }
+    Ok(())
+}
+
+enum MoveRenameError {
+    /// The source failed the link/type checks; the message is final.
+    Rejected(String),
+    /// Opening or renaming failed; keeps the OS error code for cross-volume detection.
+    Os(io::Error),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MoveRenameFailure {
+    /// Only this case may fall back to the verified staging copy.
+    CrossVolume,
+    /// ERROR_SHARING_VIOLATION: the item or something inside it is open in another program.
+    InUse,
+    /// ERROR_ACCESS_DENIED: a handle inside a directory blocks the rename, or the user lacks
+    /// delete permission (for example Public Desktop items without elevation).
+    AccessDenied,
+    DestinationExists,
+    Other,
+}
+
+#[cfg(windows)]
+fn classify_move_rename_error(raw_os_error: Option<i32>) -> MoveRenameFailure {
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_NOT_SAME_DEVICE,
+        ERROR_SHARING_VIOLATION,
+    };
+
+    match raw_os_error.and_then(|code| u32::try_from(code).ok()) {
+        Some(ERROR_NOT_SAME_DEVICE) => MoveRenameFailure::CrossVolume,
+        Some(ERROR_SHARING_VIOLATION) => MoveRenameFailure::InUse,
+        Some(ERROR_ACCESS_DENIED) => MoveRenameFailure::AccessDenied,
+        Some(ERROR_ALREADY_EXISTS | ERROR_FILE_EXISTS) => MoveRenameFailure::DestinationExists,
+        _ => MoveRenameFailure::Other,
+    }
+}
+
+#[cfg(not(windows))]
+fn classify_move_rename_error(raw_os_error: Option<i32>) -> MoveRenameFailure {
+    const EXDEV: i32 = 18;
+
+    if raw_os_error == Some(EXDEV) {
+        MoveRenameFailure::CrossVolume
+    } else {
+        MoveRenameFailure::Other
+    }
+}
+
+/// Lightweight `rename_path_no_replace` for `move_path`: only rejects reparse points, checked on
+/// the exact handle being renamed. EA and named-stream checks only matter when copying.
+#[cfg(windows)]
+fn rename_path_no_replace_for_move(
+    source: &Path,
+    destination: &Path,
+) -> Result<(), MoveRenameError> {
+    let metadata = fs::symlink_metadata(source).map_err(MoveRenameError::Os)?;
+    reject_transfer_reparse_point(source, &metadata).map_err(MoveRenameError::Rejected)?;
+    let source_handle = if metadata.is_dir() {
+        open_move_source_directory(source)
+    } else if metadata.is_file() {
+        open_reserved_transfer_file(source)
+    } else {
+        return Err(MoveRenameError::Rejected(format!(
+            "不支持移动此项目：{}",
+            source.display()
+        )));
+    }
+    .map_err(MoveRenameError::Os)?;
+    let opened = source_handle.metadata().map_err(MoveRenameError::Os)?;
+    reject_transfer_reparse_point(source, &opened).map_err(MoveRenameError::Rejected)?;
+    rename_handle_no_replace(&source_handle, destination).map_err(MoveRenameError::Os)
+}
+
+#[cfg(not(windows))]
+fn rename_path_no_replace_for_move(
+    source: &Path,
+    destination: &Path,
+) -> Result<(), MoveRenameError> {
+    let metadata = fs::symlink_metadata(source).map_err(MoveRenameError::Os)?;
+    reject_transfer_reparse_point(source, &metadata).map_err(MoveRenameError::Rejected)?;
+    if destination.exists() {
+        return Err(MoveRenameError::Os(io::ErrorKind::AlreadyExists.into()));
+    }
+    fs::rename(source, destination).map_err(MoveRenameError::Os)
+}
+
+/// Same handle access and sharing as `open_reserved_transfer_directory`, without its EA/ADS checks.
+#[cfg(windows)]
+fn open_move_source_directory(path: &Path) -> io::Result<File> {
+    use windows_sys::Win32::{
+        Foundation::GENERIC_READ,
+        Storage::FileSystem::{
+            DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+            FILE_SHARE_WRITE,
+        },
+    };
+
+    fs::OpenOptions::new()
+        .access_mode(GENERIC_READ | DELETE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
 }
 
 fn move_path_via_staging(source: &Path, destination: &Path) -> Result<(), String> {
@@ -8055,13 +8264,18 @@ fn validate_transfer_source_tree(path: &Path) -> Result<(), String> {
 }
 
 fn validate_transfer_metadata(path: &Path, metadata: &fs::Metadata) -> Result<(), String> {
+    reject_transfer_reparse_point(path, metadata)?;
+    validate_windows_extended_metadata(path, metadata)?;
+    Ok(())
+}
+
+fn reject_transfer_reparse_point(path: &Path, metadata: &fs::Metadata) -> Result<(), String> {
     if metadata.file_type().is_symlink() || metadata_is_reparse_point(metadata) {
         return Err(format!(
             "为避免误操作链接目标，不能移动符号链接或目录联接：{}",
             path.display()
         ));
     }
-    validate_windows_extended_metadata(path, metadata)?;
     Ok(())
 }
 
@@ -8268,6 +8482,11 @@ fn commit_staging_handle_no_replace(
     _staging: &Path,
     destination: &Path,
 ) -> Result<(), String> {
+    rename_handle_no_replace(root, destination).map_err(to_message)
+}
+
+#[cfg(windows)]
+fn rename_handle_no_replace(handle: &File, destination: &Path) -> io::Result<()> {
     use std::{mem::offset_of, ptr::null_mut};
     use windows_sys::Win32::Storage::FileSystem::{
         FileRenameInfoEx, SetFileInformationByHandle, FILE_RENAME_INFO,
@@ -8276,11 +8495,11 @@ fn commit_staging_handle_no_replace(
     let name_bytes = name
         .len()
         .checked_mul(std::mem::size_of::<u16>())
-        .ok_or_else(|| "目标路径过长".to_owned())?;
+        .ok_or_else(|| io::Error::other("目标路径过长"))?;
     let buffer_bytes = offset_of!(FILE_RENAME_INFO, FileName)
         .checked_add(name_bytes)
         .and_then(|length| length.checked_add(std::mem::size_of::<u16>()))
-        .ok_or_else(|| "目标路径过长".to_owned())?;
+        .ok_or_else(|| io::Error::other("目标路径过长"))?;
     name.push(0);
     let mut buffer = vec![0usize; buffer_bytes.div_ceil(std::mem::size_of::<usize>())];
     let information = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
@@ -8295,13 +8514,13 @@ fn commit_staging_handle_no_replace(
             name.len(),
         );
         if SetFileInformationByHandle(
-            root.as_raw_handle() as _,
+            handle.as_raw_handle() as _,
             FileRenameInfoEx,
             information.cast(),
             buffer_bytes as u32,
         ) == 0
         {
-            return Err(io::Error::last_os_error().to_string());
+            return Err(io::Error::last_os_error());
         }
     }
     Ok(())
@@ -11909,6 +12128,150 @@ mod tests {
         fs::remove_dir(&nested_link).expect("remove nested reparse point");
         fs::remove_dir(&top_level_link).expect("remove top-level reparse point");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn same_volume_move_renames_large_directory_and_keeps_file_identity() {
+        let root = unique_test_dir("dustdesk-same-volume-rename");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        for group in 0..30 {
+            let directory = source.join(format!("group-{group:02}"));
+            fs::create_dir_all(&directory).expect("create source group");
+            for index in 0..100 {
+                fs::write(
+                    directory.join(format!("file-{index:03}.txt")),
+                    format!("{group}-{index}"),
+                )
+                .expect("write source file");
+            }
+        }
+        let tracked = Path::new("group-17").join("file-042.txt");
+        let identity_before = test_file_identity(&source.join(&tracked));
+
+        move_path(&source, &destination).expect("same-volume move");
+
+        assert!(!source.exists());
+        assert_eq!(
+            test_file_identity(&destination.join(&tracked)),
+            identity_before,
+            "an in-volume rename keeps the volume serial number and file index"
+        );
+        assert_eq!(
+            fs::read(destination.join(&tracked)).expect("read moved file"),
+            b"17-42"
+        );
+        let moved_files = fs::read_dir(&destination)
+            .expect("read destination")
+            .map(|group| {
+                fs::read_dir(group.expect("read group entry").path())
+                    .expect("read group")
+                    .count()
+            })
+            .sum::<usize>();
+        assert_eq!(moved_files, 3000);
+        assert!(
+            fs::read_dir(&root)
+                .expect("read test root")
+                .all(|entry| !is_internal_transfer_path(&entry.expect("read entry").path())),
+            "a rename must not create transfer staging"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn same_volume_move_reports_busy_item_without_copy_fallback() {
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+        let root = unique_test_dir("dustdesk-same-volume-busy");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        let busy_path = source.join("nested").join("busy.txt");
+        fs::create_dir_all(source.join("nested")).expect("create source tree");
+        fs::write(&busy_path, b"busy data").expect("write busy file");
+        fs::write(source.join("other.txt"), b"other data").expect("write other file");
+
+        // A handle without FILE_SHARE_DELETE inside the directory blocks renaming the directory.
+        let busy = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&busy_path)
+            .expect("hold busy file");
+        let error = move_path(&source, &destination).expect_err("busy same-volume move must fail");
+        drop(busy);
+
+        // NTFS reports ERROR_ACCESS_DENIED for this rename. Only the direct rename-failure
+        // branch produces this message; the staging copy would fail with a different error.
+        assert!(
+            error.contains("正被其它程序占用"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            fs::read(&busy_path).expect("busy file remains"),
+            b"busy data"
+        );
+        assert_eq!(
+            fs::read(source.join("other.txt")).expect("other file remains"),
+            b"other data"
+        );
+        assert!(!destination.exists());
+        assert!(
+            fs::read_dir(&root)
+                .expect("read test root")
+                .all(|entry| !is_internal_transfer_path(&entry.expect("read entry").path())),
+            "a failed rename must not leave transfer staging"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn only_cross_volume_rename_errors_fall_back_to_copy() {
+        assert_eq!(
+            classify_move_rename_error(Some(17)),
+            MoveRenameFailure::CrossVolume
+        );
+        assert_eq!(
+            classify_move_rename_error(Some(5)),
+            MoveRenameFailure::AccessDenied
+        );
+        assert_eq!(
+            classify_move_rename_error(Some(32)),
+            MoveRenameFailure::InUse
+        );
+        assert_eq!(
+            classify_move_rename_error(Some(183)),
+            MoveRenameFailure::DestinationExists
+        );
+        assert_eq!(
+            classify_move_rename_error(Some(2)),
+            MoveRenameFailure::Other
+        );
+        assert_eq!(classify_move_rename_error(None), MoveRenameFailure::Other);
+    }
+
+    /// Volume serial number plus file index: unchanged by a rename, new for a copied file.
+    #[cfg(windows)]
+    fn test_file_identity(path: &Path) -> (u32, u32, u32) {
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
+
+        let file = File::open(path).expect("open file for identity");
+        let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        assert_ne!(
+            unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut information) },
+            0,
+            "read file identity: {}",
+            io::Error::last_os_error()
+        );
+        (
+            information.dwVolumeSerialNumber,
+            information.nFileIndexHigh,
+            information.nFileIndexLow,
+        )
     }
 
     #[cfg(windows)]

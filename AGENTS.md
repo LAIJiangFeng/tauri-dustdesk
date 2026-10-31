@@ -41,6 +41,7 @@
 - 目标已经原子提交并写入 committed marker 后，隔离源递归清理应放到后台，不能继续占用“正在收纳/正在还原”的前台进度。后台删除源之前必须再次做快速结构校验并持久化 cleanup-started marker；目标被外部改坏时保留隔离源，cleanup-started 后中断则在下次启动继续收尾。
 - 程序启动和每次桌面存储操作前必须串行恢复 transfer journal：未提交则还原源目录，已提交则继续清理隔离源。恢复、后台清理和新操作必须共用恢复锁，不能并发处理同一 journal。
 - `.dustdesk-transfer-*.tmp`、`.dustdesk-source-transfer-*.tmp` 和 transfer journal 都是内部事务数据，桌面扫描、分类、快捷启动、配置修复与还原候选列表必须统一过滤，不能显示成用户项目或写入配置。
+- 同卷移动只做顶层检查和基于目录枚举属性的 reparse 检查，然后直接原子 rename，不做全树 metadata/ADS 预检；只有 rename 返回 `ERROR_NOT_SAME_DEVICE` 才进入跨盘 staging 复制。同卷 rename 失败（如文件被占用）直接报错，不回退复制。
 
 ## 多窗口数据刷新
 

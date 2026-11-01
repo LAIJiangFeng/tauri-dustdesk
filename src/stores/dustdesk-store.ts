@@ -589,7 +589,7 @@ function normalizeSearchOverlay(value: unknown): SearchOverlayData {
   }
 }
 
-const runtimeMigrationPhases: RuntimeMigrationPhase[] = ["scanning", "copying", "verifying", "switching", "cleaning", "done"]
+const runtimeMigrationPhases: RuntimeMigrationPhase[] = ["scanning", "copying", "verifying", "moving", "switching", "cleaning", "done"]
 
 function asCount(value: unknown) {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0

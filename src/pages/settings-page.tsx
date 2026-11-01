@@ -836,10 +836,10 @@ function RuntimeMigrationProgressView({ progress }: { progress: RuntimeMigration
   )
 }
 
-/** Copying counts copy and its single content comparison as two halves of the bar. */
+/** Copying counts copy and checking (file content comparison or directory structure check) as two halves of the bar. */
 function runtimeMigrationPercent(progress: RuntimeMigrationProgress): number | null {
   if (progress.phase === "done") return 100
-  if (progress.phase === "scanning" || progress.phase === "switching") return null
+  if (progress.phase === "scanning" || progress.phase === "moving" || progress.phase === "switching") return null
   if (progress.bytes_total > 0) {
     const done = progress.phase === "copying" ? (progress.bytes_done + progress.verified_bytes) / 2 : progress.bytes_done
     return Math.min(100, (done / progress.bytes_total) * 100)
@@ -873,10 +873,13 @@ function runtimeMigrationProgressText(progress: RuntimeMigrationProgress) {
       break
     case "copying":
       text = `正在复制 ${amounts}`
-      if (progress.verified_bytes > 0) text += `，已校验 ${formatMigrationBytes(progress.verified_bytes)}`
+      if (progress.verified_bytes > 0) text += `，已核对 ${formatMigrationBytes(progress.verified_bytes)}`
+      break
+    case "moving":
+      text = "正在移动目录…"
       break
     case "verifying":
-      text = `正在校验 ${amounts}`
+      text = `正在核对 ${amounts}`
       break
     case "switching":
       text = "正在切换到新目录"

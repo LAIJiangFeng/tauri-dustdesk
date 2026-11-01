@@ -184,7 +184,7 @@ export interface OrganizerDirectoryVolumeCheck {
 
 export type RuntimeMigrationTarget = "data" | "organizer" | "launchers"
 
-export type RuntimeMigrationPhase = "scanning" | "copying" | "verifying" | "switching" | "cleaning" | "done"
+export type RuntimeMigrationPhase = "scanning" | "copying" | "verifying" | "moving" | "switching" | "cleaning" | "done"
 
 /** Payload of `dustdesk://runtime-migration-progress`. */
 export interface RuntimeMigrationProgress {
@@ -194,7 +194,7 @@ export interface RuntimeMigrationProgress {
   bytes_total: number
   files_done: number
   files_total: number
-  /** Bytes whose full content comparison finished while copying. */
+  /** Bytes already checked while copying: files by full content comparison, directory items by structure check. */
   verified_bytes: number
   current: string
 }

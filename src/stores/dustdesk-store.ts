@@ -17,6 +17,11 @@ import type {
   DesktopOperationStatus,
   DesktopWindowLayout,
   LaunchItem,
+  OrganizerDirectoryVolumeCheck,
+  RuntimeMigrationPhase,
+  RuntimeMigrationProgress,
+  DesktopTransferOperation,
+  DesktopTransferProgress,
   RecycleCategoryItemsResult,
   RestoreItemsResult,
   SearchItem,
@@ -55,6 +60,7 @@ const emptySnapshot: AppSnapshot = {
   desktop_items: [],
   launchers: [],
   clipboard: [],
+  organizer_on_desktop_volume: true,
 }
 
 const hiddenDesktopFrames: DesktopFrameVisibility = {
@@ -205,6 +211,7 @@ const demoSnapshot: AppSnapshot = {
     { name: "Apifox", path: "C:\\Users\\Desktop\\Apifox.lnk" },
   ],
   clipboard: [],
+  organizer_on_desktop_volume: true,
 }
 
 type InvokeArgs = Record<string, unknown>
@@ -466,6 +473,7 @@ function normalizeSnapshot(value: unknown): AppSnapshot {
     }),
     launchers: asArray(raw.launchers ?? raw.Launchers).map(normalizeLauncher),
     clipboard: asArray(raw.clipboard ?? raw.Clipboard).map(normalizeClipboardItem),
+    organizer_on_desktop_volume: asBoolean(raw.organizer_on_desktop_volume ?? raw.OrganizerOnDesktopVolume, true),
   }
   hydrateSnapshotIcons(snapshot)
   return snapshot
@@ -578,6 +586,53 @@ function normalizeSearchOverlay(value: unknown): SearchOverlayData {
       .filter(Boolean),
     recent: asArray(raw.recent ?? raw.Recent).map(normalizeSearchItem),
     frequent: asArray(raw.frequent ?? raw.Frequent).map(normalizeSearchItem),
+  }
+}
+
+const runtimeMigrationPhases: RuntimeMigrationPhase[] = ["scanning", "copying", "verifying", "moving", "switching", "cleaning", "done"]
+
+function asCount(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0
+}
+
+export function normalizeRuntimeMigrationProgress(value: unknown): RuntimeMigrationProgress | null {
+  if (!value || typeof value !== "object") return null
+  const raw = asRecord(value)
+  const phase = asString(raw.phase) as RuntimeMigrationPhase
+  if (!runtimeMigrationPhases.includes(phase)) return null
+  const target = asString(raw.target)
+  return {
+    target: target === "data" || target === "organizer" || target === "launchers" ? target : "",
+    phase,
+    bytes_done: asCount(raw.bytes_done),
+    bytes_total: asCount(raw.bytes_total),
+    files_done: asCount(raw.files_done),
+    files_total: asCount(raw.files_total),
+    verified_bytes: asCount(raw.verified_bytes),
+    current: asString(raw.current),
+  }
+}
+
+const desktopTransferOperations: DesktopTransferOperation[] = ["archive", "move", "restore", "classify", "restore-all", "exit-restore", "restart-recollect"]
+
+export function normalizeDesktopTransferProgress(value: unknown): DesktopTransferProgress | null {
+  if (!value || typeof value !== "object") return null
+  const raw = asRecord(value)
+  const operation = asString(raw.operation) as DesktopTransferOperation
+  if (!desktopTransferOperations.includes(operation)) return null
+  const status = asString(raw.status)
+  return {
+    operation,
+    status: status === "finished" || status === "failed" ? status : "running",
+    target: asString(raw.target),
+    item_index: asCount(raw.item_index),
+    items_total: asCount(raw.items_total),
+    current: asString(raw.current),
+    current_path: asString(raw.current_path),
+    copying: raw.copying === true,
+    bytes_done: asCount(raw.bytes_done),
+    bytes_total: asCount(raw.bytes_total),
+    verified_bytes: asCount(raw.verified_bytes),
   }
 }
 
@@ -927,7 +982,8 @@ interface DustDeskState {
   removeItemFromCategory: (index: number, path: string) => Promise<void>
   restoreItemToDesktop: (index: number, path: string, position?: DesktopDropPosition) => Promise<string>
   restoreItemToDesktopLight: (index: number, path: string, position?: DesktopDropPosition) => Promise<string>
-  restoreItemsToDesktopLight: (index: number, paths: string[]) => Promise<RestoreItemsResult>
+  /** `onItem` runs before each item (1-based) so the caller can show `i/N` progress. */
+  restoreItemsToDesktopLight: (index: number, paths: string[], onItem?: (index: number, total: number, path: string) => void) => Promise<RestoreItemsResult>
   deleteCategoryItemsToRecycleBinLight: (index: number, paths: string[]) => Promise<RecycleCategoryItemsResult>
   copyPathsToClipboard: (paths: string[]) => Promise<number>
   copyTextToClipboard: (text: string) => Promise<void>
@@ -967,6 +1023,7 @@ interface DustDeskState {
   hideCurrentWindow: () => Promise<void>
   openSpecial: (target: "organizer" | "launchers" | "data" | "desktop") => Promise<void>
   updateRuntimeDirectory: (target: "organizer" | "launchers" | "data", path: string) => Promise<AppSnapshot>
+  checkOrganizerDirectoryVolume: (path: string) => Promise<OrganizerDirectoryVolumeCheck>
   openPath: (path: string) => Promise<void>
   openPathAsAdministrator: (path: string) => Promise<void>
   showPathInFolder: (path: string) => Promise<void>
@@ -1260,9 +1317,14 @@ export const useDustDeskStore = create<DustDeskState>()(
       void get().loadDesktopSnapshot({ force: true })
       return restored
     },
-    restoreItemsToDesktopLight: async (index, paths) => {
+    restoreItemsToDesktopLight: async (index, paths, onItem) => {
       const result: RestoreItemsResult = { restored: 0, errors: [] }
-      for (const path of paths) {
+      for (const [position, path] of paths.entries()) {
+        try {
+          onItem?.(position + 1, paths.length, path)
+        } catch {
+          // Progress display must never stop the restore.
+        }
         try {
           await call<string>("restore_item_to_desktop", restoreDesktopArgs(index, path))
           result.restored += 1
@@ -1518,6 +1580,14 @@ export const useDustDeskStore = create<DustDeskState>()(
       })
       void get().resolveSnapshotIcons({ includeDesktopItems: true })
       return snapshot
+    },
+    checkOrganizerDirectoryVolume: async (path) => {
+      const raw = (await call<unknown>("check_organizer_directory_volume", { path })) as RawRecord | undefined
+      // An undetermined volume counts as the desktop volume, so no warning is shown.
+      return {
+        same_volume_as_desktop: asBoolean(raw?.same_volume_as_desktop, true),
+        desktop_drive: asString(raw?.desktop_drive),
+      }
     },
     openPath: async (path) => {
       await call("open_path", { path })

@@ -174,6 +174,49 @@ export interface AppSnapshot {
   desktop_items: DesktopItem[]
   launchers: LaunchItem[]
   clipboard: ClipboardHistoryItem[]
+  organizer_on_desktop_volume: boolean
+}
+
+export interface OrganizerDirectoryVolumeCheck {
+  same_volume_as_desktop: boolean
+  desktop_drive: string
+}
+
+export type RuntimeMigrationTarget = "data" | "organizer" | "launchers"
+
+export type RuntimeMigrationPhase = "scanning" | "copying" | "verifying" | "moving" | "switching" | "cleaning" | "done"
+
+/** Payload of `dustdesk://runtime-migration-progress`. */
+export interface RuntimeMigrationProgress {
+  target: RuntimeMigrationTarget | ""
+  phase: RuntimeMigrationPhase
+  bytes_done: number
+  bytes_total: number
+  files_done: number
+  files_total: number
+  /** Bytes already checked while copying: files by full content comparison, directory items by structure check. */
+  verified_bytes: number
+  current: string
+}
+
+export type DesktopTransferOperation = "archive" | "move" | "restore" | "classify" | "restore-all" | "exit-restore" | "restart-recollect"
+
+/** Payload of `dustdesk://desktop-transfer-progress`, broadcast to every window. */
+export interface DesktopTransferProgress {
+  operation: DesktopTransferOperation
+  status: "running" | "finished" | "failed"
+  /** Destination category for archive/move. */
+  target: string
+  /** 1-based position of the item being processed. */
+  item_index: number
+  items_total: number
+  current: string
+  current_path: string
+  /** True while an item is copied across volumes; byte counters are only meaningful then. */
+  copying: boolean
+  bytes_done: number
+  bytes_total: number
+  verified_bytes: number
 }
 
 export interface ScreenshotMonitor {

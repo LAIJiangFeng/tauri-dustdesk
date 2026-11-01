@@ -336,6 +336,82 @@ fn configured_path(
     Ok(default_dir)
 }
 
+/// Whether both paths are stored on the same volume, judging a missing path by its nearest
+/// existing ancestor. `None` means a volume could not be identified.
+#[cfg(windows)]
+pub fn paths_share_volume(left: &Path, right: &Path) -> Option<bool> {
+    Some(volume_serial_number(left)? == volume_serial_number(right)?)
+}
+
+#[cfg(not(windows))]
+pub fn paths_share_volume(_left: &Path, _right: &Path) -> Option<bool> {
+    Some(true)
+}
+
+#[cfg(windows)]
+fn volume_serial_number(path: &Path) -> Option<u32> {
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    // Without FILE_FLAG_OPEN_REPARSE_POINT the open follows junctions, symlinks and mounted
+    // folders, so the serial belongs to the volume that really stores the path.
+    let file = fs::OpenOptions::new()
+        .access_mode(0)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(nearest_existing_path(path)?)
+        .ok()?;
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    let succeeded =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut information) } != 0;
+    succeeded.then_some(information.dwVolumeSerialNumber)
+}
+
+/// Mount point of the volume that stores `path`, for example `C:\`.
+#[cfg(windows)]
+pub fn volume_root_path(path: &Path) -> Option<PathBuf> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows_sys::Win32::Storage::FileSystem::GetVolumePathNameW;
+
+    let existing = nearest_existing_path(path)?;
+    // Resolve junctions and symlinks first so the mount point belongs to the stored location.
+    let resolved = existing.canonicalize().unwrap_or(existing);
+    let wide = resolved
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    // The API works in place, so the buffer must be able to hold the whole input path.
+    let mut buffer = vec![0u16; wide.len().max(260) + 2];
+    let length = u32::try_from(buffer.len()).ok()?;
+    if unsafe { GetVolumePathNameW(wide.as_ptr(), buffer.as_mut_ptr(), length) } == 0 {
+        return None;
+    }
+    let end = buffer.iter().position(|unit| *unit == 0)?;
+    let root = std::ffi::OsString::from_wide(&buffer[..end]);
+    Some(without_verbatim_prefix(Path::new(&root)))
+}
+
+#[cfg(not(windows))]
+pub fn volume_root_path(path: &Path) -> Option<PathBuf> {
+    path.ancestors().last().map(Path::to_path_buf)
+}
+
+#[cfg(windows)]
+fn nearest_existing_path(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .find(|ancestor| !ancestor.as_os_str().is_empty() && ancestor.exists())
+        .map(Path::to_path_buf)
+}
+
+/// `path` without the `\\?\` prefix that `canonicalize` adds on Windows.
+pub fn without_verbatim_prefix(path: &Path) -> PathBuf {
+    PathBuf::from(path_to_config_text(path))
+}
+
 fn runtime_path_file_name(target: &str) -> Result<&'static str> {
     match target {
         "data" => Ok("data-path.txt"),
@@ -473,6 +549,33 @@ mod tests {
                     .to_string_lossy()
                     .ends_with(".tmp")),
             "successful atomic writes must not leave staging files"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn volume_helpers_judge_missing_paths_by_their_existing_ancestors() {
+        let root = std::env::temp_dir().join(format!(
+            "dustdesk-store-volume-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        let existing = root.join("existing");
+        fs::create_dir_all(&existing).expect("create existing directory");
+        let missing = root.join("missing").join("DesktopOrganizer");
+
+        assert_eq!(paths_share_volume(&existing, &missing), Some(true));
+        let volume_root = volume_root_path(&missing).expect("resolve volume root");
+        assert!(!volume_root.to_string_lossy().starts_with(r"\\?\"));
+        assert_eq!(paths_share_volume(&volume_root, &existing), Some(true));
+        assert!(
+            !missing.exists(),
+            "volume checks must not create directories"
         );
 
         let _ = fs::remove_dir_all(root);

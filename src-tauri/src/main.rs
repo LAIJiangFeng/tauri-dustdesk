@@ -18,7 +18,7 @@ use std::{
     env,
     ffi::OsString,
     fs::{self, File},
-    io::{self, BufReader, Read, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -73,6 +73,15 @@ const TRAY_MENU_QUIT: &str = "quit-app";
 // Lets the tray menu finish closing before the screen is captured.
 const TRAY_SCREENSHOT_DELAY: Duration = Duration::from_millis(220);
 const DESKTOP_OPERATION_EVENT: &str = "dustdesk://desktop-operation";
+const RUNTIME_MIGRATION_PROGRESS_EVENT: &str = "dustdesk://runtime-migration-progress";
+const RUNTIME_MIGRATION_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
+/// Progress of organizing/restoring desktop items, broadcast to every window.
+const DESKTOP_TRANSFER_PROGRESS_EVENT: &str = "dustdesk://desktop-transfer-progress";
+const DESKTOP_TRANSFER_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
+/// Robocopy runs out of process; its staging folder is measured at most this often.
+const RUNTIME_MIGRATION_ROBOCOPY_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Buffer per side for full content comparison.
+const CONTENT_COMPARE_BUFFER_BYTES: usize = 1024 * 1024;
 const CATEGORY_ORDER_CHANGED_EVENT: &str = "dustdesk://category-order-changed";
 const DESKTOP_WINDOW_STATE_CHANGED_EVENT: &str = "dustdesk://desktop-window-state-changed";
 const DESKTOP_ORGANIZATION_RESTART_SCHEMA_VERSION: u32 = 1;
@@ -264,6 +273,31 @@ struct RuntimeMigrationJournal {
     new_data_dir: String,
     new_organizer_root: String,
     new_launchers_root: String,
+    /// "copy" or "rename". Journals written before this field existed are copy migrations.
+    #[serde(default = "default_runtime_migration_mode")]
+    mode: String,
+    /// Rename mode only: the old root was atomically renamed to the new root. From then on the
+    /// data lives in the new root and the migration may only roll forward.
+    #[serde(default)]
+    renamed: bool,
+}
+
+const RUNTIME_MIGRATION_MODE_COPY: &str = "copy";
+const RUNTIME_MIGRATION_MODE_RENAME: &str = "rename";
+
+fn default_runtime_migration_mode() -> String {
+    RUNTIME_MIGRATION_MODE_COPY.to_owned()
+}
+
+impl RuntimeMigrationJournal {
+    fn is_rename_mode(&self) -> bool {
+        self.mode == RUNTIME_MIGRATION_MODE_RENAME
+    }
+
+    /// True once data may exist only in the new root, so the migration must never be rolled back.
+    fn forward_only(&self) -> bool {
+        self.is_rename_mode() && self.renamed
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -430,14 +464,17 @@ async fn load_snapshot() -> Result<AppSnapshot, String> {
 
 fn load_snapshot_impl() -> Result<AppSnapshot, String> {
     wait_for_startup_recovery()?;
-    let store = AppStore::open().map_err(to_message)?;
-    store.ensure_runtime_dirs().map_err(to_message)?;
-    let config = with_config_mutation(|| {
+    // Stores are opened under the storage lock: one opened before a runtime migration finished
+    // would repair config and launch.json against the old roots.
+    let (store, config) = with_config_mutation(|| {
+        let store = AppStore::open().map_err(to_message)?;
+        store.ensure_runtime_dirs().map_err(to_message)?;
         let mut config = store.load_config_strict().map_err(to_message)?;
         repair_category_item_paths(&store, &mut config)?;
-        Ok(config)
+        Ok((store, config))
     })?;
     let launchers = with_launcher_mutation(|| {
+        let store = AppStore::open().map_err(to_message)?;
         let mut launchers = store.load_launchers_strict().map_err(to_message)?;
         repair_launchers(&store, &mut launchers)?;
         Ok(launchers)
@@ -467,6 +504,7 @@ fn load_snapshot_impl() -> Result<AppSnapshot, String> {
         desktop_items: desktop_items(false),
         launchers: launchers_with_optional_icons(launchers.items, false),
         clipboard: clipboard_preview(clipboard.items, clipboard_history_limit),
+        organizer_on_desktop_volume: organizer_on_desktop_volume(&store.organizer_root()),
     })
 }
 
@@ -479,14 +517,17 @@ async fn load_desktop_snapshot() -> Result<AppSnapshot, String> {
 
 fn load_desktop_snapshot_impl() -> Result<AppSnapshot, String> {
     wait_for_startup_recovery()?;
-    let store = AppStore::open().map_err(to_message)?;
-    store.ensure_runtime_dirs().map_err(to_message)?;
-    let config = with_config_mutation(|| {
+    // Stores are opened under the storage lock: one opened before a runtime migration finished
+    // would repair config and launch.json against the old roots.
+    let (store, config) = with_config_mutation(|| {
+        let store = AppStore::open().map_err(to_message)?;
+        store.ensure_runtime_dirs().map_err(to_message)?;
         let mut config = store.load_config_strict().map_err(to_message)?;
         repair_category_item_paths(&store, &mut config)?;
-        Ok(config)
+        Ok((store, config))
     })?;
     let launchers = with_launcher_mutation(|| {
+        let store = AppStore::open().map_err(to_message)?;
         let mut launchers = store.load_launchers_strict().map_err(to_message)?;
         repair_launchers(&store, &mut launchers)?;
         Ok(launchers)
@@ -504,7 +545,15 @@ fn load_desktop_snapshot_impl() -> Result<AppSnapshot, String> {
         desktop_items: Vec::new(),
         launchers: launchers_with_optional_icons(launchers.items, false),
         clipboard: Vec::new(),
+        organizer_on_desktop_volume: organizer_on_desktop_volume(&store.organizer_root()),
     })
+}
+
+/// Only a confirmed volume mismatch counts; unknown volumes do not raise the settings warning.
+fn organizer_on_desktop_volume(organizer_root: &Path) -> bool {
+    user_desktop()
+        .and_then(|desktop| store::paths_share_volume(organizer_root, &desktop))
+        .unwrap_or(true)
 }
 
 #[tauri::command]
@@ -737,7 +786,9 @@ async fn add_item_to_category(
     path: String,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let result = add_items_to_category_impl(index, vec![path]);
+        let result = run_with_desktop_transfer_progress(&app, "archive", || {
+            add_items_to_category_impl(index, vec![path])
+        });
         emit_desktop_cards_changed(&app);
         result.map(|_| ())
     })
@@ -752,7 +803,9 @@ async fn add_items_to_category(
     paths: Vec<String>,
 ) -> Result<usize, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let result = add_items_to_category_impl(index, paths);
+        let result = run_with_desktop_transfer_progress(&app, "archive", || {
+            add_items_to_category_impl(index, paths)
+        });
         emit_desktop_cards_changed(&app);
         result
     })
@@ -778,7 +831,6 @@ fn add_items_to_category_impl(index: usize, paths: Vec<String>) -> Result<usize,
             .desktop_categories
             .get(index)
             .ok_or_else(|| "分类不存在".to_owned())?;
-        let category_name = config.desktop_categories[index].name.clone();
         let mut seen_source_paths = Vec::<String>::new();
         let source_paths = paths
             .into_iter()
@@ -808,43 +860,63 @@ fn add_items_to_category_impl(index: usize, paths: Vec<String>) -> Result<usize,
                 (path, position)
             })
             .collect::<Vec<_>>();
-        let mut added = 0usize;
-
-        for (path, desktop_icon_position) in paths_with_positions {
-            if !Path::new(&path).exists() {
-                continue;
-            }
-            let archived_path = archive_item_path(&store, &category_name, &path)?;
-
-            for category in &mut config.desktop_categories {
-                category.item_paths.retain(|item_path| {
-                    !same_path_text(item_path, &path) && !same_path_text(item_path, &archived_path)
-                });
-            }
-            remove_desktop_icon_position_for_path(&mut config.desktop_icon_positions, &path);
-            remove_desktop_icon_position_for_path(
-                &mut config.desktop_icon_positions,
-                &archived_path,
-            );
-            if let Some(position) = desktop_icon_position {
-                set_desktop_icon_position_for_path(
-                    &mut config.desktop_icon_positions,
-                    archived_path.clone(),
-                    position,
-                );
-            }
-
-            config.desktop_categories[index]
-                .item_paths
-                .push(archived_path);
-            added += 1;
-        }
+        let added = archive_paths_into_category(&store, &mut config, index, paths_with_positions)?;
 
         if added > 0 {
             store.save_config(&config).map_err(to_message)?;
         }
         Ok(added)
     })
+}
+
+/// Moves each path into category `index` and records it in `config`, reporting item progress
+/// to the active desktop transfer progress. Stops at the first failed move.
+fn archive_paths_into_category(
+    store: &AppStore,
+    config: &mut AppConfig,
+    index: usize,
+    paths_with_positions: Vec<(String, Option<DesktopIconPosition>)>,
+) -> Result<usize, String> {
+    let category_name = config
+        .desktop_categories
+        .get(index)
+        .ok_or_else(|| "分类不存在".to_owned())?
+        .name
+        .clone();
+    let total = paths_with_positions.len();
+    report_desktop_transfer_progress(|progress| progress.begin(total, &category_name));
+    let mut added = 0usize;
+
+    for (position, (path, desktop_icon_position)) in paths_with_positions.into_iter().enumerate() {
+        report_desktop_transfer_progress(|progress| {
+            progress.set_item(position + 1, total, Path::new(&path))
+        });
+        if !Path::new(&path).exists() {
+            continue;
+        }
+        let archived_path = archive_item_path(store, &category_name, &path)?;
+
+        for category in &mut config.desktop_categories {
+            category.item_paths.retain(|item_path| {
+                !same_path_text(item_path, &path) && !same_path_text(item_path, &archived_path)
+            });
+        }
+        remove_desktop_icon_position_for_path(&mut config.desktop_icon_positions, &path);
+        remove_desktop_icon_position_for_path(&mut config.desktop_icon_positions, &archived_path);
+        if let Some(position) = desktop_icon_position {
+            set_desktop_icon_position_for_path(
+                &mut config.desktop_icon_positions,
+                archived_path.clone(),
+                position,
+            );
+        }
+
+        config.desktop_categories[index]
+            .item_paths
+            .push(archived_path);
+        added += 1;
+    }
+    Ok(added)
 }
 
 #[tauri::command]
@@ -950,7 +1022,9 @@ fn complete_internal_path_drag_impl(
                 let affected = if target_index == source_index {
                     0
                 } else {
-                    let affected = add_items_to_category_impl(target_index, vec![path])?;
+                    let affected = run_with_desktop_transfer_progress(app, "move", || {
+                        add_items_to_category_impl(target_index, vec![path])
+                    })?;
                     emit_desktop_cards_changed(app);
                     affected
                 };
@@ -996,7 +1070,9 @@ fn complete_internal_path_drag_impl(
         }
     }
 
-    let restored = restore_item_to_desktop_impl(app, source_index, path, Some(position))?;
+    let restored = run_with_desktop_transfer_progress(app, "restore", || {
+        restore_item_to_desktop_impl(app, source_index, path, Some(position))
+    })?;
     Ok(InternalPathDragOutcome {
         action: "restored_to_desktop".to_owned(),
         target_category_index: None,
@@ -1039,7 +1115,9 @@ async fn restore_item_to_desktop(
     position: Option<DesktopDropPosition>,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        restore_item_to_desktop_impl(&app, index, path, position)
+        run_with_desktop_transfer_progress(&app, "restore", || {
+            restore_item_to_desktop_impl(&app, index, path, position)
+        })
     })
     .await
     .map_err(to_message)?
@@ -1070,6 +1148,10 @@ fn restore_item_to_desktop_impl(
                     &source.display().to_string(),
                 )
             });
+        report_desktop_transfer_progress(|progress| {
+            progress.begin(1, "");
+            progress.set_item(1, 1, &source);
+        });
         let restored_path = restore_path_to_desktop(&source, &desktop)?;
         remove_category_path_from_config(&mut config, index, &path)?;
         remove_desktop_icon_position_for_path(&mut config.desktop_icon_positions, &path);
@@ -1107,10 +1189,17 @@ async fn start_restore_all_to_desktop_task(app: tauri::AppHandle) -> Result<(), 
 fn start_restore_background_operation(app: tauri::AppHandle) -> Result<(), String> {
     start_desktop_background_operation(app.clone(), "restore", move || {
         let progress_app = app.clone();
-        let restored =
+        let relay = DesktopOperationProgressRelay::new(restore_progress_message, move |payload| {
+            emit_desktop_operation(&progress_app, payload)
+        });
+        let transfer = desktop_operation_transfer_progress(&app, "restore-all", &relay);
+        let item_relay = Arc::clone(&relay);
+        let item_transfer = Arc::clone(&transfer);
+        let result = with_desktop_transfer_progress(Some(Arc::clone(&transfer)), || {
             restore_all_organized_items_to_desktop_with_progress(move |current, total, path| {
-                emit_desktop_operation(
-                    &progress_app,
+                // Reported after an item finished; the next item is the one in progress.
+                item_transfer.set_item(current.saturating_add(1).min(total), total, path);
+                item_relay.publish_progress(
                     DesktopOperationPayload {
                         kind: "restore",
                         scope: "manual",
@@ -1123,8 +1212,13 @@ fn start_restore_background_operation(app: tauri::AppHandle) -> Result<(), Strin
                         current_path: path.display().to_string(),
                         category_counts: Vec::new(),
                     },
+                    &item_transfer.snapshot(),
                 );
-            })?;
+            })
+        });
+        relay.close();
+        transfer.complete(result.is_ok());
+        let restored = result?;
         Ok(DesktopOperationPayload {
             kind: "restore",
             scope: "manual",
@@ -1262,10 +1356,16 @@ async fn classify_desktop_items(app: tauri::AppHandle) -> Result<ClassifyResult,
 async fn start_classify_desktop_items_task(app: tauri::AppHandle) -> Result<(), String> {
     start_desktop_background_operation(app.clone(), "classify", move || {
         let progress_app = app.clone();
-        let result =
+        let relay = DesktopOperationProgressRelay::new(classify_progress_message, move |payload| {
+            emit_desktop_operation(&progress_app, payload)
+        });
+        let transfer = desktop_operation_transfer_progress(&app, "classify", &relay);
+        let item_relay = Arc::clone(&relay);
+        let item_transfer = Arc::clone(&transfer);
+        let result = with_desktop_transfer_progress(Some(Arc::clone(&transfer)), || {
             classify_desktop_items_with_progress(move |current, total, path, moved, skipped| {
-                emit_desktop_operation(
-                    &progress_app,
+                item_transfer.set_item(current, total, path);
+                item_relay.publish_progress(
                     DesktopOperationPayload {
                         kind: "classify",
                         scope: "manual",
@@ -1278,8 +1378,13 @@ async fn start_classify_desktop_items_task(app: tauri::AppHandle) -> Result<(), 
                         current_path: path.display().to_string(),
                         category_counts: Vec::new(),
                     },
+                    &item_transfer.snapshot(),
                 );
-            })?;
+            })
+        });
+        relay.close();
+        transfer.complete(result.is_ok());
+        let result = result?;
         let detail = result
             .category_counts
             .iter()
@@ -1435,6 +1540,8 @@ fn classify_desktop_items_with_progress(
             ),
         ];
         let (sender, receiver) = mpsc::channel();
+        let transfer_progress = active_desktop_transfer_progress();
+        report_desktop_transfer_progress(|progress| progress.begin(total, ""));
         let mut moved = 0usize;
         let mut handled = 0usize;
         let mut active = Vec::<ClassifyCandidate>::new();
@@ -1445,6 +1552,7 @@ fn classify_desktop_items_with_progress(
                     let queue = Arc::clone(&queue);
                     let sender = sender.clone();
                     let store = store.clone();
+                    let transfer_progress = transfer_progress.clone();
                     scope.spawn(move || loop {
                         let candidate = match queue.lock() {
                             Ok(mut queue) => queue.pop_front(),
@@ -1460,11 +1568,16 @@ fn classify_desktop_items_with_progress(
                         };
                         let _ = sender.send(ClassifyWorkerMessage::Started(candidate.clone()));
                         let item_started = Instant::now();
-                        let result = archive_item_path(
-                            &store,
-                            &candidate.category_name,
-                            &candidate.original_path,
-                        );
+                        // Copies of all workers add up in the shared progress; the name shown is
+                        // the most recently started copy.
+                        let result =
+                            with_desktop_transfer_progress(transfer_progress.clone(), || {
+                                archive_item_path(
+                                    &store,
+                                    &candidate.category_name,
+                                    &candidate.original_path,
+                                )
+                            });
                         let elapsed = item_started.elapsed();
                         if sender
                             .send(ClassifyWorkerMessage::Finished(candidate, result, elapsed))
@@ -1856,15 +1969,80 @@ fn parse_semver_like(version: &str) -> [u64; 3] {
     output
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct OrganizerDirectoryVolumeCheck {
+    same_volume_as_desktop: bool,
+    desktop_drive: String,
+}
+
+/// Lets settings warn before the organizer root moves off the desktop volume, where organizing
+/// large items needs cross-volume copies instead of renames.
 #[tauri::command]
-async fn update_runtime_directory(target: String, path: String) -> Result<AppSnapshot, String> {
-    tauri::async_runtime::spawn_blocking(move || update_runtime_directory_impl(target, path))
+async fn check_organizer_directory_volume(
+    path: String,
+) -> Result<OrganizerDirectoryVolumeCheck, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = PathBuf::from(path.trim());
+        let desktop = user_desktop();
+        let same_volume = desktop
+            .as_deref()
+            .and_then(|desktop| store::paths_share_volume(&path, desktop));
+        let desktop_root = desktop.as_deref().and_then(store::volume_root_path);
+        organizer_directory_volume_check(same_volume, desktop_root.as_deref())
+    })
+    .await
+    .map_err(to_message)
+}
+
+/// An undetermined volume counts as the desktop volume so no warning is shown.
+fn organizer_directory_volume_check(
+    same_volume: Option<bool>,
+    desktop_volume_root: Option<&Path>,
+) -> OrganizerDirectoryVolumeCheck {
+    let desktop_drive = desktop_volume_root
+        .map(|root| {
+            root.display()
+                .to_string()
+                .trim_end_matches(['\\', '/'])
+                .to_owned()
+        })
+        .unwrap_or_default();
+    OrganizerDirectoryVolumeCheck {
+        same_volume_as_desktop: same_volume.unwrap_or(true),
+        desktop_drive,
+    }
+}
+
+#[tauri::command]
+async fn update_runtime_directory(
+    app: tauri::AppHandle,
+    target: String,
+    path: String,
+) -> Result<AppSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || update_runtime_directory_impl(app, target, path))
         .await
         .map_err(to_message)?
 }
 
-fn update_runtime_directory_impl(target: String, path: String) -> Result<AppSnapshot, String> {
-    store::with_storage_mutation(move || update_runtime_directory_locked(target, path))?;
+fn update_runtime_directory_impl(
+    app: tauri::AppHandle,
+    target: String,
+    path: String,
+) -> Result<AppSnapshot, String> {
+    let progress_app = app.clone();
+    let progress = RuntimeMigrationProgress::new(
+        target.trim(),
+        RUNTIME_MIGRATION_PROGRESS_INTERVAL,
+        move |payload| {
+            let _ = progress_app.emit(RUNTIME_MIGRATION_PROGRESS_EVENT, payload);
+        },
+    );
+    let result = store::with_storage_mutation(move || {
+        with_runtime_migration_progress(progress, || update_runtime_directory_locked(target, path))
+    });
+    // Success, rollback or failure: other windows hold paths of the old roots and must reload.
+    let _ = app.emit("dustdesk://desktop-cards-changed", ());
+    result?;
     load_snapshot_impl().map_err(|error| format!("运行目录已切换成功，但刷新界面失败：{error}"))
 }
 
@@ -1883,102 +2061,811 @@ fn update_runtime_directory_locked(target: String, path: String) -> Result<(), S
         return Err("目录不能为空".to_owned());
     }
 
-    recover_pending_runtime_migration_locked()?;
+    if let RuntimeMigrationOutcome::RolledBack(message) = recover_pending_runtime_migration_with(
+        &AppRuntimeMigrationJournalPersistence,
+        &AppRuntimeMigrationSteps,
+    )? {
+        // A stale migration that never touched config must not block the new request.
+        append_desktop_diagnostic(
+            "runtime_migration_rolled_back",
+            &format!("context=update message=\"{}\"", diagnostic_value(&message)),
+        );
+    }
 
     let old_store = AppStore::open().map_err(to_message)?;
-    let old_data_dir = old_store.data_dir();
-    let old_organizer_root = old_store.organizer_root();
-    let old_launchers_root = old_store.launchers_root();
     let requested_path = PathBuf::from(path);
     validate_runtime_directory_target(&target, &requested_path, &old_store)?;
 
     let prospective_store = old_store
         .with_runtime_directory(&target, &requested_path)
-        .map_err(to_message)?;
-    prospective_store
-        .ensure_runtime_dirs()
-        .map_err(to_message)?;
-    let new_data_dir = prospective_store.data_dir();
-    let new_organizer_root = prospective_store.organizer_root();
-    let new_launchers_root = prospective_store.launchers_root();
+        .map_err(|error| {
+            runtime_directory_unwritable_message(
+                &target,
+                &requested_path,
+                &anyhow_io_reason(&error),
+            )
+        })?;
+    prospective_store.ensure_runtime_dirs().map_err(|error| {
+        runtime_directory_unwritable_message(&target, &requested_path, &anyhow_io_reason(&error))
+    })?;
+    // `with_runtime_directory` canonicalizes to `\\?\` paths. Rewritten config and marker paths
+    // must use the plain form that `AppStore::open()` reports, or they will not match later.
+    let journal_path = |path: PathBuf| store::without_verbatim_prefix(&path).display().to_string();
 
     let journal = RuntimeMigrationJournal {
         target,
         phase: "prepared".to_owned(),
         requested_path: requested_path.display().to_string(),
-        old_data_dir: old_data_dir.display().to_string(),
-        old_organizer_root: old_organizer_root.display().to_string(),
-        old_launchers_root: old_launchers_root.display().to_string(),
-        new_data_dir: new_data_dir.display().to_string(),
-        new_organizer_root: new_organizer_root.display().to_string(),
-        new_launchers_root: new_launchers_root.display().to_string(),
+        old_data_dir: journal_path(old_store.data_dir()),
+        old_organizer_root: journal_path(old_store.organizer_root()),
+        old_launchers_root: journal_path(old_store.launchers_root()),
+        new_data_dir: journal_path(prospective_store.data_dir()),
+        new_organizer_root: journal_path(prospective_store.organizer_root()),
+        new_launchers_root: journal_path(prospective_store.launchers_root()),
+        mode: default_runtime_migration_mode(),
+        renamed: false,
     };
-    save_runtime_migration_journal(&journal)?;
-    complete_runtime_migration_journal(journal)?;
-
-    Ok(())
+    match start_runtime_migration_with(
+        journal,
+        &AppRuntimeMigrationJournalPersistence,
+        &AppRuntimeMigrationSteps,
+        probe_runtime_directory_writable,
+    )? {
+        RuntimeMigrationOutcome::Completed => {
+            report_runtime_migration_progress(RuntimeMigrationProgress::complete);
+            Ok(())
+        }
+        RuntimeMigrationOutcome::RolledBack(message) => {
+            append_desktop_diagnostic(
+                "runtime_migration_rolled_back",
+                &format!("context=new message=\"{}\"", diagnostic_value(&message)),
+            );
+            Err(message)
+        }
+    }
 }
 
-fn recover_pending_runtime_migration_locked() -> Result<(), String> {
-    let Some(content) = AppStore::load_runtime_migration_journal().map_err(to_message)? else {
-        return Ok(());
-    };
-    let journal: RuntimeMigrationJournal = serde_json::from_str(&content).map_err(to_message)?;
-    complete_runtime_migration_journal(journal)
+/// Persistence for `%APPDATA%\DustDesk\runtime-migration.json`, injectable for tests.
+trait RuntimeMigrationJournalPersistence {
+    fn load(&self) -> Result<Option<String>, String>;
+    fn save(&self, bytes: &[u8]) -> Result<(), String>;
+    fn remove(&self) -> Result<(), String>;
 }
 
-fn complete_runtime_migration_journal(mut journal: RuntimeMigrationJournal) -> Result<(), String> {
-    let prospective_store = AppStore::from_runtime_dirs(
+struct AppRuntimeMigrationJournalPersistence;
+
+impl RuntimeMigrationJournalPersistence for AppRuntimeMigrationJournalPersistence {
+    fn load(&self) -> Result<Option<String>, String> {
+        AppStore::load_runtime_migration_journal().map_err(|error| format!("{error:#}"))
+    }
+
+    fn save(&self, bytes: &[u8]) -> Result<(), String> {
+        AppStore::save_runtime_migration_journal(bytes).map_err(|error| format!("{error:#}"))
+    }
+
+    fn remove(&self) -> Result<(), String> {
+        AppStore::remove_runtime_migration_journal().map_err(|error| format!("{error:#}"))
+    }
+}
+
+/// Side effects of each migration phase, injectable for tests.
+trait RuntimeMigrationSteps {
+    fn ensure_target_dirs(&self, journal: &RuntimeMigrationJournal) -> Result<(), String>;
+    fn copy_and_verify(&self, journal: &RuntimeMigrationJournal) -> Result<(), String>;
+    fn rewrite_paths(&self, journal: &RuntimeMigrationJournal) -> Result<(), String>;
+    /// Undo a possibly partial `rewrite_paths`; paths that were never rewritten stay untouched.
+    fn revert_rewritten_paths(&self, journal: &RuntimeMigrationJournal) -> Result<(), String>;
+    fn switch_directory(&self, journal: &RuntimeMigrationJournal) -> Result<(), String>;
+    fn cleanup_sources(&self, journal: &RuntimeMigrationJournal) -> Result<(), String>;
+    /// Recovers interrupted desktop transfers synchronously, committed cleanups included, so no
+    /// background cleanup runs alongside the migration.
+    fn recover_transfer_journals(&self) -> Result<(), String>;
+    /// Ok when the old root may be renamed to the new root as a whole; Err carries the reason to
+    /// copy instead.
+    fn check_rename_eligible(&self, journal: &RuntimeMigrationJournal) -> Result<(), String>;
+    /// Removes the empty new root and renames the old root to it without replacing or copying.
+    /// On failure nothing was moved.
+    fn rename_root(&self, source: &Path, target: &Path) -> Result<(), String>;
+}
+
+struct AppRuntimeMigrationSteps;
+
+fn runtime_migration_prospective_store(journal: &RuntimeMigrationJournal) -> AppStore {
+    AppStore::from_runtime_dirs(
         PathBuf::from(&journal.new_data_dir),
         PathBuf::from(&journal.new_organizer_root),
         PathBuf::from(&journal.new_launchers_root),
-    );
-    prospective_store
-        .ensure_runtime_dirs()
-        .map_err(to_message)?;
+    )
+}
 
-    if runtime_migration_phase_index(&journal.phase) < runtime_migration_phase_index("copied") {
-        copy_runtime_migration_contents(&journal)?;
-        verify_runtime_migration_contents(&journal)?;
-        set_runtime_migration_phase(&mut journal, "copied")?;
+impl RuntimeMigrationSteps for AppRuntimeMigrationSteps {
+    fn ensure_target_dirs(&self, journal: &RuntimeMigrationJournal) -> Result<(), String> {
+        runtime_migration_prospective_store(journal)
+            .ensure_runtime_dirs()
+            .map_err(|error| format!("{error:#}"))
     }
 
-    if runtime_migration_phase_index(&journal.phase) < runtime_migration_phase_index("rewritten") {
-        rewrite_runtime_migration_paths(&journal, &prospective_store)?;
-        set_runtime_migration_phase(&mut journal, "rewritten")?;
+    fn copy_and_verify(&self, journal: &RuntimeMigrationJournal) -> Result<(), String> {
+        copy_and_verify_runtime_migration(journal)
     }
 
-    if runtime_migration_phase_index(&journal.phase) < runtime_migration_phase_index("switched") {
+    fn rewrite_paths(&self, journal: &RuntimeMigrationJournal) -> Result<(), String> {
+        enter_runtime_migration_switching_phase();
+        rewrite_runtime_migration_paths(journal, &runtime_migration_prospective_store(journal))
+    }
+
+    fn revert_rewritten_paths(&self, journal: &RuntimeMigrationJournal) -> Result<(), String> {
+        // The forward rewrite edits the files of the prospective store; map new roots back.
+        let mut reversed = journal.clone();
+        std::mem::swap(&mut reversed.old_data_dir, &mut reversed.new_data_dir);
+        std::mem::swap(
+            &mut reversed.old_organizer_root,
+            &mut reversed.new_organizer_root,
+        );
+        std::mem::swap(
+            &mut reversed.old_launchers_root,
+            &mut reversed.new_launchers_root,
+        );
+        rewrite_runtime_migration_paths(&reversed, &runtime_migration_prospective_store(journal))
+    }
+
+    fn switch_directory(&self, journal: &RuntimeMigrationJournal) -> Result<(), String> {
+        enter_runtime_migration_switching_phase();
         let new_store =
             AppStore::set_runtime_directory(&journal.target, Path::new(&journal.requested_path))
-                .map_err(to_message)?;
+                .map_err(|error| format!("{error:#}"))?;
         if let Err(error) = repair_existing_app_desktop_entries(&new_store) {
             eprintln!("DustDesk 运行目录已切换，但桌面入口暂未更新：{error}");
         }
-        set_runtime_migration_phase(&mut journal, "switched")?;
+        Ok(())
+    }
+
+    fn cleanup_sources(&self, journal: &RuntimeMigrationJournal) -> Result<(), String> {
+        cleanup_runtime_migration_sources(journal)
+    }
+
+    fn recover_transfer_journals(&self) -> Result<(), String> {
+        recover_transfer_quarantine_journals_strict(false)
+    }
+
+    fn check_rename_eligible(&self, journal: &RuntimeMigrationJournal) -> Result<(), String> {
+        check_runtime_migration_rename_eligible(journal, transfer_quarantine_journals_pending()?)
+    }
+
+    fn rename_root(&self, source: &Path, target: &Path) -> Result<(), String> {
+        rename_runtime_migration_root(source, target)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RuntimeMigrationOutcome {
+    Completed,
+    /// The migration failed before config was rewritten and was cancelled; carries the message.
+    RolledBack(String),
+}
+
+/// Probes the new root, recovers interrupted desktop transfers, picks rename or copy mode, then
+/// persists a `prepared` journal and runs it. Nothing is persisted when the target is not writable
+/// or the transfer recovery fails.
+fn start_runtime_migration_with(
+    mut journal: RuntimeMigrationJournal,
+    persistence: &impl RuntimeMigrationJournalPersistence,
+    steps: &impl RuntimeMigrationSteps,
+    probe: impl Fn(&Path) -> io::Result<()>,
+) -> Result<RuntimeMigrationOutcome, String> {
+    let (_, target_root) = runtime_migration_primary_pair(&journal);
+    probe(&target_root).map_err(|error| {
+        runtime_directory_unwritable_message(
+            &journal.target,
+            &target_root,
+            &io_error_reason(&error),
+        )
+    })?;
+    steps.recover_transfer_journals().map_err(|error| {
+        format!("迁移前恢复未完成的收纳传输失败，未开始迁移，原目录和配置均未改动：{error}")
+    })?;
+    journal.renamed = false;
+    journal.mode = match steps.check_rename_eligible(&journal) {
+        Ok(()) => RUNTIME_MIGRATION_MODE_RENAME.to_owned(),
+        Err(reason) => {
+            append_desktop_diagnostic(
+                "runtime_migration_copy_mode",
+                &format!(
+                    "target={} reason=\"{}\"",
+                    journal.target,
+                    diagnostic_value(&reason)
+                ),
+            );
+            RUNTIME_MIGRATION_MODE_COPY.to_owned()
+        }
+    };
+    save_runtime_migration_journal(persistence, &journal)?;
+    finish_runtime_migration_journal(journal, persistence, steps)
+}
+
+fn recover_pending_runtime_migration_with(
+    persistence: &impl RuntimeMigrationJournalPersistence,
+    steps: &impl RuntimeMigrationSteps,
+) -> Result<RuntimeMigrationOutcome, String> {
+    let Some(content) = persistence.load()? else {
+        return Ok(RuntimeMigrationOutcome::Completed);
+    };
+    let journal: RuntimeMigrationJournal = serde_json::from_str(&content)
+        .map_err(|error| format!("运行目录迁移记录无法解析：{error}"))?;
+    finish_runtime_migration_journal(journal, persistence, steps)
+}
+
+fn recover_pending_runtime_migration_on_startup(handle: &tauri::AppHandle) -> Result<(), String> {
+    let progress_handle = handle.clone();
+    // A resumed migration may copy for a long time; show the same progress text in the startup
+    // overlay so it does not look frozen.
+    let progress =
+        RuntimeMigrationProgress::new("", RUNTIME_MIGRATION_PROGRESS_INTERVAL, move |payload| {
+            publish_lifecycle_desktop_operation(
+                &progress_handle,
+                DesktopOperationPayload {
+                    kind: "classify",
+                    scope: "lifecycle",
+                    status: "progress",
+                    message: runtime_migration_progress_message(payload),
+                    moved: usize::try_from(payload.files_done).unwrap_or(usize::MAX),
+                    skipped: 0,
+                    restored: 0,
+                    total: usize::try_from(payload.files_total).unwrap_or(usize::MAX),
+                    current_path: payload.current.clone(),
+                    category_counts: Vec::new(),
+                },
+                true,
+            );
+        });
+    store::with_storage_mutation(|| {
+        with_runtime_migration_progress(progress, || {
+            recover_runtime_migration_for_startup_with(
+                &AppRuntimeMigrationJournalPersistence,
+                &AppRuntimeMigrationSteps,
+                append_desktop_diagnostic,
+            )
+        })
+    })
+}
+
+/// A rolled back journal is logged and startup continues; later-phase failures still abort.
+fn recover_runtime_migration_for_startup_with(
+    persistence: &impl RuntimeMigrationJournalPersistence,
+    steps: &impl RuntimeMigrationSteps,
+    mut diagnostic: impl FnMut(&str, &str),
+) -> Result<(), String> {
+    if let RuntimeMigrationOutcome::RolledBack(message) =
+        recover_pending_runtime_migration_with(persistence, steps)?
+    {
+        diagnostic(
+            "runtime_migration_rolled_back",
+            &format!("context=startup message=\"{}\"", diagnostic_value(&message)),
+        );
+    }
+    Ok(())
+}
+
+/// Runs the remaining phases. A failure while the phase is still `prepared` / `copied` is rolled
+/// back: the journal is removed and source, config, marker and path files stay as they were.
+/// From `rewritten` on the migration must be finished, so the journal is kept.
+fn finish_runtime_migration_journal(
+    mut journal: RuntimeMigrationJournal,
+    persistence: &impl RuntimeMigrationJournalPersistence,
+    steps: &impl RuntimeMigrationSteps,
+) -> Result<RuntimeMigrationOutcome, String> {
+    let started = Instant::now();
+    set_runtime_migration_copy_totals(None);
+    // A `copied` journal may come from a run interrupted inside the rewrite step.
+    let mut rewrite_may_be_partial = journal.phase == "copied";
+    let result = complete_runtime_migration_journal(&mut journal, persistence, steps, || {
+        rewrite_may_be_partial = true;
+    });
+    let Err(error) = result else {
+        log_runtime_migration_finished(&journal, "completed", started);
+        return Ok(RuntimeMigrationOutcome::Completed);
+    };
+
+    let (source, target) = runtime_migration_primary_pair(&journal);
+    if journal.forward_only() && runtime_migration_phase_allows_rollback(&journal.phase) {
+        // The old root was renamed to the new root; deleting the journal would forget that the
+        // data now lives in the new root while config still points at the old one.
+        log_runtime_migration_finished(&journal, "incomplete", started);
+        return Err(format!(
+            "运行目录迁移未完成（{} → {}）：{error}。目录已整体移动到新位置，将在下次修改目录或启动时继续完成迁移。",
+            source.display(),
+            target.display()
+        ));
+    }
+    if !runtime_migration_phase_allows_rollback(&journal.phase) {
+        log_runtime_migration_finished(&journal, "incomplete", started);
+        return Err(format!(
+            "运行目录迁移未完成（{} → {}）：{error}。配置已指向新目录，将在下次修改目录或启动时继续完成迁移。",
+            source.display(),
+            target.display()
+        ));
+    }
+
+    let revert_error = if rewrite_may_be_partial {
+        steps.revert_rewritten_paths(&journal).err()
+    } else {
+        None
+    };
+    persistence.remove().map_err(|remove_error| {
+        format!(
+            "运行目录迁移失败（{} → {}）：{error}。取消迁移时无法删除迁移记录：{remove_error}",
+            source.display(),
+            target.display()
+        )
+    })?;
+
+    let mut message = format!(
+        "运行目录迁移失败：{} → {}：{error}。",
+        source.display(),
+        target.display()
+    );
+    match revert_error {
+        None => message.push_str("已取消本次迁移，原目录和配置均未改动。"),
+        Some(revert_error) => message.push_str(&format!(
+            "已取消本次迁移，原目录未改动，但恢复配置中的路径记录时出错：{revert_error}。"
+        )),
+    }
+    message.push_str("目标文件夹里可能留有部分副本，可以手动删除。");
+    log_runtime_migration_finished(&journal, "rolled_back", started);
+    Ok(RuntimeMigrationOutcome::RolledBack(message))
+}
+
+thread_local! {
+    /// Bytes and files counted by the copy step of the migration running on this thread.
+    static RUNTIME_MIGRATION_COPY_TOTALS: std::cell::Cell<Option<(u64, u64)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn set_runtime_migration_copy_totals(totals: Option<(u64, u64)>) {
+    let _ = RUNTIME_MIGRATION_COPY_TOTALS.try_with(|cell| cell.set(totals));
+}
+
+fn runtime_migration_copy_totals() -> Option<(u64, u64)> {
+    RUNTIME_MIGRATION_COPY_TOTALS
+        .try_with(std::cell::Cell::get)
+        .ok()
+        .flatten()
+}
+
+/// One line per migration run so the user can measure how long it took.
+fn log_runtime_migration_finished(
+    journal: &RuntimeMigrationJournal,
+    outcome: &str,
+    started: Instant,
+) {
+    let mode = if journal.is_rename_mode() {
+        RUNTIME_MIGRATION_MODE_RENAME
+    } else {
+        RUNTIME_MIGRATION_MODE_COPY
+    };
+    let mut details = format!(
+        "target={} mode={mode} outcome={outcome} elapsed_ms={}",
+        journal.target,
+        started.elapsed().as_millis()
+    );
+    if !journal.is_rename_mode() {
+        let (bytes, files) = runtime_migration_copy_totals().unwrap_or_default();
+        details.push_str(&format!(" bytes={bytes} files={files}"));
+    }
+    append_desktop_diagnostic("runtime_migration_finished", &details);
+}
+
+fn runtime_migration_phase_allows_rollback(phase: &str) -> bool {
+    matches!(phase, "prepared" | "copied")
+}
+
+fn complete_runtime_migration_journal(
+    journal: &mut RuntimeMigrationJournal,
+    persistence: &impl RuntimeMigrationJournalPersistence,
+    steps: &impl RuntimeMigrationSteps,
+    mut before_rewrite: impl FnMut(),
+) -> Result<(), String> {
+    if journal.is_rename_mode()
+        && runtime_migration_phase_index(&journal.phase) >= runtime_migration_phase_index("copied")
+    {
+        // `copied` is only recorded after the rename succeeded.
+        journal.renamed = true;
+    }
+    steps.ensure_target_dirs(journal)?;
+
+    if runtime_migration_phase_index(&journal.phase) < runtime_migration_phase_index("copied") {
+        if journal.is_rename_mode() && !journal.renamed {
+            resolve_runtime_migration_rename(journal, persistence, steps)?;
+        }
+        if !journal.is_rename_mode() {
+            steps.copy_and_verify(journal)?;
+        }
+        set_runtime_migration_phase(persistence, journal, "copied")?;
+    }
+
+    // After a rename the process may have kept running with the old root configured and put new
+    // items into a recreated old root. Merge them like a copy migration (never overwriting,
+    // conflicts are errors) so nothing is left unreferenced; failures keep the journal.
+    let merged_old_root =
+        journal.forward_only() && runtime_migration_old_root_has_content(journal)?;
+    if merged_old_root {
+        steps.copy_and_verify(journal)?;
+    }
+
+    if runtime_migration_phase_index(&journal.phase) < runtime_migration_phase_index("rewritten") {
+        before_rewrite();
+        steps.rewrite_paths(journal)?;
+        set_runtime_migration_phase(persistence, journal, "rewritten")?;
+    } else if merged_old_root {
+        // Config written after the earlier rewrite may hold old-root paths of the merged items.
+        // Rewriting prefixes again is a no-op for paths that already point at the new root.
+        steps.rewrite_paths(journal)?;
+    }
+
+    if runtime_migration_phase_index(&journal.phase) < runtime_migration_phase_index("switched") {
+        steps.switch_directory(journal)?;
+        set_runtime_migration_phase(persistence, journal, "switched")?;
     }
 
     if runtime_migration_phase_index(&journal.phase) < runtime_migration_phase_index("cleaned") {
-        if let Err(error) = cleanup_runtime_migration_sources(&journal) {
+        if journal.forward_only() && !runtime_migration_old_root_has_content(journal)? {
+            // Nothing to delete: the old root is gone or an empty folder recreated by a stale
+            // window, which is left untouched.
+        } else if let Err(error) = steps.cleanup_sources(journal) {
+            // Merged or copied items are removed only after their structure check passed.
             eprintln!("DustDesk 运行目录已安全切换，旧目录暂未完全清理：{error}");
         }
-        set_runtime_migration_phase(&mut journal, "cleaned")?;
+        set_runtime_migration_phase(persistence, journal, "cleaned")?;
     }
 
-    AppStore::remove_runtime_migration_journal().map_err(to_message)
+    persistence.remove()
 }
 
-fn save_runtime_migration_journal(journal: &RuntimeMigrationJournal) -> Result<(), String> {
+/// Rename mode before the rename is known to have happened. Decides from the disk whether an
+/// interrupted run already renamed, otherwise renames now; any failure falls back to copy mode
+/// with nothing moved.
+fn resolve_runtime_migration_rename(
+    journal: &mut RuntimeMigrationJournal,
+    persistence: &impl RuntimeMigrationJournalPersistence,
+    steps: &impl RuntimeMigrationSteps,
+) -> Result<(), String> {
+    let (source, target) = runtime_migration_primary_pair(journal);
+    let source_exists = fs::symlink_metadata(&source).is_ok();
+    let source_has_content = directory_has_entries(&source)?;
+    let target_has_content = directory_has_entries(&target)?;
+
+    // The journal was created with an empty new root, so content there means the rename happened
+    // (anything a stale window put into a recreated old root is merged later). A missing or empty
+    // old root with an empty new root means there is nothing to move.
+    if target_has_content || (!source_has_content && !source_exists) {
+        append_desktop_diagnostic(
+            "runtime_migration_rename_detected",
+            &format!(
+                "target={} source_exists={source_exists} target_has_content={target_has_content}",
+                journal.target
+            ),
+        );
+        journal.renamed = true;
+        return save_runtime_migration_journal(persistence, journal);
+    }
+
+    report_runtime_migration_progress(|progress| {
+        progress.begin_phase("moving", 0, 0);
+        progress.set_current(
+            &source
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        );
+    });
+    let attempt = steps
+        .check_rename_eligible(journal)
+        .and_then(|()| steps.rename_root(&source, &target));
+    match attempt {
+        Ok(()) => {
+            // In memory first: once renamed, nothing may roll back, even if recording it fails.
+            journal.renamed = true;
+            report_runtime_migration_progress(RuntimeMigrationProgress::finish_phase);
+            save_runtime_migration_journal(persistence, journal)
+        }
+        Err(reason) => {
+            append_desktop_diagnostic(
+                "runtime_migration_rename_fallback",
+                &format!(
+                    "target={} reason=\"{}\"",
+                    journal.target,
+                    diagnostic_value(&reason)
+                ),
+            );
+            journal.mode = RUNTIME_MIGRATION_MODE_COPY.to_owned();
+            journal.renamed = false;
+            save_runtime_migration_journal(persistence, journal)?;
+            steps.ensure_target_dirs(journal)
+        }
+    }
+}
+
+/// Missing counts as empty; anything other than a plain directory is an error.
+fn directory_has_entries(path: &Path) -> Result<bool, String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("无法读取 {}：{error}", path.display())),
+    };
+    reject_transfer_reparse_point(path, &metadata)?;
+    if !metadata.is_dir() {
+        return Err(format!("不是目录：{}", path.display()));
+    }
+    let mut entries =
+        fs::read_dir(path).map_err(|error| format!("无法读取 {}：{error}", path.display()))?;
+    Ok(entries.next().is_some())
+}
+
+fn runtime_migration_old_root_has_content(
+    journal: &RuntimeMigrationJournal,
+) -> Result<bool, String> {
+    let (source, _) = runtime_migration_primary_pair(journal);
+    let has_content = directory_has_entries(&source)?;
+    if has_content {
+        append_desktop_diagnostic(
+            "runtime_migration_old_root_not_empty",
+            &format!(
+                "target={} path=\"{}\"",
+                journal.target,
+                diagnostic_value(&source.display().to_string())
+            ),
+        );
+    }
+    Ok(has_content)
+}
+
+/// Rename mode needs: organizer or launchers, both roots on one volume, neither a volume root nor
+/// a reparse point, not nested, the new root missing or completely empty, no pending transfer
+/// journal and no internal `.dustdesk-*.tmp` item in the old root or its subfolders' first level.
+fn check_runtime_migration_rename_eligible(
+    journal: &RuntimeMigrationJournal,
+    transfer_journals_pending: bool,
+) -> Result<(), String> {
+    if !matches!(journal.target.as_str(), "organizer" | "launchers") {
+        return Err("数据目录保持复制模式".to_owned());
+    }
+    if transfer_journals_pending {
+        return Err("存在未恢复的收纳传输记录".to_owned());
+    }
+    let (source, target) = runtime_migration_primary_pair(journal);
+    if paths_overlap(&source, &target) {
+        return Err("新旧目录互相包含".to_owned());
+    }
+    let source_metadata = fs::symlink_metadata(&source)
+        .map_err(|error| format!("无法读取原目录 {}：{error}", source.display()))?;
+    reject_transfer_reparse_point(&source, &source_metadata)?;
+    if !source_metadata.is_dir() {
+        return Err(format!("原目录不是文件夹：{}", source.display()));
+    }
+    match fs::symlink_metadata(&target) {
+        Ok(metadata) => {
+            reject_transfer_reparse_point(&target, &metadata)?;
+            if !metadata.is_dir() {
+                return Err(format!("新目录不是文件夹：{}", target.display()));
+            }
+            if directory_has_entries(&target)? {
+                return Err(format!("新目录不是空目录：{}", target.display()));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("无法读取新目录 {}：{error}", target.display())),
+    }
+    for path in [&source, &target] {
+        if path.parent().is_none() || is_volume_root_path(path) {
+            return Err(format!("卷根目录不能整体改名：{}", path.display()));
+        }
+    }
+    if store::paths_share_volume(&source, &target) != Some(true) {
+        return Err("新旧目录不在同一个卷".to_owned());
+    }
+    if let Some(internal) = find_internal_transfer_item(&source)? {
+        return Err(format!(
+            "原目录中有未完成的内部临时项：{}",
+            internal.display()
+        ));
+    }
+    Ok(())
+}
+
+fn is_volume_root_path(path: &Path) -> bool {
+    store::volume_root_path(path).is_some_and(|root| same_path_for_move(&root, path))
+}
+
+fn is_internal_runtime_migration_name(path: &Path) -> bool {
+    if is_internal_transfer_path(path) {
+        return true;
+    }
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|name| name.starts_with(".dustdesk-") && name.ends_with(".tmp"))
+}
+
+/// Looks at the first level of `root` and the first level of each of its subfolders.
+fn find_internal_transfer_item(root: &Path) -> Result<Option<PathBuf>, String> {
+    let read = |dir: &Path| {
+        fs::read_dir(dir)
+            .map_err(|error| format!("无法读取 {}：{error}", dir.display()))?
+            .map(|entry| {
+                entry
+                    .map_err(|error| format!("无法读取 {}：{error}", dir.display()))
+                    .map(|entry| (entry.path(), entry.file_type().ok()))
+            })
+            .collect::<Result<Vec<_>, String>>()
+    };
+    for (path, file_type) in read(root)? {
+        if is_internal_runtime_migration_name(&path) {
+            return Ok(Some(path));
+        }
+        if file_type.is_some_and(|file_type| file_type.is_dir()) {
+            if let Some((child, _)) = read(&path)?
+                .into_iter()
+                .find(|(child, _)| is_internal_runtime_migration_name(child))
+            {
+                return Ok(Some(child));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn transfer_quarantine_journals_pending() -> Result<bool, String> {
+    let journal_root = transfer_quarantine_journal_root()?;
+    let entries = match fs::read_dir(&journal_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(to_message(error)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(to_message)?;
+        let is_journal = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with("source-transfer-") && name.ends_with(".json"));
+        if is_journal {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Removes the empty new root (`remove_dir` only, never recursive) and renames the old root to it
+/// without replacing and without copying. If the rename fails the new root is recreated.
+fn rename_runtime_migration_root(source: &Path, target: &Path) -> Result<(), String> {
+    match fs::remove_dir(target) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!("无法移除空的新目录 {}：{error}", target.display()));
+        }
+    }
+    if let Err(error) = rename_path_no_replace_for_move(source, target) {
+        let reason = match error {
+            MoveRenameError::Rejected(message) => message,
+            MoveRenameError::Os(error) => format!(
+                "{error}（{:?}）",
+                classify_move_rename_error(error.raw_os_error())
+            ),
+        };
+        if let Err(create_error) = fs::create_dir_all(target) {
+            return Err(format!(
+                "{reason}；重新创建新目录失败 {}：{create_error}",
+                target.display()
+            ));
+        }
+        return Err(format!(
+            "整体改名 {} → {} 失败：{reason}",
+            source.display(),
+            target.display()
+        ));
+    }
+    Ok(())
+}
+
+fn save_runtime_migration_journal(
+    persistence: &impl RuntimeMigrationJournalPersistence,
+    journal: &RuntimeMigrationJournal,
+) -> Result<(), String> {
     let json = serde_json::to_vec_pretty(journal).map_err(to_message)?;
-    AppStore::save_runtime_migration_journal(&json).map_err(to_message)
+    persistence.save(&json)
 }
 
+/// The in-memory phase advances before persisting, so a step that succeeded is never rolled back
+/// even if recording it failed.
 fn set_runtime_migration_phase(
+    persistence: &impl RuntimeMigrationJournalPersistence,
     journal: &mut RuntimeMigrationJournal,
     phase: &str,
 ) -> Result<(), String> {
     journal.phase = phase.to_owned();
-    save_runtime_migration_journal(journal)
+    save_runtime_migration_journal(persistence, journal)
+}
+
+/// The root the user picked and the root it replaces, used for messages and the write probe.
+fn runtime_migration_primary_pair(journal: &RuntimeMigrationJournal) -> (PathBuf, PathBuf) {
+    match journal.target.as_str() {
+        "data" => (
+            PathBuf::from(&journal.old_data_dir),
+            PathBuf::from(&journal.new_data_dir),
+        ),
+        "launchers" => (
+            PathBuf::from(&journal.old_launchers_root),
+            PathBuf::from(&journal.new_launchers_root),
+        ),
+        _ => (
+            PathBuf::from(&journal.old_organizer_root),
+            PathBuf::from(&journal.new_organizer_root),
+        ),
+    }
+}
+
+/// Creates, writes and deletes a uniquely named file. The name follows the internal staging pattern
+/// (`.dustdesk-transfer-s<hex>-<n>.tmp`) so scans filter it even if deletion is interrupted.
+fn probe_runtime_directory_writable(dir: &Path) -> io::Result<()> {
+    for index in 0..1000 {
+        let candidate = dir.join(format!(".dustdesk-transfer-{}-{index}.tmp", now_id()));
+        let mut file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+        let write_result = file
+            .write_all(b"DustDesk write probe")
+            .and_then(|()| file.sync_all());
+        drop(file);
+        let remove_result = fs::remove_file(&candidate);
+        write_result?;
+        return remove_result;
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "无法生成唯一的写入探测文件名",
+    ))
+}
+
+fn io_error_reason(error: &io::Error) -> String {
+    match error.kind() {
+        io::ErrorKind::PermissionDenied => "拒绝访问".to_owned(),
+        _ => error.to_string(),
+    }
+}
+
+fn anyhow_io_reason(error: &anyhow::Error) -> String {
+    match error.downcast_ref::<io::Error>() {
+        Some(io_error) => io_error_reason(io_error),
+        None => format!("{error:#}"),
+    }
+}
+
+fn runtime_directory_unwritable_message(target: &str, path: &Path, reason: &str) -> String {
+    let folder = match target {
+        "data" => "Data",
+        "launchers" => "Launchers",
+        _ => "DesktopOrganizer",
+    };
+    let example = env::var_os("USERPROFILE")
+        .filter(|profile| !profile.is_empty())
+        .map(|profile| {
+            PathBuf::from(profile)
+                .join("DustDesk")
+                .join(folder)
+                .display()
+                .to_string()
+        })
+        .unwrap_or_else(|| format!("C:\\Users\\<用户名>\\DustDesk\\{folder}"));
+    format!(
+        "无法写入所选目录：{}（{reason}）。请选择当前用户有写入权限的文件夹，例如 {example}。C:\\Users 下其他用户或用管理员权限创建的文件夹、C 盘根目录、Program Files 通常不可写。",
+        store::without_verbatim_prefix(path).display()
+    )
 }
 
 fn runtime_migration_phase_index(phase: &str) -> usize {
@@ -1990,6 +2877,32 @@ fn runtime_migration_phase_index(phase: &str) -> usize {
         "cleaned" => 4,
         _ => 0,
     }
+}
+
+/// Scans, copies and confirms. A new top-level file is fully compared once before its staging
+/// commit; a new directory item gets the structure check (type, entry counts, sizes, modified
+/// times) like a cross-volume organize. Items already present in the target are fully compared
+/// file by file. The confirmation after copying is a fast structure check.
+fn copy_and_verify_runtime_migration(journal: &RuntimeMigrationJournal) -> Result<(), String> {
+    let pairs = runtime_migration_copy_pairs(journal);
+    report_runtime_migration_progress(|progress| progress.begin_phase("scanning", 0, 0));
+    let (bytes_total, files_total) = runtime_migration_source_totals(&pairs, |bytes, files| {
+        report_runtime_migration_progress(|progress| progress.set_scanned(bytes, files));
+    });
+    set_runtime_migration_copy_totals(Some((bytes_total, files_total)));
+    report_runtime_migration_progress(|progress| {
+        progress.set_scanned(bytes_total, files_total);
+        progress.finish_phase();
+        progress.begin_phase("copying", bytes_total, files_total);
+    });
+    copy_runtime_migration_contents(journal)?;
+    report_runtime_migration_progress(|progress| {
+        progress.finish_phase();
+        progress.begin_phase("verifying", bytes_total, files_total);
+    });
+    verify_runtime_migration_contents(journal)?;
+    report_runtime_migration_progress(RuntimeMigrationProgress::finish_phase);
+    Ok(())
 }
 
 fn copy_runtime_migration_contents(journal: &RuntimeMigrationJournal) -> Result<(), String> {
@@ -2007,10 +2920,26 @@ fn verify_runtime_migration_contents(journal: &RuntimeMigrationJournal) -> Resul
 }
 
 fn cleanup_runtime_migration_sources(journal: &RuntimeMigrationJournal) -> Result<(), String> {
-    for (source, target) in runtime_migration_copy_pairs(journal) {
+    let pairs = runtime_migration_copy_pairs(journal);
+    if active_runtime_migration_progress().is_some() {
+        let (bytes_total, files_total) = runtime_migration_source_totals(&pairs, |_, _| {});
+        report_runtime_migration_progress(|progress| {
+            progress.begin_phase("cleaning", bytes_total, files_total)
+        });
+    }
+    for (source, target) in pairs {
         remove_verified_directory_contents(&source, &target)?;
     }
+    report_runtime_migration_progress(RuntimeMigrationProgress::finish_phase);
     Ok(())
+}
+
+fn enter_runtime_migration_switching_phase() {
+    report_runtime_migration_progress(|progress| {
+        if progress.phase() != "switching" {
+            progress.begin_phase("switching", 0, 0);
+        }
+    });
 }
 
 fn rewrite_runtime_migration_paths(
@@ -2049,12 +2978,20 @@ fn rewrite_runtime_migration_paths(
                     (&old_organizer_root, &new_organizer_root),
                     (&old_launchers_root, &new_launchers_root),
                 ],
+            )?;
+            rewrite_restart_marker_path_prefixes(
+                &AppDesktopOrganizationRestartPersistence,
+                &[(&old_organizer_root, &new_organizer_root)],
             )
         }
         "organizer" => {
             rewrite_runtime_path_prefixes(store, &[(&old_organizer_root, &new_organizer_root)])?;
             rewrite_search_history_path_prefixes(
                 store,
+                &[(&old_organizer_root, &new_organizer_root)],
+            )?;
+            rewrite_restart_marker_path_prefixes(
+                &AppDesktopOrganizationRestartPersistence,
                 &[(&old_organizer_root, &new_organizer_root)],
             )
         }
@@ -2067,6 +3004,42 @@ fn rewrite_runtime_migration_paths(
         }
         _ => Ok(()),
     }
+}
+
+/// Restart marker sources must stay inside the active organizer root, otherwise startup can no
+/// longer recollect them. Rewritten paths no longer match the old root, so repeating is a no-op.
+fn rewrite_restart_marker_path_prefixes(
+    persistence: &impl DesktopOrganizationRestartPersistence,
+    replacements: &[(&PathBuf, &PathBuf)],
+) -> Result<(), String> {
+    if replacements.iter().all(|(old_root, new_root)| {
+        same_path_text(
+            &old_root.display().to_string(),
+            &new_root.display().to_string(),
+        )
+    }) {
+        // Data migrations keep the organizer root; leave the marker untouched.
+        return Ok(());
+    }
+    let Some(mut marker) = persistence.load()? else {
+        return Ok(());
+    };
+    validate_restart_marker(&marker)?;
+    let mut changed = false;
+    for item in marker
+        .categories
+        .iter_mut()
+        .flat_map(|category| category.items.iter_mut())
+    {
+        if let Some(next_path) = rewrite_path_prefix(&item.source_path, replacements) {
+            item.source_path = next_path;
+            changed = true;
+        }
+    }
+    if changed {
+        persistence.save(&marker)?;
+    }
+    Ok(())
 }
 
 fn runtime_migration_copy_pairs(journal: &RuntimeMigrationJournal) -> Vec<(PathBuf, PathBuf)> {
@@ -2087,6 +3060,865 @@ fn runtime_migration_copy_pairs(journal: &RuntimeMigrationJournal) -> Vec<(PathB
         "launchers" => vec![(old_launchers_root, new_launchers_root)],
         _ => Vec::new(),
     }
+}
+
+/// Progress of a runtime directory migration. Counters reset when the phase changes and never
+/// decrease within a phase; `finish_phase` sets them to the totals.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+struct RuntimeMigrationProgressPayload {
+    target: String,
+    /// scanning / copying / verifying / moving / switching / cleaning / done
+    phase: String,
+    bytes_done: u64,
+    bytes_total: u64,
+    files_done: u64,
+    files_total: u64,
+    /// Bytes already checked while copying: files by their full content comparison, directory
+    /// items by the structure check before their commit. Only advances while copying.
+    verified_bytes: u64,
+    /// Name or relative path of the item being processed.
+    current: String,
+}
+
+type RuntimeMigrationProgressSink = Box<dyn Fn(&RuntimeMigrationProgressPayload) + Send + Sync>;
+
+struct RuntimeMigrationProgress {
+    sink: RuntimeMigrationProgressSink,
+    interval: Duration,
+    state: Mutex<RuntimeMigrationProgressState>,
+}
+
+struct RuntimeMigrationProgressState {
+    payload: RuntimeMigrationProgressPayload,
+    last_emit: Option<Instant>,
+}
+
+impl RuntimeMigrationProgress {
+    fn new(
+        target: &str,
+        interval: Duration,
+        sink: impl Fn(&RuntimeMigrationProgressPayload) + Send + Sync + 'static,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            sink: Box::new(sink),
+            interval,
+            state: Mutex::new(RuntimeMigrationProgressState {
+                payload: RuntimeMigrationProgressPayload {
+                    target: target.to_owned(),
+                    ..RuntimeMigrationProgressPayload::default()
+                },
+                last_emit: None,
+            }),
+        })
+    }
+
+    /// Applies `change` and emits when forced or when the throttle interval has passed. Emitting is
+    /// best effort: a closed window or failing sink never affects the migration.
+    fn update(&self, force: bool, change: impl FnOnce(&mut RuntimeMigrationProgressPayload)) {
+        let snapshot = {
+            let Ok(mut state) = self.state.lock() else {
+                return;
+            };
+            change(&mut state.payload);
+            let payload = &mut state.payload;
+            payload.bytes_done = payload.bytes_done.min(payload.bytes_total);
+            payload.files_done = payload.files_done.min(payload.files_total);
+            payload.verified_bytes = payload.verified_bytes.min(payload.bytes_total);
+            let due = force
+                || state
+                    .last_emit
+                    .map_or(true, |last| last.elapsed() >= self.interval);
+            if !due {
+                return;
+            }
+            state.last_emit = Some(Instant::now());
+            state.payload.clone()
+        };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.sink)(&snapshot)));
+    }
+
+    fn begin_phase(&self, phase: &str, bytes_total: u64, files_total: u64) {
+        self.update(true, |payload| {
+            payload.phase = phase.to_owned();
+            payload.bytes_total = bytes_total;
+            payload.files_total = files_total;
+            payload.bytes_done = 0;
+            payload.files_done = 0;
+            payload.verified_bytes = 0;
+            payload.current.clear();
+        });
+    }
+
+    fn phase(&self) -> String {
+        self.state
+            .lock()
+            .map(|state| state.payload.phase.clone())
+            .unwrap_or_default()
+    }
+
+    fn finish_phase(&self) {
+        self.update(true, |payload| {
+            payload.bytes_done = payload.bytes_total;
+            payload.files_done = payload.files_total;
+            if payload.phase == "copying" {
+                payload.verified_bytes = payload.bytes_total;
+            }
+        });
+    }
+
+    fn complete(&self) {
+        self.update(true, |payload| {
+            payload.phase = "done".to_owned();
+            payload.bytes_done = payload.bytes_total;
+            payload.files_done = payload.files_total;
+            payload.verified_bytes = 0;
+            payload.current.clear();
+        });
+    }
+
+    /// Scanning has no known total; totals follow the counted amounts.
+    fn set_scanned(&self, bytes: u64, files: u64) {
+        self.update(false, |payload| {
+            payload.bytes_total = bytes;
+            payload.bytes_done = bytes;
+            payload.files_total = files;
+            payload.files_done = files;
+        });
+    }
+
+    fn set_current(&self, current: &str) {
+        self.update(false, |payload| {
+            if payload.current != current {
+                payload.current = current.to_owned();
+            }
+        });
+    }
+
+    fn add_done(&self, bytes: u64, files: u64) {
+        self.update(false, |payload| {
+            payload.bytes_done = payload.bytes_done.saturating_add(bytes);
+            payload.files_done = payload.files_done.saturating_add(files);
+        });
+    }
+
+    /// Raises the counters to at least the given values; never lowers them.
+    fn raise_done_to(&self, bytes: u64, files: u64) {
+        self.update(false, |payload| {
+            payload.bytes_done = payload.bytes_done.max(bytes);
+            payload.files_done = payload.files_done.max(files);
+        });
+    }
+
+    fn add_verified(&self, bytes: u64) {
+        self.update(false, |payload| {
+            payload.verified_bytes = payload.verified_bytes.saturating_add(bytes);
+        });
+    }
+
+    fn done_counters(&self) -> (u64, u64) {
+        self.state
+            .lock()
+            .map(|state| (state.payload.bytes_done, state.payload.files_done))
+            .unwrap_or_default()
+    }
+}
+
+thread_local! {
+    /// Progress of the migration running on this thread. Migration steps and the shared copy
+    /// helpers report to it; other transfers run without one and report nothing.
+    static ACTIVE_RUNTIME_MIGRATION_PROGRESS: std::cell::RefCell<Option<Arc<RuntimeMigrationProgress>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Installs `value` in a thread-local slot while `run` executes and restores the previous value
+/// afterwards, also when `run` panics.
+fn with_thread_local_slot<V: 'static, T>(
+    slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<V>>>,
+    value: Option<V>,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Restore<V: 'static> {
+        slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<V>>>,
+        previous: Option<V>,
+    }
+    impl<V: 'static> Drop for Restore<V> {
+        fn drop(&mut self) {
+            let previous = self.previous.take();
+            let _ = self.slot.try_with(|slot| *slot.borrow_mut() = previous);
+        }
+    }
+    let previous = slot.with(|slot| slot.replace(value));
+    let _restore = Restore { slot, previous };
+    run()
+}
+
+fn with_runtime_migration_progress<T>(
+    progress: Arc<RuntimeMigrationProgress>,
+    run: impl FnOnce() -> T,
+) -> T {
+    let byte_progress: Arc<dyn TransferByteProgress> = progress.clone();
+    with_thread_local_slot(&ACTIVE_RUNTIME_MIGRATION_PROGRESS, Some(progress), || {
+        with_transfer_byte_progress(Some(byte_progress), run)
+    })
+}
+
+fn active_runtime_migration_progress() -> Option<Arc<RuntimeMigrationProgress>> {
+    ACTIVE_RUNTIME_MIGRATION_PROGRESS.with(|slot| slot.borrow().clone())
+}
+
+fn report_runtime_migration_progress(report: impl FnOnce(&RuntimeMigrationProgress)) {
+    if let Some(progress) = active_runtime_migration_progress() {
+        report(&progress);
+    }
+}
+
+/// Byte counters fed by the shared copy helpers: the `CopyFile2` callback, the robocopy staging
+/// measurement and the single full content comparison. Runtime migrations and desktop transfers
+/// both implement it. Reporting only reads; it never changes how a transfer runs or verifies.
+trait TransferByteProgress: Send + Sync {
+    fn add_done(&self, bytes: u64, files: u64);
+    /// Raises the counters to at least the given values; never lowers them.
+    fn raise_done_to(&self, bytes: u64, files: u64);
+    fn add_verified(&self, bytes: u64);
+    fn done_counters(&self) -> (u64, u64);
+    /// Bytes and files of the item being copied when already measured, so robocopy does not walk
+    /// the source again.
+    fn item_totals(&self) -> Option<(u64, u64)> {
+        None
+    }
+}
+
+impl TransferByteProgress for RuntimeMigrationProgress {
+    fn add_done(&self, bytes: u64, files: u64) {
+        RuntimeMigrationProgress::add_done(self, bytes, files);
+    }
+
+    fn raise_done_to(&self, bytes: u64, files: u64) {
+        RuntimeMigrationProgress::raise_done_to(self, bytes, files);
+    }
+
+    fn add_verified(&self, bytes: u64) {
+        RuntimeMigrationProgress::add_verified(self, bytes);
+    }
+
+    fn done_counters(&self) -> (u64, u64) {
+        RuntimeMigrationProgress::done_counters(self)
+    }
+}
+
+thread_local! {
+    /// Byte progress of the copy running on this thread (a migration or one cross-volume desktop
+    /// item). Copies without one report nothing.
+    static ACTIVE_TRANSFER_BYTE_PROGRESS: std::cell::RefCell<Option<Arc<dyn TransferByteProgress>>> =
+        const { std::cell::RefCell::new(None) };
+    /// Progress of the desktop organize/restore operation running on this thread.
+    static ACTIVE_DESKTOP_TRANSFER_PROGRESS: std::cell::RefCell<Option<Arc<DesktopTransferProgress>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn with_transfer_byte_progress<T>(
+    progress: Option<Arc<dyn TransferByteProgress>>,
+    run: impl FnOnce() -> T,
+) -> T {
+    with_thread_local_slot(&ACTIVE_TRANSFER_BYTE_PROGRESS, progress, run)
+}
+
+fn active_transfer_byte_progress() -> Option<Arc<dyn TransferByteProgress>> {
+    ACTIVE_TRANSFER_BYTE_PROGRESS
+        .try_with(|slot| slot.borrow().clone())
+        .ok()
+        .flatten()
+}
+
+#[cfg(not(windows))]
+fn report_transfer_byte_progress(report: impl FnOnce(&dyn TransferByteProgress)) {
+    if let Some(progress) = active_transfer_byte_progress() {
+        report(progress.as_ref());
+    }
+}
+
+/// Installs the desktop operation progress for `run`. Worker threads must install the same
+/// progress themselves; thread-locals do not follow `std::thread::scope` spawns.
+fn with_desktop_transfer_progress<T>(
+    progress: Option<Arc<DesktopTransferProgress>>,
+    run: impl FnOnce() -> T,
+) -> T {
+    with_thread_local_slot(&ACTIVE_DESKTOP_TRANSFER_PROGRESS, progress, run)
+}
+
+fn active_desktop_transfer_progress() -> Option<Arc<DesktopTransferProgress>> {
+    ACTIVE_DESKTOP_TRANSFER_PROGRESS
+        .try_with(|slot| slot.borrow().clone())
+        .ok()
+        .flatten()
+}
+
+fn report_desktop_transfer_progress(report: impl FnOnce(&DesktopTransferProgress)) {
+    if let Some(progress) = active_desktop_transfer_progress() {
+        report(&progress);
+    }
+}
+
+/// Progress of one desktop organize/restore operation (archive, move, restore, classify,
+/// restore-all, exit-restore, restart-recollect). Bytes only exist while an item is really copied
+/// across volumes; same-volume renames only advance the item counters.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+struct DesktopTransferProgressPayload {
+    operation: String,
+    /// running / finished / failed
+    status: String,
+    /// Destination category name for archive/move; empty otherwise.
+    target: String,
+    /// 1-based position of the item being processed.
+    item_index: u64,
+    items_total: u64,
+    /// Display name of the current item; while copying, the most recently started copy.
+    current: String,
+    current_path: String,
+    /// True while at least one item is being copied across volumes.
+    copying: bool,
+    /// Sum over every copy in flight (several with parallel classify/restore-all).
+    bytes_done: u64,
+    bytes_total: u64,
+    verified_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct DesktopTransferCopyCounters {
+    bytes_done: u64,
+    bytes_total: u64,
+    files_done: u64,
+    files_total: u64,
+    verified_bytes: u64,
+}
+
+type DesktopTransferProgressSink = Box<dyn Fn(&DesktopTransferProgressPayload) + Send + Sync>;
+
+struct DesktopTransferProgress {
+    sink: DesktopTransferProgressSink,
+    interval: Duration,
+    state: Mutex<DesktopTransferProgressState>,
+    /// How often an item was measured for a cross-volume copy; renames never measure.
+    size_scans: std::sync::atomic::AtomicUsize,
+}
+
+struct DesktopTransferProgressState {
+    payload: DesktopTransferProgressPayload,
+    last_emit: Option<Instant>,
+    copies: BTreeMap<u64, DesktopTransferCopyCounters>,
+    next_copy_id: u64,
+}
+
+impl DesktopTransferProgress {
+    fn new(
+        operation: &str,
+        interval: Duration,
+        sink: impl Fn(&DesktopTransferProgressPayload) + Send + Sync + 'static,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            sink: Box::new(sink),
+            interval,
+            state: Mutex::new(DesktopTransferProgressState {
+                payload: DesktopTransferProgressPayload {
+                    operation: operation.to_owned(),
+                    status: "running".to_owned(),
+                    ..DesktopTransferProgressPayload::default()
+                },
+                last_emit: None,
+                copies: BTreeMap::new(),
+                next_copy_id: 0,
+            }),
+            size_scans: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// Applies `change`, recomputes the byte sums and emits when forced or when the throttle
+    /// interval has passed. Emitting is best effort: a failing or panicking sink is ignored.
+    fn update(&self, force: bool, change: impl FnOnce(&mut DesktopTransferProgressState)) {
+        let snapshot = {
+            let Ok(mut state) = self.state.lock() else {
+                return;
+            };
+            change(&mut state);
+            let (mut done, mut total, mut verified) = (0u64, 0u64, 0u64);
+            for counters in state.copies.values() {
+                done = done.saturating_add(counters.bytes_done.min(counters.bytes_total));
+                total = total.saturating_add(counters.bytes_total);
+                verified =
+                    verified.saturating_add(counters.verified_bytes.min(counters.bytes_total));
+            }
+            let copying = !state.copies.is_empty();
+            let payload = &mut state.payload;
+            payload.copying = copying;
+            payload.bytes_done = done;
+            payload.bytes_total = total;
+            payload.verified_bytes = verified;
+            let due = force
+                || state
+                    .last_emit
+                    .map_or(true, |last| last.elapsed() >= self.interval);
+            if !due {
+                return;
+            }
+            state.last_emit = Some(Instant::now());
+            state.payload.clone()
+        };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.sink)(&snapshot)));
+    }
+
+    /// Announces the operation (forced) with its item total and destination.
+    fn begin(&self, items_total: usize, target: &str) {
+        self.update(true, |state| {
+            state.payload.status = "running".to_owned();
+            state.payload.items_total = items_total as u64;
+            state.payload.item_index = items_total.min(1) as u64;
+            state.payload.target = target.to_owned();
+        });
+    }
+
+    /// Marks `path` as item `index` of `total`. The name only follows the item while no copy is
+    /// in flight, so a long copy keeps showing the item whose bytes are counted.
+    fn set_item(&self, index: usize, total: usize, path: &Path) {
+        self.update(false, |state| {
+            state.payload.item_index = index as u64;
+            state.payload.items_total = total as u64;
+            if state.copies.is_empty() {
+                state.payload.current = display_path_name(path);
+                state.payload.current_path = path.display().to_string();
+            }
+        });
+    }
+
+    /// Starts byte tracking for one cross-volume copy (forced emit).
+    fn begin_copy(
+        self: &Arc<Self>,
+        path: &Path,
+        bytes_total: u64,
+        files_total: u64,
+    ) -> DesktopTransferCopy {
+        let mut id = 0;
+        self.update(true, |state| {
+            id = state.next_copy_id;
+            state.next_copy_id += 1;
+            state.copies.insert(
+                id,
+                DesktopTransferCopyCounters {
+                    bytes_total,
+                    files_total,
+                    ..DesktopTransferCopyCounters::default()
+                },
+            );
+            state.payload.current = display_path_name(path);
+            state.payload.current_path = path.display().to_string();
+        });
+        DesktopTransferCopy {
+            owner: Arc::clone(self),
+            id,
+        }
+    }
+
+    fn update_copy(&self, id: u64, change: impl FnOnce(&mut DesktopTransferCopyCounters)) {
+        self.update(false, |state| {
+            if let Some(counters) = state.copies.get_mut(&id) {
+                change(counters);
+                counters.bytes_done = counters.bytes_done.min(counters.bytes_total);
+                counters.files_done = counters.files_done.min(counters.files_total);
+                counters.verified_bytes = counters.verified_bytes.min(counters.bytes_total);
+            }
+        });
+    }
+
+    /// Final forced emit; later reports from this operation are dropped by the windows.
+    fn complete(&self, success: bool) {
+        self.update(true, |state| {
+            state.copies.clear();
+            state.payload.status = if success { "finished" } else { "failed" }.to_owned();
+            if success {
+                state.payload.item_index = state.payload.items_total;
+            }
+        });
+    }
+
+    fn snapshot(&self) -> DesktopTransferProgressPayload {
+        self.state
+            .lock()
+            .map(|state| state.payload.clone())
+            .unwrap_or_default()
+    }
+}
+
+/// Byte progress handle of one cross-volume copy; dropping it ends the copy's byte tracking.
+struct DesktopTransferCopy {
+    owner: Arc<DesktopTransferProgress>,
+    id: u64,
+}
+
+impl DesktopTransferCopy {
+    /// After a successful move every byte has been copied (and verified when it was compared).
+    fn finish(&self, success: bool) {
+        if !success {
+            return;
+        }
+        self.owner.update(true, |state| {
+            if let Some(counters) = state.copies.get_mut(&self.id) {
+                counters.bytes_done = counters.bytes_total;
+                counters.files_done = counters.files_total;
+            }
+        });
+    }
+}
+
+impl Drop for DesktopTransferCopy {
+    fn drop(&mut self) {
+        let id = self.id;
+        self.owner.update(true, |state| {
+            state.copies.remove(&id);
+        });
+    }
+}
+
+impl TransferByteProgress for DesktopTransferCopy {
+    fn add_done(&self, bytes: u64, files: u64) {
+        self.owner.update_copy(self.id, |counters| {
+            counters.bytes_done = counters.bytes_done.saturating_add(bytes);
+            counters.files_done = counters.files_done.saturating_add(files);
+        });
+    }
+
+    fn raise_done_to(&self, bytes: u64, files: u64) {
+        self.owner.update_copy(self.id, |counters| {
+            counters.bytes_done = counters.bytes_done.max(bytes);
+            counters.files_done = counters.files_done.max(files);
+        });
+    }
+
+    fn add_verified(&self, bytes: u64) {
+        self.owner.update_copy(self.id, |counters| {
+            counters.verified_bytes = counters.verified_bytes.saturating_add(bytes);
+        });
+    }
+
+    fn done_counters(&self) -> (u64, u64) {
+        self.owner
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| {
+                state
+                    .copies
+                    .get(&self.id)
+                    .map(|counters| (counters.bytes_done, counters.files_done))
+            })
+            .unwrap_or_default()
+    }
+
+    fn item_totals(&self) -> Option<(u64, u64)> {
+        self.owner.state.lock().ok().and_then(|state| {
+            state
+                .copies
+                .get(&self.id)
+                .map(|counters| (counters.bytes_total, counters.files_total))
+        })
+    }
+}
+
+/// Byte detail of the copies in flight, e.g. `已复制 1.2 GB / 3.4 GB`.
+fn desktop_transfer_bytes_detail(payload: &DesktopTransferProgressPayload) -> Option<String> {
+    if !payload.copying || payload.bytes_total == 0 {
+        return None;
+    }
+    let mut detail = format!(
+        "已复制 {} / {}",
+        format_migration_bytes(payload.bytes_done),
+        format_migration_bytes(payload.bytes_total)
+    );
+    if payload.verified_bytes > 0 && payload.verified_bytes < payload.bytes_total {
+        detail.push_str(&format!(
+            "，已校验 {}",
+            format_migration_bytes(payload.verified_bytes)
+        ));
+    }
+    Some(detail)
+}
+
+fn message_with_transfer_detail(message: &str, payload: &DesktopTransferProgressPayload) -> String {
+    match desktop_transfer_bytes_detail(payload) {
+        Some(detail) => format!("{message}（{detail}）"),
+        None => message.to_owned(),
+    }
+}
+
+/// Runs a window-initiated transfer (archive, move, restore) with progress broadcast to every
+/// window. The final emit always happens, success or not.
+fn run_with_desktop_transfer_progress<T>(
+    app: &tauri::AppHandle,
+    operation: &str,
+    run: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let emitter = app.clone();
+    let progress = DesktopTransferProgress::new(
+        operation,
+        DESKTOP_TRANSFER_PROGRESS_INTERVAL,
+        move |payload| emit_desktop_transfer_progress(&emitter, payload),
+    );
+    progress.begin(0, "");
+    let result = with_desktop_transfer_progress(Some(progress.clone()), run);
+    progress.complete(result.is_ok());
+    result
+}
+
+fn emit_desktop_transfer_progress(
+    app: &tauri::AppHandle,
+    payload: &DesktopTransferProgressPayload,
+) {
+    let _ = app.emit(DESKTOP_TRANSFER_PROGRESS_EVENT, payload);
+}
+
+/// Republishes the latest desktop-operation progress message of a background or lifecycle
+/// operation with the byte detail of the copy in flight, so long cross-volume copies keep moving.
+struct DesktopOperationProgressRelay {
+    publish: Box<dyn Fn(DesktopOperationPayload) + Send + Sync>,
+    format: fn(usize, usize, &Path) -> String,
+    state: Mutex<DesktopOperationProgressRelayState>,
+}
+
+#[derive(Default)]
+struct DesktopOperationProgressRelayState {
+    last: Option<DesktopOperationPayload>,
+    last_message: String,
+    closed: bool,
+}
+
+impl DesktopOperationProgressRelay {
+    fn new(
+        format: fn(usize, usize, &Path) -> String,
+        publish: impl Fn(DesktopOperationPayload) + Send + Sync + 'static,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            publish: Box::new(publish),
+            format,
+            state: Mutex::new(DesktopOperationProgressRelayState::default()),
+        })
+    }
+
+    /// Publishes an item progress payload built by the operation, with byte detail when copying.
+    fn publish_progress(
+        &self,
+        mut payload: DesktopOperationPayload,
+        transfer: &DesktopTransferProgressPayload,
+    ) {
+        {
+            let Ok(mut state) = self.state.lock() else {
+                return;
+            };
+            if state.closed {
+                return;
+            }
+            state.last = Some(payload.clone());
+            payload.message = message_with_transfer_detail(&payload.message, transfer);
+            state.last_message = payload.message.clone();
+        }
+        (self.publish)(payload);
+    }
+
+    /// Called from the transfer progress sink; only byte updates of a copy in flight are relayed.
+    fn on_transfer(&self, transfer: &DesktopTransferProgressPayload) {
+        if transfer.status != "running" || !transfer.copying {
+            return;
+        }
+        let payload = {
+            let Ok(mut state) = self.state.lock() else {
+                return;
+            };
+            if state.closed {
+                return;
+            }
+            let Some(mut payload) = state.last.clone() else {
+                return;
+            };
+            let base = (self.format)(
+                transfer.item_index as usize,
+                transfer.items_total as usize,
+                Path::new(&transfer.current_path),
+            );
+            payload.message = message_with_transfer_detail(&base, transfer);
+            if payload.message == state.last_message {
+                return;
+            }
+            payload.current_path = transfer.current_path.clone();
+            state.last_message = payload.message.clone();
+            payload
+        };
+        (self.publish)(payload);
+    }
+
+    /// Stops relaying before the operation publishes its final status.
+    fn close(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.closed = true;
+        }
+    }
+}
+
+/// Transfer progress of a background/lifecycle operation that feeds both the transfer event and
+/// the operation's own desktop-operation messages.
+fn desktop_operation_transfer_progress(
+    app: &tauri::AppHandle,
+    operation: &str,
+    relay: &Arc<DesktopOperationProgressRelay>,
+) -> Arc<DesktopTransferProgress> {
+    let emitter = app.clone();
+    let relay = Arc::clone(relay);
+    let progress = DesktopTransferProgress::new(
+        operation,
+        DESKTOP_TRANSFER_PROGRESS_INTERVAL,
+        move |payload| {
+            emit_desktop_transfer_progress(&emitter, payload);
+            relay.on_transfer(payload);
+        },
+    );
+    progress.begin(0, "");
+    progress
+}
+
+/// Moves an item whose rename failed with a cross-volume error through the verified staging
+/// copy. Only here, inside a desktop operation, is the item measured (metadata only) so byte
+/// progress has a total; renames never reach this point.
+fn move_path_across_volumes(source: &Path, destination: &Path) -> Result<(), String> {
+    let Some(progress) = active_desktop_transfer_progress() else {
+        return move_path_via_staging(source, destination);
+    };
+    progress
+        .size_scans
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let (bytes_total, files_total) = transfer_tree_totals(source);
+    let copy = Arc::new(progress.begin_copy(source, bytes_total, files_total));
+    let byte_progress: Arc<dyn TransferByteProgress> = copy.clone();
+    let result = with_transfer_byte_progress(Some(byte_progress), || {
+        move_path_via_staging(source, destination)
+    });
+    copy.finish(result.is_ok());
+    result
+}
+
+/// Calls `on_file(len)` for every regular file below `path` using metadata only. Unreadable or
+/// unsupported entries are skipped; the copy step itself reports them.
+fn visit_transfer_tree_files(path: &Path, on_file: &mut dyn FnMut(u64)) {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if validate_transfer_metadata(path, &metadata).is_err() {
+        return;
+    }
+    if metadata.is_file() {
+        on_file(metadata.len());
+        return;
+    }
+    if !metadata.is_dir() {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        visit_transfer_tree_files(&entry.path(), on_file);
+    }
+}
+
+fn transfer_tree_totals(path: &Path) -> (u64, u64) {
+    let mut totals = (0u64, 0u64);
+    visit_transfer_tree_files(path, &mut |len| {
+        totals.0 = totals.0.saturating_add(len);
+        totals.1 += 1;
+    });
+    totals
+}
+
+/// Total bytes and files of the migration sources, read from metadata only.
+fn runtime_migration_source_totals(
+    pairs: &[(PathBuf, PathBuf)],
+    mut on_progress: impl FnMut(u64, u64),
+) -> (u64, u64) {
+    let mut totals = (0u64, 0u64);
+    for (source, target) in pairs {
+        if same_path_for_move(source, target) {
+            continue;
+        }
+        visit_transfer_tree_files(source, &mut |len| {
+            totals.0 = totals.0.saturating_add(len);
+            totals.1 += 1;
+            on_progress(totals.0, totals.1);
+        });
+    }
+    totals
+}
+
+fn format_migration_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
+}
+
+fn format_migration_count(count: u64) -> String {
+    let digits = count.to_string();
+    let mut output = String::new();
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            output.push(',');
+        }
+        output.push(ch);
+    }
+    output
+}
+
+/// Same wording as the settings page, used for the startup lifecycle overlay.
+fn runtime_migration_progress_message(payload: &RuntimeMigrationProgressPayload) -> String {
+    let amounts = format!(
+        "{} / {}（{} / {} 个文件）",
+        format_migration_bytes(payload.bytes_done),
+        format_migration_bytes(payload.bytes_total),
+        format_migration_count(payload.files_done),
+        format_migration_count(payload.files_total)
+    );
+    let mut message = match payload.phase.as_str() {
+        "scanning" => format!(
+            "正在统计迁移内容：{}，{} 个文件",
+            format_migration_bytes(payload.bytes_total),
+            format_migration_count(payload.files_total)
+        ),
+        "copying" => {
+            let mut text = format!("正在复制 {amounts}");
+            if payload.verified_bytes > 0 {
+                text.push_str(&format!(
+                    "，已核对 {}",
+                    format_migration_bytes(payload.verified_bytes)
+                ));
+            }
+            text
+        }
+        "moving" => "正在移动目录…".to_owned(),
+        "verifying" => format!("正在核对 {amounts}"),
+        "switching" => "正在切换到新目录".to_owned(),
+        "cleaning" => format!("正在清理旧目录 {amounts}"),
+        "done" => "目录迁移完成".to_owned(),
+        _ => "正在迁移目录".to_owned(),
+    };
+    if !payload.current.is_empty() && payload.phase != "done" {
+        message.push('：');
+        message.push_str(&payload.current);
+    }
+    if payload.phase != "done" {
+        message.push_str("。迁移中，请不要退出 DustDesk");
+    }
+    message
 }
 
 #[tauri::command]
@@ -2397,9 +4229,9 @@ fn merge_desktop_category_impl(app: &tauri::AppHandle, index: usize) -> Result<(
 }
 
 fn show_split_desktop_widgets(app: &tauri::AppHandle) -> Result<Vec<usize>, String> {
-    let store = AppStore::open().map_err(to_message)?;
-    store.ensure_runtime_dirs().map_err(to_message)?;
     let categories = with_config_mutation(|| {
+        let store = AppStore::open().map_err(to_message)?;
+        store.ensure_runtime_dirs().map_err(to_message)?;
         let mut config = store.load_config_strict().map_err(to_message)?;
         repair_category_item_paths(&store, &mut config)?;
         Ok(config.desktop_categories)
@@ -2438,6 +4270,7 @@ fn show_split_desktop_widgets(app: &tauri::AppHandle) -> Result<Vec<usize>, Stri
     }
 
     with_config_mutation(|| {
+        let store = AppStore::open().map_err(to_message)?;
         let mut config = store.load_config_strict().map_err(to_message)?;
         config.desktop_layout.split_category_indices =
             normalize_desktop_split_indices(split_indices.clone(), config.desktop_categories.len());
@@ -3030,6 +4863,7 @@ fn restore_desktop_organization_for_exit_core_with_progress(
                     .is_some_and(|path| valid_restart_desktop_path(&path, desktop))
         })
         .count();
+    report_desktop_transfer_progress(|progress| progress.begin(total, ""));
 
     for category_index in 0..marker.categories.len() {
         for item_index in 0..marker.categories[category_index].items.len() {
@@ -3211,6 +5045,7 @@ fn recollect_desktop_organization_from_restart_marker_core_with_progress(
         .iter()
         .map(|category| category.items.len())
         .sum();
+    report_desktop_transfer_progress(|progress| progress.begin(total, ""));
     let mut processed = 0usize;
     let mut claimed_category_indices = Vec::new();
 
@@ -3570,6 +5405,7 @@ fn restore_all_organized_items_to_desktop_impl(
             }
         };
         let total = restore_candidate_count(&config, &organizer_root, &desktop);
+        report_desktop_transfer_progress(|progress| progress.begin(total, ""));
         let mut seen_paths = Vec::<String>::new();
         let mut candidates = Vec::<RestoreCandidate>::new();
         let stored_icon_positions = config.desktop_icon_positions.clone();
@@ -3639,6 +5475,7 @@ fn restore_all_organized_items_to_desktop_impl(
         let worker_count = desktop_operation_worker_count(candidates.len());
         let queue = Arc::new(Mutex::new(VecDeque::from(candidates)));
         let (sender, receiver) = mpsc::channel();
+        let transfer_progress = active_desktop_transfer_progress();
         let mut restored = 0usize;
         let mut restored_icon_positions = Vec::<(PathBuf, DesktopIconPosition)>::new();
 
@@ -3647,6 +5484,7 @@ fn restore_all_organized_items_to_desktop_impl(
                 let queue = Arc::clone(&queue);
                 let sender = sender.clone();
                 let desktop = desktop.clone();
+                let transfer_progress = transfer_progress.clone();
                 scope.spawn(move || loop {
                     let candidate = match queue.lock() {
                         Ok(mut queue) => queue.pop_front(),
@@ -3658,7 +5496,9 @@ fn restore_all_organized_items_to_desktop_impl(
                     let Some(candidate) = candidate else {
                         return;
                     };
-                    let result = restore_path_to_desktop_silent(&candidate.source, &desktop);
+                    let result = with_desktop_transfer_progress(transfer_progress.clone(), || {
+                        restore_path_to_desktop_silent(&candidate.source, &desktop)
+                    });
                     if sender.send(Ok((candidate, result))).is_err() {
                         return;
                     }
@@ -4792,6 +6632,10 @@ fn launchers_with_optional_icons(
 }
 
 fn repair_launchers(store: &AppStore, launchers: &mut models::LaunchData) -> Result<(), String> {
+    if runtime_migration_journal_pending() {
+        // Load read-only until the migration is finished; see `runtime_migration_journal_pending`.
+        return Ok(());
+    }
     let repaired = launcher_items_from_directory(store, &launchers.items)?;
     if !same_launcher_items(&launchers.items, &repaired) {
         launchers.items = repaired;
@@ -5208,6 +7052,9 @@ fn copy_directory_contents_preserving_source(source: &Path, target: &Path) -> Re
         let target_path = target.join(entry.file_name());
         let source_metadata = fs::symlink_metadata(&source_path).map_err(to_message)?;
         validate_transfer_metadata(&source_path, &source_metadata)?;
+        report_runtime_migration_progress(|progress| {
+            progress.set_current(&entry.file_name().to_string_lossy())
+        });
 
         match fs::symlink_metadata(&target_path) {
             Ok(target_metadata) => {
@@ -5218,6 +7065,8 @@ fn copy_directory_contents_preserving_source(source: &Path, target: &Path) -> Re
                 }
                 let _source_lock = lock_transfer_source_tree(&source_path)?;
                 let _target_lock = lock_transfer_source_tree(&target_path)?;
+                // The single full comparison for an item that is already present (for example
+                // when an interrupted migration is resumed).
                 verify_copied_path(&source_path, &target_path).map_err(|_| {
                     format!(
                         "迁移目标存在不同内容，已保留源项目：{} -> {}",
@@ -5225,6 +7074,10 @@ fn copy_directory_contents_preserving_source(source: &Path, target: &Path) -> Re
                         target_path.display()
                     )
                 })?;
+                report_runtime_migration_progress(|progress| {
+                    let (bytes, files) = transfer_tree_totals(&source_path);
+                    progress.add_done(bytes, files);
+                });
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 copy_path_via_staging(&source_path, &target_path)?;
@@ -5271,12 +7124,77 @@ fn verify_directory_contents_contained(source: &Path, target: &Path) -> Result<(
             continue;
         }
 
+        report_runtime_migration_progress(|progress| {
+            progress.set_current(&entry.file_name().to_string_lossy())
+        });
         let _source_lock = lock_transfer_source_tree(&source_path)?;
-        let _target_lock = lock_transfer_source_tree(&target_path)?;
-        verify_copied_path(&source_path, &target_path)?;
+        let _target_lock = lock_runtime_migration_target(&target_path)?;
+        // New files were fully compared and new directory items structure checked before their
+        // commit, so a structure check (type, entry count, size, modified time) confirms nothing
+        // changed since.
+        verify_copied_path_shape_with(&source_path, &target_path, &mut |len| {
+            report_runtime_migration_progress(|progress| progress.add_done(len, 1));
+        })
+        .map_err(|error| format!("运行目录迁移校验失败，已保留源项目：{error}"))?;
     }
 
     Ok(())
+}
+
+/// Holds a migrated target item while it is checked, without reading its data. The handle asks for
+/// DELETE so its share mode is enforced: nobody can write, rename or delete the item until it is
+/// closed, while readers stay allowed. A data-access open of every freshly copied file would make
+/// real-time antivirus scan each one (about 20 ms per file measured), which dominated migrations
+/// of folders with many small files.
+#[cfg(windows)]
+fn lock_runtime_migration_target(path: &Path) -> Result<File, String> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ,
+    };
+
+    let file = fs::OpenOptions::new()
+        .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|error| format!("无法锁定迁移目标 {}：{error}", path.display()))?;
+    let metadata = file.metadata().map_err(to_message)?;
+    reject_transfer_reparse_point(path, &metadata)?;
+    Ok(file)
+}
+
+#[cfg(not(windows))]
+fn lock_runtime_migration_target(path: &Path) -> Result<File, String> {
+    let metadata = fs::symlink_metadata(path).map_err(to_message)?;
+    reject_transfer_reparse_point(path, &metadata)?;
+    File::open(path).map_err(to_message)
+}
+
+/// `remove_dir` only, so a folder that still has content is never removed. Windows refuses to
+/// remove a read-only folder (common for customized folders with desktop.ini), so after an access
+/// error on an empty read-only folder its read-only attribute is cleared and removal retried.
+fn remove_empty_migrated_directory(path: &Path) -> io::Result<()> {
+    let error = match fs::remove_dir(path) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    if error.kind() != io::ErrorKind::PermissionDenied {
+        return Err(error);
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_dir()
+        || metadata_is_reparse_point(&metadata)
+        || !metadata.permissions().readonly()
+        || fs::read_dir(path)?.next().is_some()
+    {
+        return Err(error);
+    }
+    let mut permissions = metadata.permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    fs::set_permissions(path, permissions)?;
+    fs::remove_dir(path)
 }
 
 fn remove_verified_directory_contents(source: &Path, target: &Path) -> Result<(), String> {
@@ -5307,13 +7225,24 @@ fn remove_verified_directory_contents(source: &Path, target: &Path) -> Result<()
             continue;
         }
 
+        report_runtime_migration_progress(|progress| {
+            progress.set_current(&entry.file_name().to_string_lossy())
+        });
         let locked_source = lock_transfer_source_tree(&source_path)?;
-        let _locked_target = lock_transfer_source_tree(&target_path)?;
-        verify_copied_path(&source_path, &target_path)?;
+        let _locked_target = lock_runtime_migration_target(&target_path)?;
+        // Fast structure check before deleting: the target must exist with the same type, entry
+        // counts, sizes and modified times; otherwise the source is kept.
+        let mut removed = (0u64, 0u64);
+        verify_copied_path_shape_with(&source_path, &target_path, &mut |len| {
+            removed.0 = removed.0.saturating_add(len);
+            removed.1 += 1;
+        })
+        .map_err(|error| format!("新目录中的项目与旧目录不一致，已保留旧项目：{error}"))?;
         delete_locked_source_tree(locked_source)?;
+        report_runtime_migration_progress(|progress| progress.add_done(removed.0, removed.1));
     }
 
-    match fs::remove_dir(source) {
+    match remove_empty_migrated_directory(source) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(format!(
@@ -6174,11 +8103,35 @@ fn repair_category_item_paths_for_desktop(
     repair_category_item_paths_with_desktop_roots(store, config, &[desktop.to_path_buf()])
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_RUNTIME_MIGRATION_PENDING: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// True while `runtime-migration.json` exists. Must be called under the storage lock. Paths may
+/// then point at a root whose data already moved (an interrupted rename), so snapshot repairs must
+/// not drop "missing" paths. An unreadable journal location counts as pending.
+fn runtime_migration_journal_pending() -> bool {
+    #[cfg(test)]
+    {
+        TEST_RUNTIME_MIGRATION_PENDING.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        !matches!(AppStore::load_runtime_migration_journal(), Ok(None))
+    }
+}
+
 fn repair_category_item_paths_with_desktop_roots(
     store: &AppStore,
     config: &mut AppConfig,
     desktop_roots: &[PathBuf],
 ) -> Result<(), String> {
+    if runtime_migration_journal_pending() {
+        // Load read-only until the migration is finished.
+        return Ok(());
+    }
     let organizer_root = store.organizer_root();
     let mut changed = recover_missing_categories_from_organizer(&organizer_root, config);
     let mut seen_paths = Vec::<String>::new();
@@ -6459,8 +8412,54 @@ fn unique_destination(destination_dir: &Path, source: &Path) -> PathBuf {
 }
 
 fn move_path(source: &Path, destination: &Path) -> Result<(), String> {
+    let started = Instant::now();
+    let result = move_path_with_mode(source, destination);
+    match &result {
+        Ok(mode) => append_desktop_diagnostic(
+            "move_path_finished",
+            &format!(
+                "mode={} elapsed_ms={} source=\"{}\" destination=\"{}\"",
+                mode.as_str(),
+                started.elapsed().as_millis(),
+                diagnostic_value(&source.display().to_string()),
+                diagnostic_value(&destination.display().to_string())
+            ),
+        ),
+        Err(error) => append_desktop_diagnostic(
+            "move_path_failed",
+            &format!(
+                "elapsed_ms={} source=\"{}\" destination=\"{}\" error=\"{}\"",
+                started.elapsed().as_millis(),
+                diagnostic_value(&source.display().to_string()),
+                diagnostic_value(&destination.display().to_string()),
+                diagnostic_value(error)
+            ),
+        ),
+    }
+    result.map(|_| ())
+}
+
+#[derive(Clone, Copy)]
+enum MovePathMode {
+    /// Source and destination already name the same item.
+    Unchanged,
+    Rename,
+    Copy,
+}
+
+impl MovePathMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unchanged => "none",
+            Self::Rename => "rename",
+            Self::Copy => "copy",
+        }
+    }
+}
+
+fn move_path_with_mode(source: &Path, destination: &Path) -> Result<MovePathMode, String> {
     if same_path_for_move(source, destination) {
-        return Ok(());
+        return Ok(MovePathMode::Unchanged);
     }
     if !source.exists() {
         return Err(format!("源项目不存在：{}", source.display()));
@@ -6475,16 +8474,179 @@ fn move_path(source: &Path, destination: &Path) -> Result<(), String> {
     if destination.exists() {
         return Err(format!("目标项目已存在：{}", destination.display()));
     }
-    validate_transfer_source_tree(source)?;
+    // A same-volume rename keeps every byte, EA and named stream, so it only needs the cheap
+    // link checks; the full metadata/ADS walk is reserved for the cross-volume copy below.
+    validate_move_source_reparse_points(source)?;
 
-    if rename_path_no_replace(source, destination).is_ok() {
-        return Ok(());
-    }
+    let rename_error = match rename_path_no_replace_for_move(source, destination) {
+        Ok(()) => return Ok(MovePathMode::Rename),
+        Err(MoveRenameError::Rejected(message)) => return Err(message),
+        Err(MoveRenameError::Os(error)) => error,
+    };
     if destination.exists() {
         return Err(format!("目标项目已存在：{}", destination.display()));
     }
+    match classify_move_rename_error(rename_error.raw_os_error()) {
+        // Only a cross-volume move pays for the full metadata walk and verified staging copy.
+        MoveRenameFailure::CrossVolume => {
+            validate_transfer_source_tree(source)?;
+            move_path_across_volumes(source, destination)?;
+            Ok(MovePathMode::Copy)
+        }
+        // Same-volume failures below never fall back to copying.
+        MoveRenameFailure::InUse => Err(format!(
+            "项目或其中的文件正被其它程序占用，请关闭相关程序后重试：{}（{rename_error}）",
+            source.display()
+        )),
+        MoveRenameFailure::AccessDenied => Err(format!(
+            "无法移动：项目或其中的文件正被其它程序占用，或当前权限不足（公共桌面的项目需要以管理员身份运行 DustDesk）：{}（{rename_error}）",
+            source.display()
+        )),
+        MoveRenameFailure::DestinationExists => {
+            Err(format!("目标项目已存在：{}", destination.display()))
+        }
+        MoveRenameFailure::Other => Err(format!(
+            "移动项目失败：{} -> {}：{rename_error}",
+            source.display(),
+            destination.display()
+        )),
+    }
+}
 
-    move_path_via_staging(source, destination)
+/// Cheap pre-rename check for `move_path`: rejects symlinks and junctions at the top level and
+/// anywhere inside a directory. Nested entries are judged by the attributes that directory
+/// enumeration already returned (FindNextFileW on Windows), so no entry is opened individually.
+fn validate_move_source_reparse_points(source: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(source).map_err(to_message)?;
+    validate_move_source_entry(source, &metadata)?;
+    let mut pending = Vec::new();
+    if metadata.is_dir() {
+        pending.push(source.to_path_buf());
+    }
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory).map_err(to_message)? {
+            let entry = entry.map_err(to_message)?;
+            // On Windows DirEntry::metadata comes from the enumeration record without a syscall.
+            let metadata = entry.metadata().map_err(to_message)?;
+            let path = entry.path();
+            validate_move_source_entry(&path, &metadata)?;
+            if metadata.is_dir() {
+                pending.push(path);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_move_source_entry(path: &Path, metadata: &fs::Metadata) -> Result<(), String> {
+    reject_transfer_reparse_point(path, metadata)?;
+    if !metadata.is_dir() && !metadata.is_file() {
+        return Err(format!("不支持移动此项目：{}", path.display()));
+    }
+    Ok(())
+}
+
+enum MoveRenameError {
+    /// The source failed the link/type checks; the message is final.
+    Rejected(String),
+    /// Opening or renaming failed; keeps the OS error code for cross-volume detection.
+    Os(io::Error),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MoveRenameFailure {
+    /// Only this case may fall back to the verified staging copy.
+    CrossVolume,
+    /// ERROR_SHARING_VIOLATION: the item or something inside it is open in another program.
+    InUse,
+    /// ERROR_ACCESS_DENIED: a handle inside a directory blocks the rename, or the user lacks
+    /// delete permission (for example Public Desktop items without elevation).
+    AccessDenied,
+    DestinationExists,
+    Other,
+}
+
+#[cfg(windows)]
+fn classify_move_rename_error(raw_os_error: Option<i32>) -> MoveRenameFailure {
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_NOT_SAME_DEVICE,
+        ERROR_SHARING_VIOLATION,
+    };
+
+    match raw_os_error.and_then(|code| u32::try_from(code).ok()) {
+        Some(ERROR_NOT_SAME_DEVICE) => MoveRenameFailure::CrossVolume,
+        Some(ERROR_SHARING_VIOLATION) => MoveRenameFailure::InUse,
+        Some(ERROR_ACCESS_DENIED) => MoveRenameFailure::AccessDenied,
+        Some(ERROR_ALREADY_EXISTS | ERROR_FILE_EXISTS) => MoveRenameFailure::DestinationExists,
+        _ => MoveRenameFailure::Other,
+    }
+}
+
+#[cfg(not(windows))]
+fn classify_move_rename_error(raw_os_error: Option<i32>) -> MoveRenameFailure {
+    const EXDEV: i32 = 18;
+
+    if raw_os_error == Some(EXDEV) {
+        MoveRenameFailure::CrossVolume
+    } else {
+        MoveRenameFailure::Other
+    }
+}
+
+/// Lightweight `rename_path_no_replace` for `move_path`: only rejects reparse points, checked on
+/// the exact handle being renamed. EA and named-stream checks only matter when copying.
+#[cfg(windows)]
+fn rename_path_no_replace_for_move(
+    source: &Path,
+    destination: &Path,
+) -> Result<(), MoveRenameError> {
+    let metadata = fs::symlink_metadata(source).map_err(MoveRenameError::Os)?;
+    reject_transfer_reparse_point(source, &metadata).map_err(MoveRenameError::Rejected)?;
+    let source_handle = if metadata.is_dir() {
+        open_move_source_directory(source)
+    } else if metadata.is_file() {
+        open_reserved_transfer_file(source)
+    } else {
+        return Err(MoveRenameError::Rejected(format!(
+            "不支持移动此项目：{}",
+            source.display()
+        )));
+    }
+    .map_err(MoveRenameError::Os)?;
+    let opened = source_handle.metadata().map_err(MoveRenameError::Os)?;
+    reject_transfer_reparse_point(source, &opened).map_err(MoveRenameError::Rejected)?;
+    rename_handle_no_replace(&source_handle, destination).map_err(MoveRenameError::Os)
+}
+
+#[cfg(not(windows))]
+fn rename_path_no_replace_for_move(
+    source: &Path,
+    destination: &Path,
+) -> Result<(), MoveRenameError> {
+    let metadata = fs::symlink_metadata(source).map_err(MoveRenameError::Os)?;
+    reject_transfer_reparse_point(source, &metadata).map_err(MoveRenameError::Rejected)?;
+    if destination.exists() {
+        return Err(MoveRenameError::Os(io::ErrorKind::AlreadyExists.into()));
+    }
+    fs::rename(source, destination).map_err(MoveRenameError::Os)
+}
+
+/// Same handle access and sharing as `open_reserved_transfer_directory`, without its EA/ADS checks.
+#[cfg(windows)]
+fn open_move_source_directory(path: &Path) -> io::Result<File> {
+    use windows_sys::Win32::{
+        Foundation::GENERIC_READ,
+        Storage::FileSystem::{
+            DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+            FILE_SHARE_WRITE,
+        },
+    };
+
+    fs::OpenOptions::new()
+        .access_mode(GENERIC_READ | DELETE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
 }
 
 fn move_path_via_staging(source: &Path, destination: &Path) -> Result<(), String> {
@@ -6504,8 +8666,32 @@ fn move_path_via_staging_with_verifier(
     transfer_path_via_staging_with_verifier(source, destination, true, verifier)
 }
 
+/// Copy for runtime migrations, keeping the source. Files are fully compared before the staging
+/// commit; directories only get the structure check (type, entry counts, sizes, modified times)
+/// that every staging commit runs, like `move_path_via_staging`. A checked directory's bytes count
+/// as verified.
 fn copy_path_via_staging(source: &Path, destination: &Path) -> Result<(), String> {
-    transfer_path_via_staging_with_verifier(source, destination, false, verify_copied_path)
+    let source_is_dir = fs::symlink_metadata(source)
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false);
+    if !source_is_dir {
+        return transfer_path_via_staging_with_verifier(
+            source,
+            destination,
+            false,
+            verify_copied_path,
+        );
+    }
+    let progress = active_transfer_byte_progress();
+    let bytes_before = progress
+        .as_ref()
+        .map_or(0, |progress| progress.done_counters().0);
+    transfer_path_via_staging_with_verifier(source, destination, false, |_, _| Ok(()))?;
+    if let Some(progress) = progress {
+        let copied = progress.done_counters().0.saturating_sub(bytes_before);
+        progress.add_verified(copied);
+    }
+    Ok(())
 }
 
 fn transfer_path_via_staging_with_verifier(
@@ -7376,13 +9562,18 @@ fn validate_transfer_source_tree(path: &Path) -> Result<(), String> {
 }
 
 fn validate_transfer_metadata(path: &Path, metadata: &fs::Metadata) -> Result<(), String> {
+    reject_transfer_reparse_point(path, metadata)?;
+    validate_windows_extended_metadata(path, metadata)?;
+    Ok(())
+}
+
+fn reject_transfer_reparse_point(path: &Path, metadata: &fs::Metadata) -> Result<(), String> {
     if metadata.file_type().is_symlink() || metadata_is_reparse_point(metadata) {
         return Err(format!(
             "为避免误操作链接目标，不能移动符号链接或目录联接：{}",
             path.display()
         ));
     }
-    validate_windows_extended_metadata(path, metadata)?;
     Ok(())
 }
 
@@ -7589,6 +9780,11 @@ fn commit_staging_handle_no_replace(
     _staging: &Path,
     destination: &Path,
 ) -> Result<(), String> {
+    rename_handle_no_replace(root, destination).map_err(to_message)
+}
+
+#[cfg(windows)]
+fn rename_handle_no_replace(handle: &File, destination: &Path) -> io::Result<()> {
     use std::{mem::offset_of, ptr::null_mut};
     use windows_sys::Win32::Storage::FileSystem::{
         FileRenameInfoEx, SetFileInformationByHandle, FILE_RENAME_INFO,
@@ -7597,11 +9793,11 @@ fn commit_staging_handle_no_replace(
     let name_bytes = name
         .len()
         .checked_mul(std::mem::size_of::<u16>())
-        .ok_or_else(|| "目标路径过长".to_owned())?;
+        .ok_or_else(|| io::Error::other("目标路径过长"))?;
     let buffer_bytes = offset_of!(FILE_RENAME_INFO, FileName)
         .checked_add(name_bytes)
         .and_then(|length| length.checked_add(std::mem::size_of::<u16>()))
-        .ok_or_else(|| "目标路径过长".to_owned())?;
+        .ok_or_else(|| io::Error::other("目标路径过长"))?;
     name.push(0);
     let mut buffer = vec![0usize; buffer_bytes.div_ceil(std::mem::size_of::<usize>())];
     let information = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
@@ -7616,13 +9812,13 @@ fn commit_staging_handle_no_replace(
             name.len(),
         );
         if SetFileInformationByHandle(
-            root.as_raw_handle() as _,
+            handle.as_raw_handle() as _,
             FileRenameInfoEx,
             information.cast(),
             buffer_bytes as u32,
         ) == 0
         {
-            return Err(io::Error::last_os_error().to_string());
+            return Err(io::Error::last_os_error());
         }
     }
     Ok(())
@@ -7711,6 +9907,16 @@ fn delete_locked_source_tree(locked: LockedSourceTree) -> Result<(), String> {
 }
 
 fn verify_copied_path_shape(source: &Path, destination: &Path) -> Result<(), String> {
+    verify_copied_path_shape_with(source, destination, &mut |_| {})
+}
+
+/// Fast structure check: same type, entry counts, file sizes and modified times. Calls
+/// `on_file(len)` after each matching file.
+fn verify_copied_path_shape_with(
+    source: &Path,
+    destination: &Path,
+    on_file: &mut dyn FnMut(u64),
+) -> Result<(), String> {
     let source_metadata = fs::symlink_metadata(source).map_err(to_message)?;
     let destination_metadata = fs::symlink_metadata(destination).map_err(to_message)?;
     validate_transfer_metadata(source, &source_metadata)?;
@@ -7728,9 +9934,14 @@ fn verify_copied_path_shape(source: &Path, destination: &Path) -> Result<(), Str
             }
             _ => false,
         };
-        return (source_metadata.len() == destination_metadata.len() && modified_matches)
-            .then_some(())
-            .ok_or_else(|| format!("迁移校验失败：文件大小或时间不一致 {}", source.display()));
+        if source_metadata.len() != destination_metadata.len() || !modified_matches {
+            return Err(format!(
+                "迁移校验失败：文件大小或时间不一致 {}",
+                source.display()
+            ));
+        }
+        on_file(source_metadata.len());
+        return Ok(());
     }
 
     let source_entries = fs::read_dir(source)
@@ -7751,7 +9962,11 @@ fn verify_copied_path_shape(source: &Path, destination: &Path) -> Result<(), Str
         ));
     }
     for entry in source_entries {
-        verify_copied_path_shape(&entry.path(), &destination.join(entry.file_name()))?;
+        verify_copied_path_shape_with(
+            &entry.path(),
+            &destination.join(entry.file_name()),
+            on_file,
+        )?;
     }
     Ok(())
 }
@@ -7788,8 +10003,10 @@ fn verify_copied_path(source: &Path, destination: &Path) -> Result<(), String> {
         return Ok(());
     }
 
+    #[cfg(test)]
+    record_full_content_comparison(source);
     if source_metadata.len() != destination_metadata.len()
-        || !files_have_same_contents(source, destination)?
+        || !compare_file_contents(source, destination, true)?
         || !named_streams_have_same_contents(source, destination)?
     {
         return Err(format!("迁移校验失败：文件内容不一致 {}", source.display()));
@@ -7921,22 +10138,66 @@ fn path_with_windows_stream(path: &Path, stream: &str) -> PathBuf {
     PathBuf::from(value)
 }
 
+#[cfg(test)]
+thread_local! {
+    static FULL_CONTENT_COMPARISONS: std::cell::RefCell<BTreeMap<PathBuf, usize>> =
+        const { std::cell::RefCell::new(BTreeMap::new()) };
+}
+
+#[cfg(test)]
+fn record_full_content_comparison(source: &Path) {
+    FULL_CONTENT_COMPARISONS.with(|counts| {
+        *counts.borrow_mut().entry(source.to_path_buf()).or_default() += 1;
+    });
+}
+
+#[cfg(test)]
+fn take_full_content_comparisons() -> BTreeMap<PathBuf, usize> {
+    FULL_CONTENT_COMPARISONS.with(|counts| std::mem::take(&mut *counts.borrow_mut()))
+}
+
 fn files_have_same_contents(left: &Path, right: &Path) -> Result<bool, String> {
-    let mut left = BufReader::new(File::open(left).map_err(to_message)?);
-    let mut right = BufReader::new(File::open(right).map_err(to_message)?);
-    let mut left_buffer = [0u8; 64 * 1024];
-    let mut right_buffer = [0u8; 64 * 1024];
+    compare_file_contents(left, right, false)
+}
+
+/// Byte-for-byte comparison with large buffers. With `report_progress`, compared bytes advance the
+/// active migration's verified counter.
+fn compare_file_contents(left: &Path, right: &Path, report_progress: bool) -> Result<bool, String> {
+    let mut left = File::open(left).map_err(to_message)?;
+    let mut right = File::open(right).map_err(to_message)?;
+    let mut left_buffer = vec![0u8; CONTENT_COMPARE_BUFFER_BYTES];
+    let mut right_buffer = vec![0u8; CONTENT_COMPARE_BUFFER_BYTES];
+    let progress = report_progress
+        .then(active_transfer_byte_progress)
+        .flatten();
 
     loop {
-        let left_read = left.read(&mut left_buffer).map_err(to_message)?;
-        let right_read = right.read(&mut right_buffer).map_err(to_message)?;
+        let left_read = read_full_buffer(&mut left, &mut left_buffer).map_err(to_message)?;
+        let right_read = read_full_buffer(&mut right, &mut right_buffer).map_err(to_message)?;
         if left_read != right_read || left_buffer[..left_read] != right_buffer[..right_read] {
             return Ok(false);
         }
         if left_read == 0 {
             return Ok(true);
         }
+        if let Some(progress) = &progress {
+            progress.add_verified(left_read as u64);
+        }
     }
+}
+
+/// Reads until the buffer is full or the end of the file, so short reads never cause a mismatch.
+fn read_full_buffer(reader: &mut impl Read, buffer: &mut [u8]) -> io::Result<usize> {
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match reader.read(&mut buffer[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(filled)
 }
 
 fn remove_existing_path(path: &Path) -> Result<(), String> {
@@ -7997,7 +10258,16 @@ fn try_copy_directory_with_robocopy(source: &Path, destination: &Path) -> Result
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     let started = Instant::now();
-    let status = Command::new("robocopy.exe")
+    let progress = active_transfer_byte_progress();
+    // Robocopy reports nothing back; the staging folder is measured at a low rate instead.
+    let progress_base = progress.as_deref().map(|progress| {
+        let (bytes_done, files_done) = progress.done_counters();
+        let (item_bytes, item_files) = progress
+            .item_totals()
+            .unwrap_or_else(|| transfer_tree_totals(source));
+        (bytes_done, files_done, item_bytes, item_files)
+    });
+    let child = Command::new("robocopy.exe")
         .arg(source)
         .arg(destination)
         .args([
@@ -8017,13 +10287,49 @@ fn try_copy_directory_with_robocopy(source: &Path, destination: &Path) -> Result
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .creation_flags(CREATE_NO_WINDOW)
-        .status();
+        .spawn();
 
-    let status = match status {
-        Ok(status) => status,
+    let mut child = match child {
+        Ok(child) => child,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(format!("启动 Windows 多线程目录复制失败：{error}")),
     };
+    let mut next_measure = Instant::now() + RUNTIME_MIGRATION_ROBOCOPY_POLL_INTERVAL;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("Windows robocopy wait failed: {error}"));
+            }
+        }
+        if let (Some(progress), Some((bytes_base, files_base, item_bytes, item_files))) =
+            (progress.as_deref(), progress_base)
+        {
+            if Instant::now() >= next_measure {
+                let measure_started = Instant::now();
+                let (staged_bytes, staged_files) = transfer_tree_totals(destination);
+                progress.raise_done_to(
+                    bytes_base + staged_bytes.min(item_bytes),
+                    files_base + staged_files.min(item_files),
+                );
+                // Keep measuring cheap relative to the copy on huge folders.
+                next_measure = Instant::now()
+                    + RUNTIME_MIGRATION_ROBOCOPY_POLL_INTERVAL
+                        .max(measure_started.elapsed().saturating_mul(4));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    if let (Some(progress), Some((bytes_base, files_base, item_bytes, item_files))) =
+        (progress.as_deref(), progress_base)
+    {
+        if matches!(status.code(), Some(code) if (0..4).contains(&code)) {
+            progress.raise_done_to(bytes_base + item_bytes, files_base + item_files);
+        }
+    }
     eprintln!(
         "[desktop-transfer] robocopy elapsed_ms={} exit_code={:?} source={} destination={}",
         started.elapsed().as_millis(),
@@ -8066,6 +10372,41 @@ fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), String> {
 }
 
 #[cfg(windows)]
+struct CopyFileProgressContext<'a> {
+    progress: &'a dyn TransferByteProgress,
+    file_len: u64,
+    reported: u64,
+}
+
+/// `CopyFile2` progress callback; runs synchronously on the copying thread.
+#[cfg(windows)]
+unsafe extern "system" fn copy_file_progress_routine(
+    message: *const windows_sys::Win32::Storage::FileSystem::COPYFILE2_MESSAGE,
+    context: *const std::ffi::c_void,
+) -> windows_sys::Win32::Storage::FileSystem::COPYFILE2_MESSAGE_ACTION {
+    use windows_sys::Win32::Storage::FileSystem::{
+        COPYFILE2_CALLBACK_CHUNK_FINISHED, COPYFILE2_PROGRESS_CONTINUE,
+    };
+
+    if message.is_null() || context.is_null() {
+        return COPYFILE2_PROGRESS_CONTINUE;
+    }
+    let message = unsafe { &*message };
+    if message.Type == COPYFILE2_CALLBACK_CHUNK_FINISHED {
+        let context = unsafe { &mut *(context as *mut CopyFileProgressContext) };
+        // Named streams can push the total past the file length; the remainder is settled after
+        // the copy returns.
+        let transferred =
+            unsafe { message.Info.ChunkFinished.uliTotalBytesTransferred }.min(context.file_len);
+        if transferred > context.reported {
+            context.progress.add_done(transferred - context.reported, 0);
+            context.reported = transferred;
+        }
+    }
+    COPYFILE2_PROGRESS_CONTINUE
+}
+
+#[cfg(windows)]
 fn copy_file_contents(source: &Path, destination: &Path) -> Result<(), String> {
     use std::mem::size_of;
     use windows_sys::Win32::Storage::FileSystem::{
@@ -8093,7 +10434,24 @@ fn copy_file_contents(source: &Path, destination: &Path) -> Result<(), String> {
     let mut parameters = COPYFILE2_EXTENDED_PARAMETERS::default();
     parameters.dwSize = size_of::<COPYFILE2_EXTENDED_PARAMETERS>() as u32;
     parameters.dwCopyFlags = COPY_FILE_FAIL_IF_EXISTS;
+    let progress = active_transfer_byte_progress();
+    let mut progress_context = progress.as_deref().map(|progress| CopyFileProgressContext {
+        progress,
+        file_len: metadata.len(),
+        reported: 0,
+    });
+    if let Some(context) = progress_context.as_mut() {
+        parameters.pProgressRoutine = Some(copy_file_progress_routine);
+        parameters.pvCallbackContext = (context as *mut CopyFileProgressContext).cast();
+    }
     let result = unsafe { CopyFile2(source_wide.as_ptr(), destination_wide.as_ptr(), &parameters) };
+    if result >= 0 {
+        if let Some(context) = progress_context.as_mut() {
+            let remaining = context.file_len.saturating_sub(context.reported);
+            context.reported = context.file_len;
+            context.progress.add_done(remaining, 1);
+        }
+    }
     if result < 0 {
         return Err(format!("CopyFile2 失败：HRESULT 0x{:08X}", result as u32));
     }
@@ -8123,6 +10481,7 @@ fn copy_file_contents(source: &Path, destination: &Path) -> Result<(), String> {
         .map_err(to_message)?;
     io::copy(&mut source_file, &mut destination_file).map_err(to_message)?;
     destination_file.sync_all().map_err(to_message)?;
+    report_transfer_byte_progress(|progress| progress.add_done(metadata.len(), 1));
     copy_file_basic_metadata(source, &destination_file)
 }
 
@@ -9702,6 +12061,125 @@ mod tests {
     }
 
     #[test]
+    fn organizer_directory_volume_check_reports_drive_and_treats_unknown_as_same_volume() {
+        assert_eq!(
+            organizer_directory_volume_check(Some(false), Some(Path::new(r"C:\"))),
+            OrganizerDirectoryVolumeCheck {
+                same_volume_as_desktop: false,
+                desktop_drive: "C:".to_owned(),
+            }
+        );
+        assert_eq!(
+            organizer_directory_volume_check(Some(true), Some(Path::new(r"D:\"))),
+            OrganizerDirectoryVolumeCheck {
+                same_volume_as_desktop: true,
+                desktop_drive: "D:".to_owned(),
+            }
+        );
+        assert_eq!(
+            organizer_directory_volume_check(None, None),
+            OrganizerDirectoryVolumeCheck {
+                same_volume_as_desktop: true,
+                desktop_drive: String::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn restart_marker_rewrite_moves_only_old_organizer_sources_and_is_idempotent() {
+        let old_root = PathBuf::from(r"D:\Software\DustDesk\DesktopOrganizer");
+        let new_root = PathBuf::from(r"C:\Users\me\AppData\Local\DustDesk\DesktopOrganizer");
+        let persistence = MemoryRestartPersistence::with_marker(DesktopOrganizationRestartMarker {
+            schema_version: DESKTOP_ORGANIZATION_RESTART_SCHEMA_VERSION,
+            categories: vec![RestartCategoryMarker {
+                category_name: "文档".to_owned(),
+                category_index: Some(0),
+                items: vec![
+                    RestartItemMarker {
+                        source_path: r"d:\software\dustdesk\desktoporganizer\docs\report.docx"
+                            .to_owned(),
+                        desktop_path: Some(r"C:\Users\me\Desktop\report.docx".to_owned()),
+                        desktop_icon_position: None,
+                    },
+                    RestartItemMarker {
+                        source_path: r"D:\Software\DustDesk\DesktopOrganizerOld\notes.txt"
+                            .to_owned(),
+                        desktop_path: None,
+                        desktop_icon_position: None,
+                    },
+                    RestartItemMarker {
+                        source_path: r"E:\Elsewhere\plan.txt".to_owned(),
+                        desktop_path: None,
+                        desktop_icon_position: None,
+                    },
+                ],
+            }],
+        });
+
+        rewrite_restart_marker_path_prefixes(&persistence, &[(&old_root, &new_root)])
+            .expect("rewrite restart marker");
+
+        let rewritten = persistence.current().expect("rewritten marker");
+        let items = &rewritten.categories[0].items;
+        assert!(same_path_text(
+            &items[0].source_path,
+            r"C:\Users\me\AppData\Local\DustDesk\DesktopOrganizer\docs\report.docx"
+        ));
+        assert_eq!(
+            items[0].desktop_path.as_deref(),
+            Some(r"C:\Users\me\Desktop\report.docx")
+        );
+        assert_eq!(
+            items[1].source_path,
+            r"D:\Software\DustDesk\DesktopOrganizerOld\notes.txt"
+        );
+        assert_eq!(items[2].source_path, r"E:\Elsewhere\plan.txt");
+        assert_eq!(persistence.save_calls.get(), 1);
+
+        rewrite_restart_marker_path_prefixes(&persistence, &[(&old_root, &new_root)])
+            .expect("repeat restart marker rewrite");
+
+        assert_eq!(persistence.current(), Some(rewritten));
+        assert_eq!(
+            persistence.save_calls.get(),
+            1,
+            "an already rewritten marker must not be saved again"
+        );
+    }
+
+    #[test]
+    fn restart_marker_rewrite_skips_missing_markers_and_unchanged_roots() {
+        let root = PathBuf::from(r"D:\Software\DustDesk\DesktopOrganizer");
+        let marker = DesktopOrganizationRestartMarker {
+            schema_version: DESKTOP_ORGANIZATION_RESTART_SCHEMA_VERSION,
+            categories: vec![RestartCategoryMarker {
+                category_name: "docs".to_owned(),
+                category_index: None,
+                items: vec![RestartItemMarker {
+                    source_path: root.join("docs").join("a.txt").display().to_string(),
+                    desktop_path: None,
+                    desktop_icon_position: None,
+                }],
+            }],
+        };
+        let unchanged = MemoryRestartPersistence::with_marker(marker.clone());
+        let missing = MemoryRestartPersistence::default();
+
+        rewrite_restart_marker_path_prefixes(&unchanged, &[(&root, &root)])
+            .expect("same root rewrite");
+        rewrite_restart_marker_path_prefixes(
+            &missing,
+            &[(&root, &PathBuf::from(r"C:\DustDesk\DesktopOrganizer"))],
+        )
+        .expect("missing marker rewrite");
+
+        assert_eq!(unchanged.current(), Some(marker));
+        assert_eq!(unchanged.save_calls.get(), 0);
+        assert!(missing.current().is_none());
+        assert_eq!(missing.save_calls.get(), 0);
+    }
+
+    #[test]
     fn startup_without_restart_marker_never_recollects_desktop_reference() {
         let root = unique_test_dir("dustdesk-no-restart-marker");
         let (store, organizer, desktop) = lifecycle_test_store(&root);
@@ -10792,6 +13270,150 @@ mod tests {
         fs::remove_dir(&nested_link).expect("remove nested reparse point");
         fs::remove_dir(&top_level_link).expect("remove top-level reparse point");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn same_volume_move_renames_large_directory_and_keeps_file_identity() {
+        let root = unique_test_dir("dustdesk-same-volume-rename");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        for group in 0..30 {
+            let directory = source.join(format!("group-{group:02}"));
+            fs::create_dir_all(&directory).expect("create source group");
+            for index in 0..100 {
+                fs::write(
+                    directory.join(format!("file-{index:03}.txt")),
+                    format!("{group}-{index}"),
+                )
+                .expect("write source file");
+            }
+        }
+        let tracked = Path::new("group-17").join("file-042.txt");
+        let identity_before = test_file_identity(&source.join(&tracked));
+
+        move_path(&source, &destination).expect("same-volume move");
+
+        assert!(!source.exists());
+        assert_eq!(
+            test_file_identity(&destination.join(&tracked)),
+            identity_before,
+            "an in-volume rename keeps the volume serial number and file index"
+        );
+        assert_eq!(
+            fs::read(destination.join(&tracked)).expect("read moved file"),
+            b"17-42"
+        );
+        let moved_files = fs::read_dir(&destination)
+            .expect("read destination")
+            .map(|group| {
+                fs::read_dir(group.expect("read group entry").path())
+                    .expect("read group")
+                    .count()
+            })
+            .sum::<usize>();
+        assert_eq!(moved_files, 3000);
+        assert!(
+            fs::read_dir(&root)
+                .expect("read test root")
+                .all(|entry| !is_internal_transfer_path(&entry.expect("read entry").path())),
+            "a rename must not create transfer staging"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn same_volume_move_reports_busy_item_without_copy_fallback() {
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+        let root = unique_test_dir("dustdesk-same-volume-busy");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        let busy_path = source.join("nested").join("busy.txt");
+        fs::create_dir_all(source.join("nested")).expect("create source tree");
+        fs::write(&busy_path, b"busy data").expect("write busy file");
+        fs::write(source.join("other.txt"), b"other data").expect("write other file");
+
+        // A handle without FILE_SHARE_DELETE inside the directory blocks renaming the directory.
+        let busy = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&busy_path)
+            .expect("hold busy file");
+        let error = move_path(&source, &destination).expect_err("busy same-volume move must fail");
+        drop(busy);
+
+        // NTFS reports ERROR_ACCESS_DENIED for this rename. Only the direct rename-failure
+        // branch produces this message; the staging copy would fail with a different error.
+        assert!(
+            error.contains("正被其它程序占用"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            fs::read(&busy_path).expect("busy file remains"),
+            b"busy data"
+        );
+        assert_eq!(
+            fs::read(source.join("other.txt")).expect("other file remains"),
+            b"other data"
+        );
+        assert!(!destination.exists());
+        assert!(
+            fs::read_dir(&root)
+                .expect("read test root")
+                .all(|entry| !is_internal_transfer_path(&entry.expect("read entry").path())),
+            "a failed rename must not leave transfer staging"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn only_cross_volume_rename_errors_fall_back_to_copy() {
+        assert_eq!(
+            classify_move_rename_error(Some(17)),
+            MoveRenameFailure::CrossVolume
+        );
+        assert_eq!(
+            classify_move_rename_error(Some(5)),
+            MoveRenameFailure::AccessDenied
+        );
+        assert_eq!(
+            classify_move_rename_error(Some(32)),
+            MoveRenameFailure::InUse
+        );
+        assert_eq!(
+            classify_move_rename_error(Some(183)),
+            MoveRenameFailure::DestinationExists
+        );
+        assert_eq!(
+            classify_move_rename_error(Some(2)),
+            MoveRenameFailure::Other
+        );
+        assert_eq!(classify_move_rename_error(None), MoveRenameFailure::Other);
+    }
+
+    /// Volume serial number plus file index: unchanged by a rename, new for a copied file.
+    #[cfg(windows)]
+    fn test_file_identity(path: &Path) -> (u32, u32, u32) {
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
+
+        let file = File::open(path).expect("open file for identity");
+        let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        assert_ne!(
+            unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut information) },
+            0,
+            "read file identity: {}",
+            io::Error::last_os_error()
+        );
+        (
+            information.dwVolumeSerialNumber,
+            information.nFileIndexHigh,
+            information.nFileIndexLow,
+        )
     }
 
     #[cfg(windows)]
@@ -13422,27 +16044,38 @@ fn request_real_app_exit(app: tauri::AppHandle) {
         );
         let _running_reset_guard = DesktopOperationRunningResetGuard;
         let progress_app = app.clone();
+        let relay = DesktopOperationProgressRelay::new(restore_progress_message, move |payload| {
+            publish_lifecycle_desktop_operation(&progress_app, payload, true)
+        });
+        let transfer = desktop_operation_transfer_progress(&app, "exit-restore", &relay);
+        let item_relay = Arc::clone(&relay);
+        let item_transfer = Arc::clone(&transfer);
         let restore_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            restore_desktop_organization_for_exit_with_progress(move |current, total, path| {
-                publish_lifecycle_desktop_operation(
-                    &progress_app,
-                    DesktopOperationPayload {
-                        kind: "restore",
-                        scope: "lifecycle",
-                        status: "progress",
-                        message: restore_progress_message(current, total, path),
-                        moved: 0,
-                        skipped: 0,
-                        restored: current,
-                        total,
-                        current_path: path.display().to_string(),
-                        category_counts: Vec::new(),
-                    },
-                    true,
-                );
+            with_desktop_transfer_progress(Some(Arc::clone(&transfer)), || {
+                restore_desktop_organization_for_exit_with_progress(move |current, total, path| {
+                    // Reported after an item finished; the next item is the one in progress.
+                    item_transfer.set_item(current.saturating_add(1).min(total), total, path);
+                    item_relay.publish_progress(
+                        DesktopOperationPayload {
+                            kind: "restore",
+                            scope: "lifecycle",
+                            status: "progress",
+                            message: restore_progress_message(current, total, path),
+                            moved: 0,
+                            skipped: 0,
+                            restored: current,
+                            total,
+                            current_path: path.display().to_string(),
+                            category_counts: Vec::new(),
+                        },
+                        &item_transfer.snapshot(),
+                    );
+                })
             })
         }))
         .unwrap_or_else(|_| Err("退出前还原桌面任务异常中断".to_owned()));
+        relay.close();
+        transfer.complete(restore_result.is_ok());
         keep_loading_effect_visible(loading_started_at, Duration::from_millis(850));
 
         let restored = match restore_result {
@@ -13761,40 +16394,59 @@ fn main() {
                 }
 
                 let progress_handle = handle.clone();
+                let relay = DesktopOperationProgressRelay::new(
+                    restart_recollect_progress_message,
+                    move |payload| {
+                        publish_lifecycle_desktop_operation(&progress_handle, payload, true)
+                    },
+                );
+                let transfer =
+                    desktop_operation_transfer_progress(&handle, "restart-recollect", &relay);
+                let item_relay = Arc::clone(&relay);
+                let item_transfer = Arc::clone(&transfer);
                 let mut loading_visible_at = None;
                 let recovery_result =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        store::with_storage_mutation(recover_pending_runtime_migration_locked)?;
+                        recover_pending_runtime_migration_on_startup(&handle)?;
                         if let Err(error) =
                             with_lazy_window_operation(|| show_persisted_desktop_layout(&handle))
                         {
                             eprintln!("failed to show startup operation overlay: {error}");
                         }
                         loading_visible_at = Some(Instant::now());
-                        recollect_desktop_organization_from_restart_marker_with_progress(
-                            move |current, total, path| {
-                                publish_lifecycle_desktop_operation(
-                                    &progress_handle,
-                                    DesktopOperationPayload {
-                                        kind: "classify",
-                                        scope: "lifecycle",
-                                        status: "progress",
-                                        message: restart_recollect_progress_message(
-                                            current, total, path,
-                                        ),
-                                        moved: current,
-                                        skipped: 0,
-                                        restored: 0,
+                        with_desktop_transfer_progress(Some(Arc::clone(&transfer)), || {
+                            recollect_desktop_organization_from_restart_marker_with_progress(
+                                move |current, total, path| {
+                                    // Reported after an item finished; the next one is in progress.
+                                    item_transfer.set_item(
+                                        current.saturating_add(1).min(total),
                                         total,
-                                        current_path: path.display().to_string(),
-                                        category_counts: Vec::new(),
-                                    },
-                                    true,
-                                );
-                            },
-                        )
+                                        path,
+                                    );
+                                    item_relay.publish_progress(
+                                        DesktopOperationPayload {
+                                            kind: "classify",
+                                            scope: "lifecycle",
+                                            status: "progress",
+                                            message: restart_recollect_progress_message(
+                                                current, total, path,
+                                            ),
+                                            moved: current,
+                                            skipped: 0,
+                                            restored: 0,
+                                            total,
+                                            current_path: path.display().to_string(),
+                                            category_counts: Vec::new(),
+                                        },
+                                        &item_transfer.snapshot(),
+                                    );
+                                },
+                            )
+                        })
                     }))
                     .unwrap_or_else(|_| Err("启动恢复任务异常中断".to_owned()));
+                relay.close();
+                transfer.complete(recovery_result.is_ok());
                 if let Some(visible_at) = loading_visible_at {
                     keep_loading_effect_visible(visible_at, Duration::from_millis(850));
                 }
@@ -13921,6 +16573,7 @@ fn main() {
             create_desktop_entries,
             open_special,
             update_runtime_directory,
+            check_organizer_directory_volume,
             check_for_updates,
             open_update_download,
             update_notice::get_update_notice,
@@ -14005,4 +16658,1966 @@ fn main() {
         }
         _ => {}
     });
+}
+
+#[cfg(test)]
+mod runtime_migration_tests {
+    use super::*;
+    use std::{
+        cell::{Cell, RefCell},
+        time::UNIX_EPOCH,
+    };
+
+    #[derive(Default)]
+    struct FakeJournalPersistence {
+        content: RefCell<Option<Vec<u8>>>,
+        saves: Cell<usize>,
+    }
+
+    impl FakeJournalPersistence {
+        fn with_journal(journal: &RuntimeMigrationJournal) -> Self {
+            let persistence = Self::default();
+            *persistence.content.borrow_mut() =
+                Some(serde_json::to_vec(journal).expect("serialize journal"));
+            persistence
+        }
+
+        fn stored(&self) -> Option<RuntimeMigrationJournal> {
+            self.content
+                .borrow()
+                .as_ref()
+                .map(|bytes| serde_json::from_slice(bytes).expect("parse journal"))
+        }
+    }
+
+    impl RuntimeMigrationJournalPersistence for FakeJournalPersistence {
+        fn load(&self) -> Result<Option<String>, String> {
+            Ok(self
+                .content
+                .borrow()
+                .as_ref()
+                .map(|bytes| String::from_utf8(bytes.clone()).expect("utf8 journal")))
+        }
+
+        fn save(&self, bytes: &[u8]) -> Result<(), String> {
+            self.saves.set(self.saves.get() + 1);
+            *self.content.borrow_mut() = Some(bytes.to_vec());
+            Ok(())
+        }
+
+        fn remove(&self) -> Result<(), String> {
+            *self.content.borrow_mut() = None;
+            Ok(())
+        }
+    }
+
+    /// Records the steps it ran; `fail_at` makes that step fail. `copy_and_verify` can run the real
+    /// copy so filesystem effects are observable.
+    #[derive(Default)]
+    struct FakeSteps {
+        fail_at: Option<&'static str>,
+        real_copy: bool,
+        real_cleanup: bool,
+        /// Without it the rename eligibility check always answers "copy", so tests using sample
+        /// paths never look at real directories.
+        allow_rename: bool,
+        /// Stands in for the shared test transfer journal folder, which parallel tests write to.
+        pending_transfer_journals: bool,
+        /// Held open without FILE_SHARE_DELETE while the real rename runs, then closed.
+        hold_during_rename: Option<PathBuf>,
+        calls: RefCell<Vec<&'static str>>,
+    }
+
+    impl FakeSteps {
+        fn failing_at(step: &'static str) -> Self {
+            Self {
+                fail_at: Some(step),
+                ..Self::default()
+            }
+        }
+
+        fn run(&self, step: &'static str) -> Result<(), String> {
+            self.calls.borrow_mut().push(step);
+            if self.fail_at == Some(step) {
+                return Err(format!("{step} 拒绝访问。 (os error 5)"));
+            }
+            Ok(())
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    impl RuntimeMigrationSteps for FakeSteps {
+        fn ensure_target_dirs(&self, _journal: &RuntimeMigrationJournal) -> Result<(), String> {
+            self.run("ensure")
+        }
+
+        fn copy_and_verify(&self, journal: &RuntimeMigrationJournal) -> Result<(), String> {
+            self.run("copy")?;
+            if self.real_copy {
+                AppRuntimeMigrationSteps.copy_and_verify(journal)?;
+            }
+            Ok(())
+        }
+
+        fn rewrite_paths(&self, _journal: &RuntimeMigrationJournal) -> Result<(), String> {
+            enter_runtime_migration_switching_phase();
+            self.run("rewrite")
+        }
+
+        fn revert_rewritten_paths(&self, _journal: &RuntimeMigrationJournal) -> Result<(), String> {
+            self.run("revert")
+        }
+
+        fn switch_directory(&self, _journal: &RuntimeMigrationJournal) -> Result<(), String> {
+            enter_runtime_migration_switching_phase();
+            self.run("switch")
+        }
+
+        fn cleanup_sources(&self, journal: &RuntimeMigrationJournal) -> Result<(), String> {
+            self.run("cleanup")?;
+            if self.real_cleanup {
+                AppRuntimeMigrationSteps.cleanup_sources(journal)?;
+            }
+            Ok(())
+        }
+
+        fn recover_transfer_journals(&self) -> Result<(), String> {
+            if self.fail_at == Some("transfer-recover") {
+                return Err("transfer journal ".to_owned() + "\u{62d2}\u{7edd}\u{8bbf}\u{95ee}");
+            }
+            Ok(())
+        }
+
+        fn check_rename_eligible(&self, journal: &RuntimeMigrationJournal) -> Result<(), String> {
+            if !self.allow_rename {
+                return Err("test default: copy".to_owned());
+            }
+            check_runtime_migration_rename_eligible(journal, self.pending_transfer_journals)
+        }
+
+        fn rename_root(&self, source: &Path, target: &Path) -> Result<(), String> {
+            self.run("rename")?;
+            #[cfg(windows)]
+            let _held = self.hold_during_rename.as_ref().map(|path| {
+                use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+                fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(FILE_SHARE_READ)
+                    .open(path)
+                    .expect("hold file without share delete")
+            });
+            rename_runtime_migration_root(source, target)
+        }
+    }
+
+    type RecordedProgress = Arc<Mutex<Vec<RuntimeMigrationProgressPayload>>>;
+
+    /// Records every update (no throttling) so monotonicity can be checked exactly.
+    fn recording_progress() -> (Arc<RuntimeMigrationProgress>, RecordedProgress) {
+        let recorded: RecordedProgress = Arc::default();
+        let sink = recorded.clone();
+        let progress = RuntimeMigrationProgress::new("organizer", Duration::ZERO, move |payload| {
+            sink.lock().expect("progress log").push(payload.clone());
+        });
+        (progress, recorded)
+    }
+
+    /// Relative path -> contents of every file below `root`.
+    fn tree_contents(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn walk(root: &Path, dir: &Path, output: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            for entry in fs::read_dir(dir).expect("read tree") {
+                let path = entry.expect("tree entry").path();
+                if path.is_dir() {
+                    walk(root, &path, output);
+                } else {
+                    let relative = path.strip_prefix(root).expect("relative").to_path_buf();
+                    output.insert(relative, fs::read(&path).expect("read file"));
+                }
+            }
+        }
+        let mut output = BTreeMap::new();
+        walk(root, root, &mut output);
+        output
+    }
+
+    /// A small file, a multi-chunk file, nested Unicode folders and a folder above the robocopy
+    /// threshold.
+    fn write_migration_source(source: &Path) {
+        fs::create_dir_all(
+            source
+                .join("\u{5de5}\u{4f5c}")
+                .join("\u{5b50}\u{76ee}\u{5f55}"),
+        )
+        .expect("create nested");
+        fs::write(source.join("readme.txt"), b"top level").expect("write top");
+        let large = (0..(3 * 1024 * 1024 + 123))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        fs::write(source.join("\u{5de5}\u{4f5c}").join("large.bin"), large).expect("write large");
+        fs::write(
+            source
+                .join("\u{5de5}\u{4f5c}")
+                .join("\u{5b50}\u{76ee}\u{5f55}")
+                .join("note.txt"),
+            b"nested note",
+        )
+        .expect("write nested");
+        let many = source.join("many");
+        fs::create_dir_all(&many).expect("create many");
+        for index in 0..(MAX_LOCKED_TRANSFER_TREE_ENTRIES + 20) {
+            fs::write(
+                many.join(format!("item-{index}.txt")),
+                format!("payload {index}"),
+            )
+            .expect("write many");
+        }
+    }
+
+    #[test]
+    fn migration_copies_byte_identical_content_checks_directories_by_structure_and_reports_progress(
+    ) {
+        let root = test_dir("dustdesk-runtime-progress");
+        let source = root.join("old");
+        let target = root.join("new");
+        write_migration_source(&source);
+        let original = tree_contents(&source);
+        let original_bytes = original
+            .values()
+            .map(|bytes| bytes.len() as u64)
+            .sum::<u64>();
+        let persistence = FakeJournalPersistence::default();
+        let steps = FakeSteps {
+            real_copy: true,
+            real_cleanup: true,
+            ..FakeSteps::default()
+        };
+        let (progress, recorded) = recording_progress();
+        take_full_content_comparisons();
+
+        let outcome = with_runtime_migration_progress(progress.clone(), || {
+            let outcome = start_runtime_migration_with(
+                organizer_journal("prepared", &source, &target),
+                &persistence,
+                &steps,
+                |_| Ok(()),
+            );
+            if outcome == Ok(RuntimeMigrationOutcome::Completed) {
+                report_runtime_migration_progress(RuntimeMigrationProgress::complete);
+            }
+            outcome
+        })
+        .expect("migration runs");
+        let comparisons = take_full_content_comparisons();
+
+        assert_eq!(outcome, RuntimeMigrationOutcome::Completed);
+        assert_eq!(tree_contents(&target), original);
+        assert!(!source.exists(), "old directory must be cleaned");
+        assert!(persistence.stored().is_none());
+
+        // The single top-level file is fully compared once; files inside directory items only
+        // get the structure check.
+        assert_eq!(
+            comparisons,
+            BTreeMap::from([(source.join("readme.txt"), 1usize)])
+        );
+
+        let recorded = recorded.lock().expect("progress log").clone();
+        let mut phases: Vec<String> = Vec::new();
+        for payload in &recorded {
+            if phases.last() != Some(&payload.phase) {
+                phases.push(payload.phase.clone());
+            }
+        }
+        assert_eq!(
+            phases,
+            [
+                "scanning",
+                "copying",
+                "verifying",
+                "switching",
+                "cleaning",
+                "done"
+            ]
+        );
+        for pair in recorded.windows(2) {
+            let (previous, next) = (&pair[0], &pair[1]);
+            assert_eq!(next.target, "organizer");
+            if previous.phase == next.phase {
+                assert!(
+                    next.bytes_done >= previous.bytes_done,
+                    "{previous:?} -> {next:?}"
+                );
+                assert!(
+                    next.files_done >= previous.files_done,
+                    "{previous:?} -> {next:?}"
+                );
+                assert!(next.verified_bytes >= previous.verified_bytes);
+            }
+        }
+        for (index, payload) in recorded.iter().enumerate() {
+            assert!(payload.bytes_done <= payload.bytes_total);
+            assert!(payload.files_done <= payload.files_total);
+            let last_of_phase = recorded
+                .get(index + 1)
+                .map_or(true, |next| next.phase != payload.phase);
+            if last_of_phase {
+                assert_eq!(payload.bytes_done, payload.bytes_total, "{payload:?}");
+                assert_eq!(payload.files_done, payload.files_total, "{payload:?}");
+            }
+        }
+        let copying = recorded
+            .iter()
+            .filter(|payload| payload.phase == "copying")
+            .collect::<Vec<_>>();
+        let copy_end = copying.last().expect("copying progress");
+        assert_eq!(copy_end.bytes_total, original_bytes);
+        assert_eq!(copy_end.files_total, original.len() as u64);
+        assert_eq!(copy_end.verified_bytes, original_bytes);
+        // Byte level progress inside the large file, before the phase is finished.
+        assert!(copying
+            .iter()
+            .any(|payload| payload.bytes_done > 0 && payload.bytes_done < original_bytes));
+        assert!(copying
+            .iter()
+            .any(|payload| payload.verified_bytes > 0 && payload.verified_bytes < original_bytes));
+        assert!(copying.iter().any(|payload| !payload.current.is_empty()));
+        let done = recorded.last().expect("done progress");
+        assert_eq!(done.phase, "done");
+        assert_eq!(done.bytes_done, done.bytes_total);
+        assert_eq!(done.files_done, done.files_total);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resumed_copy_compares_existing_items_once_and_counts_them_as_done() {
+        let root = test_dir("dustdesk-runtime-resume");
+        let source = root.join("old");
+        let target = root.join("new");
+        write_migration_source(&source);
+        let journal = organizer_journal("prepared", &source, &target);
+        AppRuntimeMigrationSteps
+            .copy_and_verify(&journal)
+            .expect("first copy");
+        take_full_content_comparisons();
+        let (progress, recorded) = recording_progress();
+
+        with_runtime_migration_progress(progress, || {
+            AppRuntimeMigrationSteps.copy_and_verify(&journal)
+        })
+        .expect("resumed copy accepts identical targets");
+
+        let comparisons = take_full_content_comparisons();
+        let files = tree_contents(&source).len();
+        assert_eq!(comparisons.len(), files);
+        assert!(comparisons.values().all(|count| *count == 1));
+        let recorded = recorded.lock().expect("progress log");
+        assert!(recorded.iter().any(|payload| payload.phase == "copying"
+            && payload.files_done > 0
+            && payload.files_done < payload.files_total));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn copied_migration(prefix: &str) -> (PathBuf, PathBuf, PathBuf, RuntimeMigrationJournal) {
+        let root = test_dir(prefix);
+        let source = root.join("old");
+        let target = root.join("new");
+        write_migration_source(&source);
+        let journal = organizer_journal("prepared", &source, &target);
+        AppRuntimeMigrationSteps
+            .copy_and_verify(&journal)
+            .expect("copy before tampering");
+        (root, source, target, journal)
+    }
+
+    fn assert_tampered_source_kept(source: &Path, relative: &Path, expected: &[u8], error: &str) {
+        assert!(!error.is_empty());
+        assert_eq!(
+            fs::read(source.join(relative)).expect("source kept"),
+            expected
+        );
+    }
+
+    #[test]
+    fn tampered_target_size_keeps_source_and_fails_verify_and_cleanup() {
+        let (root, source, target, journal) = copied_migration("dustdesk-runtime-tamper-size");
+        let relative = Path::new("readme.txt");
+        fs::write(target.join(relative), b"top level, but changed").expect("tamper size");
+
+        let verify_error =
+            verify_runtime_migration_contents(&journal).expect_err("verify detects size change");
+        assert!(verify_error.contains("\u{5df2}\u{4fdd}\u{7559}"));
+        let cleanup_error =
+            cleanup_runtime_migration_sources(&journal).expect_err("cleanup refuses to delete");
+        assert_tampered_source_kept(&source, relative, b"top level", &cleanup_error);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tampered_target_modified_time_keeps_source_and_fails_cleanup() {
+        let (root, source, target, journal) = copied_migration("dustdesk-runtime-tamper-time");
+        let relative = Path::new("\u{5de5}\u{4f5c}")
+            .join("\u{5b50}\u{76ee}\u{5f55}")
+            .join("note.txt");
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(target.join(&relative))
+            .expect("open target");
+        file.set_modified(SystemTime::now() - Duration::from_secs(3600))
+            .expect("tamper modified time");
+        drop(file);
+
+        verify_runtime_migration_contents(&journal).expect_err("verify detects time change");
+        let cleanup_error =
+            cleanup_runtime_migration_sources(&journal).expect_err("cleanup refuses to delete");
+        assert_tampered_source_kept(&source, &relative, b"nested note", &cleanup_error);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_target_item_keeps_source_and_fails_cleanup() {
+        let (root, source, target, journal) = copied_migration("dustdesk-runtime-tamper-missing");
+        let relative = Path::new("many").join("item-7.txt");
+        fs::remove_file(target.join(&relative)).expect("delete target item");
+
+        verify_runtime_migration_contents(&journal).expect_err("verify detects missing item");
+        let cleanup_error =
+            cleanup_runtime_migration_sources(&journal).expect_err("cleanup refuses to delete");
+        assert_tampered_source_kept(&source, &relative, b"payload 7", &cleanup_error);
+
+        // Put the file back (fs::copy keeps the modified time) and remove a whole folder instead.
+        fs::copy(source.join(&relative), target.join(&relative)).expect("restore target item");
+        fs::remove_dir_all(target.join("\u{5de5}\u{4f5c}")).expect("delete target folder");
+        let cleanup_error =
+            cleanup_runtime_migration_sources(&journal).expect_err("cleanup refuses to delete");
+        assert_tampered_source_kept(
+            &source,
+            &Path::new("\u{5de5}\u{4f5c}").join("large.bin"),
+            &(0..(3 * 1024 * 1024 + 123))
+                .map(|index| (index % 251) as u8)
+                .collect::<Vec<_>>(),
+            &cleanup_error,
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn same_size_conflict_in_existing_target_is_rejected_and_both_sides_kept() {
+        let root = test_dir("dustdesk-runtime-same-size-conflict");
+        let source = root.join("old");
+        let target = root.join("new");
+        fs::create_dir_all(&source).expect("create source");
+        fs::create_dir_all(&target).expect("create target");
+        fs::write(source.join("a.txt"), b"aaaa").expect("write source");
+        fs::write(target.join("a.txt"), b"bbbb").expect("write target");
+        let modified = fs::metadata(source.join("a.txt"))
+            .and_then(|metadata| metadata.modified())
+            .expect("source time");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(target.join("a.txt"))
+            .and_then(|file| file.set_modified(modified))
+            .expect("align target time");
+        let journal = organizer_journal("prepared", &source, &target);
+
+        let error = AppRuntimeMigrationSteps
+            .copy_and_verify(&journal)
+            .expect_err("same size conflict detected by the full comparison");
+
+        assert!(error.contains("\u{4e0d}\u{540c}\u{5185}\u{5bb9}"));
+        assert_eq!(fs::read(source.join("a.txt")).expect("source"), b"aaaa");
+        assert_eq!(fs::read(target.join("a.txt")).expect("target"), b"bbbb");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn progress_sink_failure_does_not_affect_migration() {
+        let root = test_dir("dustdesk-runtime-progress-panic");
+        let source = root.join("old");
+        let target = root.join("new");
+        write_migration_source(&source);
+        let original = tree_contents(&source);
+        let progress =
+            RuntimeMigrationProgress::new("organizer", Duration::ZERO, |_| panic!("window closed"));
+
+        with_runtime_migration_progress(progress, || {
+            AppRuntimeMigrationSteps
+                .copy_and_verify(&organizer_journal("prepared", &source, &target))
+        })
+        .expect("copy succeeds although progress cannot be delivered");
+
+        assert_eq!(tree_contents(&target), original);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn progress_is_throttled_but_phase_changes_are_immediate() {
+        let recorded: RecordedProgress = Arc::default();
+        let sink = recorded.clone();
+        let progress =
+            RuntimeMigrationProgress::new("data", Duration::from_secs(3600), move |payload| {
+                sink.lock().expect("log").push(payload.clone());
+            });
+        progress.begin_phase("copying", 100, 10);
+        for _ in 0..10 {
+            progress.add_done(10, 1);
+        }
+        progress.finish_phase();
+        progress.begin_phase("verifying", 100, 10);
+        let recorded = recorded.lock().expect("log");
+        assert_eq!(recorded.len(), 3);
+        assert_eq!(recorded[1].bytes_done, 100);
+        assert_eq!(recorded[2].phase, "verifying");
+        assert_eq!(recorded[2].bytes_done, 0);
+    }
+
+    #[test]
+    fn progress_message_matches_settings_wording() {
+        let message = runtime_migration_progress_message(&RuntimeMigrationProgressPayload {
+            target: "organizer".to_owned(),
+            phase: "copying".to_owned(),
+            bytes_done: 3_435_973_837,
+            bytes_total: 11_274_289_152,
+            files_done: 1234,
+            files_total: 5678,
+            verified_bytes: 0,
+            current: "\u{6587}\u{6863}".to_owned(),
+        });
+        assert_eq!(
+            message,
+            "\u{6b63}\u{5728}\u{590d}\u{5236} 3.2 GB / 10.5 GB\u{ff08}1,234 / 5,678 \u{4e2a}\u{6587}\u{4ef6}\u{ff09}\u{ff1a}\u{6587}\u{6863}\u{3002}\u{8fc1}\u{79fb}\u{4e2d}\u{ff0c}\u{8bf7}\u{4e0d}\u{8981}\u{9000}\u{51fa} DustDesk"
+        );
+    }
+
+    fn test_dir(prefix: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("{prefix}-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create test dir");
+        dir
+    }
+
+    fn organizer_journal(phase: &str, old_root: &Path, new_root: &Path) -> RuntimeMigrationJournal {
+        RuntimeMigrationJournal {
+            target: "organizer".to_owned(),
+            phase: phase.to_owned(),
+            requested_path: new_root.display().to_string(),
+            old_data_dir: "X:\\DustDesk\\Data".to_owned(),
+            old_organizer_root: old_root.display().to_string(),
+            old_launchers_root: "X:\\DustDesk\\Launchers".to_owned(),
+            new_data_dir: "X:\\DustDesk\\Data".to_owned(),
+            new_organizer_root: new_root.display().to_string(),
+            new_launchers_root: "X:\\DustDesk\\Launchers".to_owned(),
+            mode: default_runtime_migration_mode(),
+            renamed: false,
+        }
+    }
+
+    fn sample_journal(phase: &str) -> RuntimeMigrationJournal {
+        organizer_journal(
+            phase,
+            Path::new("D:\\Software\\DustDesk\\DesktopOrganizer"),
+            Path::new("E:\\Target\\DesktopOrganizer"),
+        )
+    }
+
+    #[test]
+    fn unwritable_target_is_rejected_before_journal_is_written() {
+        let persistence = FakeJournalPersistence::default();
+        let steps = FakeSteps::default();
+        let error =
+            start_runtime_migration_with(sample_journal("prepared"), &persistence, &steps, |_| {
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            })
+            .expect_err("unwritable target must fail");
+
+        assert!(error.contains("无法写入所选目录：E:\\Target\\DesktopOrganizer（拒绝访问）"));
+        assert!(error.contains("DustDesk"));
+        assert!(error.contains("Program Files"));
+        assert_eq!(persistence.saves.get(), 0);
+        assert!(persistence.stored().is_none());
+        assert!(steps.calls().is_empty());
+    }
+
+    #[test]
+    fn target_that_cannot_be_created_is_rejected_without_journal() {
+        let root = test_dir("dustdesk-runtime-probe-blocked");
+        let blocker = root.join("not-a-folder");
+        fs::write(&blocker, b"file").expect("write blocker");
+        let new_root = blocker.join("DesktopOrganizer");
+        let persistence = FakeJournalPersistence::default();
+        let steps = FakeSteps::default();
+
+        let error = start_runtime_migration_with(
+            organizer_journal("prepared", &root.join("old"), &new_root),
+            &persistence,
+            &steps,
+            probe_runtime_directory_writable,
+        )
+        .expect_err("probe inside a file must fail");
+
+        assert!(error.contains(&new_root.display().to_string()));
+        assert_eq!(persistence.saves.get(), 0);
+        assert!(steps.calls().is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn write_probe_leaves_no_file_and_uses_internal_name() {
+        let root = test_dir("dustdesk-runtime-probe-ok");
+        probe_runtime_directory_writable(&root).expect("probe writable dir");
+        assert_eq!(fs::read_dir(&root).expect("read dir").count(), 0);
+        assert!(is_internal_transfer_path(
+            &root.join(format!(".dustdesk-transfer-{}-0.tmp", now_id()))
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepared_copy_failure_rolls_back_without_touching_source_or_existing_target() {
+        let root = test_dir("dustdesk-runtime-rollback");
+        let source = root.join("old");
+        let target = root.join("new");
+        fs::create_dir_all(source.join("工作")).expect("create source category");
+        fs::write(source.join("工作").join("a.txt"), b"source a").expect("write a");
+        fs::write(source.join("conflict.txt"), b"source version").expect("write conflict");
+        fs::create_dir_all(&target).expect("create target");
+        fs::write(target.join("conflict.txt"), b"existing target version").expect("write t");
+        fs::write(target.join("keep.txt"), b"keep me").expect("write keep");
+
+        let persistence = FakeJournalPersistence::default();
+        let steps = FakeSteps {
+            real_copy: true,
+            ..FakeSteps::default()
+        };
+        let outcome = start_runtime_migration_with(
+            organizer_journal("prepared", &source, &target),
+            &persistence,
+            &steps,
+            probe_runtime_directory_writable,
+        )
+        .expect("rollback is not an error outcome");
+
+        let RuntimeMigrationOutcome::RolledBack(message) = outcome else {
+            panic!("expected rollback, got {outcome:?}");
+        };
+        assert!(message.contains(&source.display().to_string()));
+        assert!(message.contains(&target.display().to_string()));
+        assert!(message.contains("已取消本次迁移，原目录和配置均未改动"));
+        assert!(message.contains("可以手动删除"));
+        assert!(persistence.stored().is_none());
+        assert_eq!(steps.calls(), vec!["ensure", "copy"]);
+
+        assert_eq!(
+            fs::read(source.join("工作").join("a.txt")).expect("source a"),
+            b"source a"
+        );
+        assert_eq!(
+            fs::read(source.join("conflict.txt")).expect("source conflict"),
+            b"source version"
+        );
+        assert_eq!(
+            fs::read(target.join("conflict.txt")).expect("target conflict"),
+            b"existing target version"
+        );
+        assert_eq!(fs::read(target.join("keep.txt")).expect("keep"), b"keep me");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn copied_rewrite_failure_reverts_paths_and_removes_journal() {
+        let persistence = FakeJournalPersistence::with_journal(&sample_journal("copied"));
+        let steps = FakeSteps::failing_at("rewrite");
+
+        let outcome =
+            recover_pending_runtime_migration_with(&persistence, &steps).expect("rollback outcome");
+
+        assert!(matches!(outcome, RuntimeMigrationOutcome::RolledBack(_)));
+        assert_eq!(steps.calls(), vec!["ensure", "rewrite", "revert"]);
+        assert!(persistence.stored().is_none());
+    }
+
+    #[test]
+    fn prepared_failure_before_rewrite_does_not_revert_paths() {
+        let persistence = FakeJournalPersistence::with_journal(&sample_journal("prepared"));
+        let steps = FakeSteps::failing_at("copy");
+
+        let outcome =
+            recover_pending_runtime_migration_with(&persistence, &steps).expect("rollback outcome");
+
+        assert!(matches!(outcome, RuntimeMigrationOutcome::RolledBack(_)));
+        assert_eq!(steps.calls(), vec!["ensure", "copy"]);
+        assert!(persistence.stored().is_none());
+    }
+
+    #[test]
+    fn rewritten_or_later_failures_are_not_rolled_back() {
+        for (phase, failing_step) in [("rewritten", "switch"), ("switched", "ensure")] {
+            let persistence = FakeJournalPersistence::with_journal(&sample_journal(phase));
+            let steps = FakeSteps::failing_at(failing_step);
+
+            let error = recover_pending_runtime_migration_with(&persistence, &steps)
+                .expect_err("late failure must surface");
+
+            assert!(error.contains("D:\\Software\\DustDesk\\DesktopOrganizer"));
+            assert!(error.contains("E:\\Target\\DesktopOrganizer"));
+            assert!(!steps.calls().contains(&"revert"));
+            assert_eq!(persistence.stored().expect("journal kept").phase, phase);
+        }
+    }
+
+    #[test]
+    fn rewrite_success_then_switch_failure_keeps_rewritten_journal() {
+        let persistence = FakeJournalPersistence::with_journal(&sample_journal("prepared"));
+        let steps = FakeSteps::failing_at("switch");
+
+        recover_pending_runtime_migration_with(&persistence, &steps)
+            .expect_err("switch failure must surface");
+
+        assert_eq!(steps.calls(), vec!["ensure", "copy", "rewrite", "switch"]);
+        assert_eq!(
+            persistence.stored().expect("journal kept").phase,
+            "rewritten"
+        );
+    }
+
+    #[test]
+    fn successful_migration_runs_all_phases_and_removes_journal() {
+        let persistence = FakeJournalPersistence::default();
+        let steps = FakeSteps::default();
+
+        let outcome =
+            start_runtime_migration_with(sample_journal("prepared"), &persistence, &steps, |_| {
+                Ok(())
+            })
+            .expect("migration succeeds");
+
+        assert_eq!(outcome, RuntimeMigrationOutcome::Completed);
+        assert_eq!(
+            steps.calls(),
+            vec!["ensure", "copy", "rewrite", "switch", "cleanup"]
+        );
+        assert!(persistence.stored().is_none());
+    }
+
+    #[test]
+    fn startup_recovery_continues_after_rolling_back_failed_journal() {
+        let persistence = FakeJournalPersistence::with_journal(&sample_journal("prepared"));
+        let steps = FakeSteps::failing_at("copy");
+        let mut events = Vec::new();
+
+        recover_runtime_migration_for_startup_with(&persistence, &steps, |event, details| {
+            events.push((event.to_owned(), details.to_owned()))
+        })
+        .expect("startup continues");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "runtime_migration_rolled_back");
+        assert!(events[0].1.contains("context=startup"));
+        assert!(persistence.stored().is_none());
+    }
+
+    #[test]
+    fn startup_recovery_still_fails_for_late_phase_journal() {
+        let persistence = FakeJournalPersistence::with_journal(&sample_journal("rewritten"));
+        let steps = FakeSteps::failing_at("switch");
+        let mut events = 0;
+
+        recover_runtime_migration_for_startup_with(&persistence, &steps, |_, _| events += 1)
+            .expect_err("late phase failure aborts startup recovery");
+
+        assert_eq!(events, 0);
+        assert!(persistence.stored().is_some());
+    }
+
+    #[test]
+    fn journal_without_mode_fields_reads_as_copy_mode() {
+        let json = r#"{"target":"organizer","phase":"copied","requestedPath":"E:\\T","oldDataDir":"D:\\D","oldOrganizerRoot":"D:\\O","oldLaunchersRoot":"D:\\L","newDataDir":"D:\\D","newOrganizerRoot":"E:\\T","newLaunchersRoot":"D:\\L"}"#;
+        let journal: RuntimeMigrationJournal = serde_json::from_str(json).expect("old journal");
+        assert_eq!(journal.mode, "copy");
+        assert!(!journal.renamed);
+        assert!(!journal.forward_only());
+        let saved = serde_json::to_string(&organizer_journal(
+            "prepared",
+            Path::new("D:\\O"),
+            Path::new("E:\\T"),
+        ))
+        .expect("serialize");
+        assert!(saved.contains("\"mode\":\"copy\""));
+        assert!(saved.contains("\"renamed\":false"));
+    }
+
+    /// Old root with nested folders and files, plus an empty new root next to it.
+    fn rename_fixture(prefix: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let root = test_dir(prefix);
+        let source = root.join("old").join("DesktopOrganizer");
+        let target = root.join("new").join("DesktopOrganizer");
+        fs::create_dir_all(source.join("\u{5de5}\u{4f5c}").join("sub")).expect("create source");
+        fs::write(source.join("top.txt"), b"top").expect("write top");
+        fs::write(source.join("\u{5de5}\u{4f5c}").join("a.lnk"), b"shortcut").expect("write a");
+        fs::write(
+            source.join("\u{5de5}\u{4f5c}").join("sub").join("b.bin"),
+            vec![7u8; 70_000],
+        )
+        .expect("write b");
+        fs::create_dir_all(&target).expect("create empty target");
+        (root, source, target)
+    }
+
+    #[cfg(windows)]
+    fn file_identity(path: &Path) -> (u32, u32, u32) {
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
+        let file = File::open(path).expect("open for identity");
+        let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        assert_ne!(
+            unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut information) },
+            0
+        );
+        (
+            information.dwVolumeSerialNumber,
+            information.nFileIndexHigh,
+            information.nFileIndexLow,
+        )
+    }
+
+    fn phases_of(recorded: &RecordedProgress) -> Vec<String> {
+        let mut phases: Vec<String> = Vec::new();
+        for payload in recorded.lock().expect("progress log").iter() {
+            if phases.last() != Some(&payload.phase) {
+                phases.push(payload.phase.clone());
+            }
+        }
+        phases
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn same_volume_migration_renames_root_and_keeps_file_identity() {
+        let (root, source, target) = rename_fixture("dustdesk-runtime-rename");
+        let original = tree_contents(&source);
+        let nested = Path::new("\u{5de5}\u{4f5c}").join("sub").join("b.bin");
+        let identity = file_identity(&source.join(&nested));
+        let persistence = FakeJournalPersistence::default();
+        let steps = FakeSteps {
+            allow_rename: true,
+            real_copy: true,
+            real_cleanup: true,
+            ..FakeSteps::default()
+        };
+        let (progress, recorded) = recording_progress();
+        take_full_content_comparisons();
+
+        let outcome = with_runtime_migration_progress(progress, || {
+            let outcome = start_runtime_migration_with(
+                organizer_journal("prepared", &source, &target),
+                &persistence,
+                &steps,
+                probe_runtime_directory_writable,
+            );
+            if outcome == Ok(RuntimeMigrationOutcome::Completed) {
+                report_runtime_migration_progress(RuntimeMigrationProgress::complete);
+            }
+            outcome
+        })
+        .expect("rename migration");
+
+        assert_eq!(outcome, RuntimeMigrationOutcome::Completed);
+        assert_eq!(steps.calls(), vec!["ensure", "rename", "rewrite", "switch"]);
+        assert!(!source.exists(), "old root is gone");
+        assert_eq!(tree_contents(&target), original);
+        assert_eq!(file_identity(&target.join(&nested)), identity);
+        assert!(persistence.stored().is_none(), "journal removed");
+        assert!(take_full_content_comparisons().is_empty());
+        assert_eq!(phases_of(&recorded), ["moving", "switching", "done"]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Simulates a rename that happened but was never recorded, after which a stale window
+    /// recreated the old root and organized new items into it.
+    fn renamed_then_old_root_refilled(
+        prefix: &str,
+    ) -> (PathBuf, PathBuf, PathBuf, BTreeMap<PathBuf, Vec<u8>>) {
+        let (root, source, target, original) = renamed_on_disk(prefix);
+        fs::create_dir_all(source.join("\u{5de5}\u{4f5c}")).expect("recreate old root");
+        fs::write(
+            source.join("\u{5de5}\u{4f5c}").join("late.lnk"),
+            b"late item",
+        )
+        .expect("write late item");
+        fs::write(source.join("late-top.txt"), b"late top").expect("write late top");
+        (root, source, target, original)
+    }
+
+    #[test]
+    fn unrecorded_rename_with_refilled_old_root_rolls_forward_and_merges() {
+        let (root, source, target, original) =
+            renamed_then_old_root_refilled("dustdesk-runtime-rename-refilled");
+        let persistence = FakeJournalPersistence::with_journal(&rename_journal(
+            "prepared", &source, &target, false,
+        ));
+        let steps = FakeSteps {
+            allow_rename: true,
+            real_copy: true,
+            real_cleanup: true,
+            ..FakeSteps::default()
+        };
+
+        let outcome = recover_pending_runtime_migration_with(&persistence, &steps)
+            .expect("recovery rolls forward");
+
+        assert_eq!(outcome, RuntimeMigrationOutcome::Completed);
+        assert_eq!(
+            steps.calls(),
+            vec!["ensure", "copy", "rewrite", "switch", "cleanup"]
+        );
+        let mut expected = original.clone();
+        expected.insert(
+            Path::new("\u{5de5}\u{4f5c}").join("late.lnk"),
+            b"late item".to_vec(),
+        );
+        expected.insert(PathBuf::from("late-top.txt"), b"late top".to_vec());
+        assert_eq!(tree_contents(&target), expected);
+        assert!(
+            !source.exists(),
+            "merged old root cleaned after verification"
+        );
+        assert!(persistence.stored().is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_merge_after_unrecorded_rename_keeps_journal_and_both_roots() {
+        let (root, source, target, original) =
+            renamed_then_old_root_refilled("dustdesk-runtime-rename-merge-fails");
+        let persistence = FakeJournalPersistence::with_journal(&rename_journal(
+            "prepared", &source, &target, false,
+        ));
+        let steps = FakeSteps {
+            allow_rename: true,
+            fail_at: Some("copy"),
+            real_cleanup: true,
+            ..FakeSteps::default()
+        };
+
+        let error = recover_pending_runtime_migration_with(&persistence, &steps)
+            .expect_err("merge failure is incomplete, not rolled back");
+
+        assert!(error.contains("\u{672a}\u{5b8c}\u{6210}"), "{error}");
+        assert_eq!(steps.calls(), vec!["ensure", "copy"]);
+        let stored = persistence.stored().expect("journal kept");
+        assert_eq!(stored.mode, "rename");
+        assert!(stored.renamed);
+        assert_eq!(tree_contents(&target), original);
+        assert_eq!(
+            fs::read(source.join("\u{5de5}\u{4f5c}").join("late.lnk")).expect("late item kept"),
+            b"late item"
+        );
+        assert_eq!(
+            fs::read(source.join("late-top.txt")).expect("late top kept"),
+            b"late top"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rewritten_rename_journal_merges_new_old_root_item_before_cleaning_it() {
+        let (root, source, target, original) = renamed_on_disk("dustdesk-runtime-rename-late");
+        fs::create_dir_all(&source).expect("recreate old root");
+        fs::write(source.join("new.txt"), b"organized later").expect("write new item");
+        let persistence = FakeJournalPersistence::with_journal(&rename_journal(
+            "rewritten",
+            &source,
+            &target,
+            true,
+        ));
+        let steps = FakeSteps {
+            real_copy: true,
+            real_cleanup: true,
+            ..FakeSteps::default()
+        };
+
+        let outcome =
+            recover_pending_runtime_migration_with(&persistence, &steps).expect("roll forward");
+
+        assert_eq!(outcome, RuntimeMigrationOutcome::Completed);
+        // Copied and verified, paths re-pointed, then cleaned only after the switch.
+        assert_eq!(
+            steps.calls(),
+            vec!["ensure", "copy", "rewrite", "switch", "cleanup"]
+        );
+        let mut expected = original.clone();
+        expected.insert(PathBuf::from("new.txt"), b"organized later".to_vec());
+        assert_eq!(tree_contents(&target), expected);
+        assert!(!source.exists());
+        assert!(persistence.stored().is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn changed_merged_copy_keeps_old_root_item() {
+        let (root, source, target, _) = renamed_on_disk("dustdesk-runtime-rename-late-check");
+        fs::create_dir_all(&source).expect("recreate old root");
+        fs::write(source.join("new.txt"), b"organized later").expect("write new item");
+        let journal = rename_journal("switched", &source, &target, true);
+        AppRuntimeMigrationSteps
+            .copy_and_verify(&journal)
+            .expect("merge copy");
+        fs::write(target.join("new.txt"), b"changed after merge!").expect("change copy");
+
+        cleanup_runtime_migration_sources(&journal).expect_err("structure check fails");
+
+        assert_eq!(
+            fs::read(source.join("new.txt")).expect("old item kept"),
+            b"organized later"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pending_migration_journal_makes_snapshot_repair_read_only() {
+        let root = test_dir("dustdesk-runtime-pending-repair");
+        let store = AppStore::for_test(
+            root.join("data"),
+            root.join("organizer"),
+            root.join("launchers"),
+        );
+        store.ensure_runtime_dirs().expect("dirs");
+        let missing = root
+            .join("organizer")
+            .join("docs")
+            .join("moved-away.txt")
+            .display()
+            .to_string();
+        let make_config = || AppConfig {
+            desktop_categories: vec![DeskCategory {
+                name: "docs".to_owned(),
+                item_paths: vec![missing.clone()],
+                ..DeskCategory::default()
+            }],
+            ..AppConfig::default()
+        };
+        let mut launchers = models::LaunchData::default();
+        launchers.items.push(LaunchItem {
+            name: "gone".to_owned(),
+            path: root
+                .join("launchers")
+                .join("gone.lnk")
+                .display()
+                .to_string(),
+            icon_data_url: None,
+        });
+
+        TEST_RUNTIME_MIGRATION_PENDING.with(|pending| pending.set(true));
+        let mut config = make_config();
+        let repair = repair_category_item_paths(&store, &mut config);
+        let mut kept_launchers = launchers.clone();
+        let launcher_repair = repair_launchers(&store, &mut kept_launchers);
+        TEST_RUNTIME_MIGRATION_PENDING.with(|pending| pending.set(false));
+        repair.expect("read-only repair");
+        launcher_repair.expect("read-only launcher repair");
+        assert_eq!(
+            config.desktop_categories[0].item_paths,
+            vec![missing.clone()]
+        );
+        assert_eq!(kept_launchers.items.len(), 1);
+        assert!(!store.config_path().exists(), "config.json not written");
+        assert!(!store.launch_path().exists(), "launch.json not written");
+
+        // Without a journal the same repair drops the missing path as before.
+        let mut config = make_config();
+        repair_category_item_paths(&store, &mut config).expect("normal repair");
+        assert!(config.desktop_categories[0].item_paths.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    fn set_test_attributes(path: &Path, attributes: u32) {
+        use windows_sys::Win32::Storage::FileSystem::SetFileAttributesW;
+        let wide = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        assert_ne!(unsafe { SetFileAttributesW(wide.as_ptr(), attributes) }, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn read_only_hidden_and_system_items_pass_target_lock_and_are_cleaned() {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_READONLY,
+            FILE_ATTRIBUTE_SYSTEM,
+        };
+
+        let root = test_dir("dustdesk-runtime-attributes");
+        let source = root.join("old");
+        let target = root.join("new");
+        // A small folder (per-file copy) and a large one (robocopy /COPY:DAT /DCOPY:DAT).
+        for (name, extra) in [
+            ("small", 0usize),
+            ("large", MAX_LOCKED_TRANSFER_TREE_ENTRIES + 5),
+        ] {
+            let dir = source.join(name);
+            let nested = dir.join("hidden-system");
+            fs::create_dir_all(&nested).expect("create dirs");
+            for index in 0..extra {
+                fs::write(dir.join(format!("filler-{index}.txt")), b"filler").expect("filler");
+            }
+            for (file, attributes) in [
+                ("read-only.txt", FILE_ATTRIBUTE_READONLY),
+                ("hidden.txt", FILE_ATTRIBUTE_HIDDEN),
+                ("system.txt", FILE_ATTRIBUTE_SYSTEM),
+                (
+                    "all.txt",
+                    FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM,
+                ),
+            ] {
+                fs::write(dir.join(file), file.as_bytes()).expect("write file");
+                set_test_attributes(&dir.join(file), attributes);
+                fs::write(nested.join(file), file.as_bytes()).expect("write nested file");
+                set_test_attributes(&nested.join(file), attributes);
+            }
+            set_test_attributes(
+                &nested,
+                FILE_ATTRIBUTE_DIRECTORY
+                    | FILE_ATTRIBUTE_READONLY
+                    | FILE_ATTRIBUTE_HIDDEN
+                    | FILE_ATTRIBUTE_SYSTEM,
+            );
+        }
+        fs::write(source.join("top-read-only.txt"), b"top").expect("write top");
+        set_test_attributes(&source.join("top-read-only.txt"), FILE_ATTRIBUTE_READONLY);
+        let original = tree_contents(&source);
+        let journal = organizer_journal("prepared", &source, &target);
+
+        AppRuntimeMigrationSteps
+            .copy_and_verify(&journal)
+            .expect("copy and confirm");
+        AppRuntimeMigrationSteps
+            .cleanup_sources(&journal)
+            .expect("verified cleanup");
+
+        assert_eq!(tree_contents(&target), original);
+        assert!(!source.exists(), "source cleaned");
+        let copied = fs::metadata(target.join("large").join("read-only.txt")).expect("copied");
+        assert!(copied.permissions().readonly(), "attributes were copied");
+        let _ = std::process::Command::new("attrib")
+            .args(["-r", "-h", "-s", "/s", "/d"])
+            .arg(root.join("*"))
+            .output();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn target_lock_blocks_writers_and_deleters_but_allows_readers() {
+        let root = test_dir("dustdesk-runtime-target-lock");
+        let file = root.join("copied.txt");
+        fs::write(&file, b"copied").expect("write file");
+
+        let lock = lock_runtime_migration_target(&file).expect("lock target");
+        assert!(fs::OpenOptions::new().write(true).open(&file).is_err());
+        assert!(fs::remove_file(&file).is_err());
+        assert!(fs::rename(&file, root.join("moved.txt")).is_err());
+        assert_eq!(fs::read(&file).expect("readers allowed"), b"copied");
+        drop(lock);
+
+        fs::remove_file(&file).expect("unlocked");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rename_eligibility_rejects_unsafe_layouts() {
+        let (root, source, target) = rename_fixture("dustdesk-runtime-rename-eligibility");
+        let journal = organizer_journal("prepared", &source, &target);
+        check_runtime_migration_rename_eligible(&journal, false).expect("eligible");
+        // A missing new root is fine too.
+        fs::remove_dir(&target).expect("remove empty target");
+        check_runtime_migration_rename_eligible(&journal, false).expect("missing target");
+        fs::create_dir_all(&target).expect("recreate target");
+
+        // Data directory always copies.
+        let mut data = journal.clone();
+        data.target = "data".to_owned();
+        data.old_data_dir = source.display().to_string();
+        data.new_data_dir = target.display().to_string();
+        assert!(check_runtime_migration_rename_eligible(&data, false).is_err());
+
+        // Pending transfer journals.
+        assert!(check_runtime_migration_rename_eligible(&journal, true).is_err());
+
+        // Nested roots.
+        let nested = organizer_journal("prepared", &source, &source.join("inner"));
+        assert!(check_runtime_migration_rename_eligible(&nested, false).is_err());
+
+        // Internal temporary items in the first level or a subfolder's first level.
+        for internal in [
+            source.join(".dustdesk-transfer-1-0.tmp"),
+            source
+                .join("\u{5de5}\u{4f5c}")
+                .join(".dustdesk-source-transfer-1-0.tmp"),
+            source.join("\u{5de5}\u{4f5c}").join(".dustdesk-other.tmp"),
+        ] {
+            fs::create_dir(&internal).expect("create internal item");
+            assert!(
+                check_runtime_migration_rename_eligible(&journal, false).is_err(),
+                "{}",
+                internal.display()
+            );
+            fs::remove_dir(&internal).expect("remove internal item");
+        }
+
+        // A non-empty new root.
+        fs::write(target.join("existing.txt"), b"x").expect("write existing");
+        assert!(check_runtime_migration_rename_eligible(&journal, false).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn assert_copy_mode_migration(steps: FakeSteps, prepare: impl FnOnce(&Path, &Path)) {
+        let (root, source, target) = rename_fixture("dustdesk-runtime-copy-fallback");
+        prepare(&source, &target);
+        let original = tree_contents(&source);
+        let persistence = FakeJournalPersistence::default();
+
+        let outcome = start_runtime_migration_with(
+            organizer_journal("prepared", &source, &target),
+            &persistence,
+            &steps,
+            probe_runtime_directory_writable,
+        )
+        .expect("copy migration");
+
+        assert_eq!(outcome, RuntimeMigrationOutcome::Completed);
+        assert!(steps.calls().contains(&"copy"), "{:?}", steps.calls());
+        let target_contents = tree_contents(&target);
+        for (relative, bytes) in &original {
+            assert_eq!(
+                target_contents.get(relative),
+                Some(bytes),
+                "{}",
+                relative.display()
+            );
+        }
+        assert!(!source.exists(), "old root cleaned after verified copy");
+        assert!(persistence.stored().is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn non_empty_new_root_uses_copy_mode() {
+        assert_copy_mode_migration(
+            FakeSteps {
+                allow_rename: true,
+                real_copy: true,
+                real_cleanup: true,
+                ..FakeSteps::default()
+            },
+            |_, target| fs::write(target.join("existing.txt"), b"keep").expect("write existing"),
+        );
+    }
+
+    #[test]
+    fn pending_transfer_journal_uses_copy_mode() {
+        assert_copy_mode_migration(
+            FakeSteps {
+                allow_rename: true,
+                pending_transfer_journals: true,
+                real_copy: true,
+                real_cleanup: true,
+                ..FakeSteps::default()
+            },
+            |_, _| {},
+        );
+    }
+
+    #[test]
+    fn injected_rename_failure_falls_back_to_copy() {
+        let steps = FakeSteps {
+            allow_rename: true,
+            fail_at: Some("rename"),
+            real_copy: true,
+            real_cleanup: true,
+            ..FakeSteps::default()
+        };
+        assert_copy_mode_migration(steps, |_, _| {});
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rename_blocked_by_open_file_falls_back_to_copy() {
+        let (root, source, target) = rename_fixture("dustdesk-runtime-rename-locked");
+        let original = tree_contents(&source);
+        let persistence = FakeJournalPersistence::default();
+        let steps = FakeSteps {
+            allow_rename: true,
+            hold_during_rename: Some(source.join("\u{5de5}\u{4f5c}").join("a.lnk")),
+            real_copy: true,
+            real_cleanup: true,
+            ..FakeSteps::default()
+        };
+
+        let outcome = start_runtime_migration_with(
+            organizer_journal("prepared", &source, &target),
+            &persistence,
+            &steps,
+            probe_runtime_directory_writable,
+        )
+        .expect("migration falls back to copy");
+
+        assert_eq!(outcome, RuntimeMigrationOutcome::Completed);
+        assert_eq!(
+            steps.calls(),
+            vec!["ensure", "rename", "ensure", "copy", "rewrite", "switch", "cleanup"]
+        );
+        assert_eq!(tree_contents(&target), original);
+        assert!(!source.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn renamed_on_disk(prefix: &str) -> (PathBuf, PathBuf, PathBuf, BTreeMap<PathBuf, Vec<u8>>) {
+        let (root, source, target) = rename_fixture(prefix);
+        let original = tree_contents(&source);
+        fs::remove_dir(&target).expect("remove empty target");
+        fs::rename(&source, &target).expect("simulate the rename");
+        (root, source, target, original)
+    }
+
+    fn rename_journal(
+        phase: &str,
+        source: &Path,
+        target: &Path,
+        renamed: bool,
+    ) -> RuntimeMigrationJournal {
+        let mut journal = organizer_journal(phase, source, target);
+        journal.mode = RUNTIME_MIGRATION_MODE_RENAME.to_owned();
+        journal.renamed = renamed;
+        journal
+    }
+
+    #[test]
+    fn crash_after_rename_before_recording_it_rolls_forward() {
+        for recreate_empty_old_root in [false, true] {
+            let (root, source, target, original) = renamed_on_disk("dustdesk-runtime-rename-crash");
+            if recreate_empty_old_root {
+                fs::create_dir_all(&source).expect("stale window recreates old root");
+            }
+            let persistence = FakeJournalPersistence::with_journal(&rename_journal(
+                "prepared", &source, &target, false,
+            ));
+            let steps = FakeSteps {
+                allow_rename: true,
+                real_copy: true,
+                real_cleanup: true,
+                ..FakeSteps::default()
+            };
+
+            let outcome = recover_pending_runtime_migration_with(&persistence, &steps)
+                .expect("recovery rolls forward");
+
+            assert_eq!(outcome, RuntimeMigrationOutcome::Completed);
+            assert_eq!(steps.calls(), vec!["ensure", "rewrite", "switch"]);
+            assert_eq!(tree_contents(&target), original);
+            assert_eq!(source.exists(), recreate_empty_old_root);
+            assert!(persistence.stored().is_none());
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn rewrite_failure_after_rename_is_never_rolled_back() {
+        let (root, source, target) = rename_fixture("dustdesk-runtime-rename-rewrite-fails");
+        let original = tree_contents(&source);
+        let persistence = FakeJournalPersistence::default();
+        let steps = FakeSteps {
+            allow_rename: true,
+            fail_at: Some("rewrite"),
+            ..FakeSteps::default()
+        };
+
+        let error = start_runtime_migration_with(
+            organizer_journal("prepared", &source, &target),
+            &persistence,
+            &steps,
+            probe_runtime_directory_writable,
+        )
+        .expect_err("incomplete migration surfaces as an error");
+
+        assert!(error.contains("\u{672a}\u{5b8c}\u{6210}"), "{error}");
+        assert!(error
+            .contains("\u{4e0b}\u{6b21}\u{4fee}\u{6539}\u{76ee}\u{5f55}\u{6216}\u{542f}\u{52a8}"));
+        assert_eq!(steps.calls(), vec!["ensure", "rename", "rewrite"]);
+        let stored = persistence.stored().expect("journal kept");
+        assert_eq!(stored.mode, "rename");
+        assert!(stored.renamed);
+        assert_eq!(stored.phase, "copied");
+        assert_eq!(tree_contents(&target), original);
+
+        // Startup recovery hitting the same failure aborts instead of continuing.
+        let failing = FakeSteps::failing_at("rewrite");
+        recover_runtime_migration_for_startup_with(&persistence, &failing, |_, _| {})
+            .expect_err("startup recovery must stop");
+        assert!(!failing.calls().contains(&"revert"));
+        assert!(persistence.stored().expect("journal still kept").renamed);
+
+        // Once the rewrite works the migration rolls forward without copying or cleaning.
+        let steps = FakeSteps::default();
+        let outcome =
+            recover_pending_runtime_migration_with(&persistence, &steps).expect("roll forward");
+        assert_eq!(outcome, RuntimeMigrationOutcome::Completed);
+        assert_eq!(steps.calls(), vec!["ensure", "rewrite", "switch"]);
+        assert!(persistence.stored().is_none());
+        assert_eq!(tree_contents(&target), original);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recreated_empty_old_root_after_rename_is_not_rolled_back_or_cleaned() {
+        let (root, source, target) = rename_fixture("dustdesk-runtime-rename-recreated");
+        let original = tree_contents(&source);
+        let persistence = FakeJournalPersistence::default();
+        let steps = FakeSteps {
+            allow_rename: true,
+            fail_at: Some("switch"),
+            ..FakeSteps::default()
+        };
+        start_runtime_migration_with(
+            organizer_journal("prepared", &source, &target),
+            &persistence,
+            &steps,
+            probe_runtime_directory_writable,
+        )
+        .expect_err("switch failure surfaces");
+        assert!(!source.exists());
+
+        // A window with a stale store recreates the old root before the next attempt.
+        fs::create_dir_all(&source).expect("recreate old root");
+        let steps = FakeSteps {
+            real_copy: true,
+            real_cleanup: true,
+            ..FakeSteps::default()
+        };
+        let outcome =
+            recover_pending_runtime_migration_with(&persistence, &steps).expect("roll forward");
+
+        assert_eq!(outcome, RuntimeMigrationOutcome::Completed);
+        assert_eq!(steps.calls(), vec!["ensure", "switch"]);
+        assert!(source.is_dir(), "cleanup deletes nothing");
+        assert_eq!(fs::read_dir(&source).expect("old root").count(), 0);
+        assert_eq!(tree_contents(&target), original);
+        assert!(persistence.stored().is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn transfer_recovery_failure_writes_no_journal() {
+        let (root, source, target) = rename_fixture("dustdesk-runtime-transfer-recover");
+        let persistence = FakeJournalPersistence::default();
+        let steps = FakeSteps::failing_at("transfer-recover");
+
+        start_runtime_migration_with(
+            organizer_journal("prepared", &source, &target),
+            &persistence,
+            &steps,
+            |_| Ok(()),
+        )
+        .expect_err("recovery failure stops the migration");
+
+        assert_eq!(persistence.saves.get(), 0);
+        assert!(steps.calls().is_empty());
+        assert!(source.join("top.txt").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn nested_same_size_conflict_rolls_back_without_cleaning_source() {
+        let root = test_dir("dustdesk-runtime-nested-conflict");
+        let source = root.join("old");
+        let target = root.join("new");
+        fs::create_dir_all(source.join("cat")).expect("create source");
+        fs::create_dir_all(target.join("cat")).expect("create target");
+        fs::write(source.join("cat").join("a.txt"), b"aaaa").expect("write source");
+        fs::write(target.join("cat").join("a.txt"), b"bbbb").expect("write target");
+        let modified = fs::metadata(source.join("cat").join("a.txt"))
+            .and_then(|metadata| metadata.modified())
+            .expect("source time");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(target.join("cat").join("a.txt"))
+            .and_then(|file| file.set_modified(modified))
+            .expect("align target time");
+        let persistence = FakeJournalPersistence::default();
+        let steps = FakeSteps {
+            allow_rename: true,
+            real_copy: true,
+            real_cleanup: true,
+            ..FakeSteps::default()
+        };
+
+        let outcome = start_runtime_migration_with(
+            organizer_journal("prepared", &source, &target),
+            &persistence,
+            &steps,
+            probe_runtime_directory_writable,
+        )
+        .expect("rollback outcome");
+
+        assert!(matches!(outcome, RuntimeMigrationOutcome::RolledBack(_)));
+        assert!(!steps.calls().contains(&"cleanup"));
+        assert_eq!(
+            fs::read(source.join("cat").join("a.txt")).expect("source"),
+            b"aaaa"
+        );
+        assert_eq!(
+            fs::read(target.join("cat").join("a.txt")).expect("target"),
+            b"bbbb"
+        );
+        assert!(persistence.stored().is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn directory_item_is_structure_checked_and_counted_as_verified() {
+        let root = test_dir("dustdesk-runtime-dir-verified");
+        let source = root.join("old");
+        let target = root.join("new");
+        fs::create_dir_all(source.join("cat").join("sub")).expect("create source");
+        fs::write(source.join("cat").join("one.bin"), vec![1u8; 4096]).expect("write one");
+        fs::write(
+            source.join("cat").join("sub").join("two.bin"),
+            vec![2u8; 8192],
+        )
+        .expect("write two");
+        fs::write(source.join("single.txt"), b"single").expect("write single");
+        let (progress, recorded) = recording_progress();
+        take_full_content_comparisons();
+
+        with_runtime_migration_progress(progress, || {
+            AppRuntimeMigrationSteps
+                .copy_and_verify(&organizer_journal("prepared", &source, &target))
+        })
+        .expect("copy");
+
+        assert_eq!(
+            take_full_content_comparisons(),
+            BTreeMap::from([(source.join("single.txt"), 1usize)])
+        );
+        assert_eq!(tree_contents(&target), tree_contents(&source));
+        let recorded = recorded.lock().expect("progress log");
+        // The directory's bytes count as verified as soon as its structure check passed.
+        assert!(recorded
+            .iter()
+            .any(|payload| payload.phase == "copying" && payload.verified_bytes >= 4096 + 8192));
+        let copy_end = recorded
+            .iter()
+            .filter(|payload| payload.phase == "copying")
+            .last()
+            .expect("copy end");
+        assert_eq!(copy_end.verified_bytes, copy_end.bytes_total);
+        drop(recorded);
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod desktop_transfer_progress_tests {
+    use super::*;
+    use std::time::UNIX_EPOCH;
+
+    type Recorded = Arc<Mutex<Vec<DesktopTransferProgressPayload>>>;
+
+    /// Records every update (no throttling).
+    fn recording_progress(operation: &str) -> (Arc<DesktopTransferProgress>, Recorded) {
+        let recorded: Recorded = Arc::default();
+        let sink = recorded.clone();
+        let progress = DesktopTransferProgress::new(operation, Duration::ZERO, move |payload| {
+            sink.lock().expect("progress log").push(payload.clone());
+        });
+        (progress, recorded)
+    }
+
+    fn test_dir(prefix: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("{prefix}-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create test dir");
+        dir
+    }
+
+    fn pattern(len: usize, seed: u8) -> Vec<u8> {
+        (0..len)
+            .map(|index| (index as u8).wrapping_mul(31).wrapping_add(seed))
+            .collect()
+    }
+
+    /// A directory with a multi-chunk file, nested Unicode folders and small files.
+    fn write_source_tree(root: &Path) -> u64 {
+        let nested = root.join("\u{6cca}\u{9510}\u{79d1}\u{6280}").join("nested");
+        fs::create_dir_all(&nested).expect("create source tree");
+        let big = pattern(6 * 1024 * 1024 + 123, 7);
+        fs::write(root.join("big.bin"), &big).expect("write big file");
+        fs::write(nested.join("small.txt"), b"small content").expect("write small file");
+        fs::write(root.join("empty.txt"), b"").expect("write empty file");
+        (big.len() + b"small content".len()) as u64
+    }
+
+    fn tree_contents(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn walk(root: &Path, dir: &Path, output: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            for entry in fs::read_dir(dir).expect("read tree") {
+                let path = entry.expect("tree entry").path();
+                if path.is_dir() {
+                    walk(root, &path, output);
+                } else {
+                    let relative = path.strip_prefix(root).expect("relative").to_path_buf();
+                    output.insert(relative, fs::read(&path).expect("read file"));
+                }
+            }
+        }
+        let mut output = BTreeMap::new();
+        walk(root, root, &mut output);
+        output
+    }
+
+    fn assert_copy_progress(recorded: &Recorded, expected_total: u64) {
+        let recorded = recorded.lock().expect("progress log").clone();
+        let copying = recorded
+            .iter()
+            .filter(|payload| payload.copying)
+            .collect::<Vec<_>>();
+        assert!(!copying.is_empty(), "a cross-volume copy reports bytes");
+        let mut last = 0;
+        for payload in &copying {
+            assert_eq!(payload.bytes_total, expected_total);
+            assert!(payload.bytes_done >= last, "byte progress never decreases");
+            assert!(payload.bytes_done <= payload.bytes_total);
+            assert!(payload.verified_bytes <= payload.bytes_total);
+            last = payload.bytes_done;
+        }
+        assert_eq!(last, expected_total, "finished copy reports every byte");
+        let final_payload = recorded.last().expect("final payload");
+        assert!(!final_payload.copying, "finished copy leaves byte tracking");
+    }
+
+    #[test]
+    fn cross_volume_move_reports_monotonic_bytes_and_matches_a_move_without_progress() {
+        let root = test_dir("dustdesk-desktop-transfer-bytes");
+
+        // Reference: the same items moved without any progress installed.
+        let plain_dir = root.join("plain-source");
+        let plain_file = root.join("plain-file.bin");
+        write_source_tree(&plain_dir);
+        fs::write(&plain_file, pattern(3 * 1024 * 1024 + 5, 3)).expect("write plain file");
+        let expected_tree = tree_contents(&plain_dir);
+        let expected_file = fs::read(&plain_file).expect("read plain file");
+        move_path_across_volumes(&plain_dir, &root.join("plain-destination"))
+            .expect("move directory without progress");
+        move_path_across_volumes(&plain_file, &root.join("plain-file-destination.bin"))
+            .expect("move file without progress");
+
+        let source_dir = root.join("source");
+        let dir_total = write_source_tree(&source_dir);
+        let destination_dir = root.join("destination");
+        let (progress, recorded) = recording_progress("archive");
+        with_desktop_transfer_progress(Some(progress.clone()), || {
+            move_path_across_volumes(&source_dir, &destination_dir)
+        })
+        .expect("move directory with progress");
+        assert_copy_progress(&recorded, dir_total);
+        assert_eq!(
+            progress
+                .size_scans
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert!(!source_dir.exists(), "source directory is moved away");
+        assert_eq!(tree_contents(&destination_dir), expected_tree);
+        assert_eq!(
+            tree_contents(&root.join("plain-destination")),
+            tree_contents(&destination_dir)
+        );
+
+        let source_file = root.join("file.bin");
+        fs::write(&source_file, &expected_file).expect("write source file");
+        let destination_file = root.join("file-destination.bin");
+        let (progress, recorded) = recording_progress("restore");
+        with_desktop_transfer_progress(Some(progress), || {
+            move_path_across_volumes(&source_file, &destination_file)
+        })
+        .expect("move file with progress");
+        assert_copy_progress(&recorded, expected_file.len() as u64);
+        assert!(
+            recorded
+                .lock()
+                .expect("progress log")
+                .iter()
+                .any(|payload| payload.verified_bytes > 0),
+            "the single full comparison reports verified bytes"
+        );
+        assert!(!source_file.exists(), "source file is moved away");
+        assert_eq!(
+            fs::read(&destination_file).expect("read moved file"),
+            expected_file
+        );
+        assert_eq!(
+            fs::read(root.join("plain-file-destination.bin")).expect("read plain move"),
+            expected_file
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn panicking_progress_sink_does_not_affect_the_move() {
+        let root = test_dir("dustdesk-desktop-transfer-panic");
+        let source_dir = root.join("source");
+        write_source_tree(&source_dir);
+        let expected_tree = tree_contents(&source_dir);
+        let source_file = root.join("file.bin");
+        let file_content = pattern(2 * 1024 * 1024 + 9, 11);
+        fs::write(&source_file, &file_content).expect("write source file");
+        let progress = DesktopTransferProgress::new("archive", Duration::ZERO, |_| {
+            panic!("progress sink failure")
+        });
+
+        with_desktop_transfer_progress(Some(progress), || {
+            move_path_across_volumes(&source_dir, &root.join("destination"))?;
+            move_path_across_volumes(&source_file, &root.join("file-destination.bin"))
+        })
+        .expect("moves succeed although the sink panics");
+
+        assert!(!source_dir.exists());
+        assert!(!source_file.exists());
+        assert_eq!(tree_contents(&root.join("destination")), expected_tree);
+        assert_eq!(
+            fs::read(root.join("file-destination.bin")).expect("read moved file"),
+            file_content
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn same_volume_rename_does_not_measure_the_item() {
+        let root = test_dir("dustdesk-desktop-transfer-rename");
+        let source = root.join("source");
+        write_source_tree(&source);
+        let expected_tree = tree_contents(&source);
+        let (progress, recorded) = recording_progress("archive");
+
+        with_desktop_transfer_progress(Some(progress.clone()), || {
+            move_path(&source, &root.join("destination"))
+        })
+        .expect("same-volume rename");
+
+        assert_eq!(
+            progress
+                .size_scans
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a rename never walks the item for its size"
+        );
+        assert!(recorded
+            .lock()
+            .expect("progress log")
+            .iter()
+            .all(|payload| !payload.copying && payload.bytes_total == 0));
+        assert_eq!(tree_contents(&root.join("destination")), expected_tree);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn archiving_several_items_reports_item_positions() {
+        let root = test_dir("dustdesk-desktop-transfer-items");
+        let desktop = root.join("desktop");
+        let data = root.join("data");
+        let organizer = root.join("organizer");
+        let launchers = root.join("launchers");
+        for dir in [&desktop, &data, &organizer, &launchers] {
+            fs::create_dir_all(dir).expect("create test root");
+        }
+        let names = ["a.txt", "b.txt", "c.txt"];
+        let paths = names
+            .iter()
+            .map(|name| {
+                let path = desktop.join(name);
+                fs::write(&path, name.as_bytes()).expect("write desktop item");
+                (path.display().to_string(), None)
+            })
+            .collect::<Vec<_>>();
+        let store = AppStore::for_test(data, organizer.clone(), launchers);
+        let mut config = AppConfig {
+            desktop_categories: vec![DeskCategory {
+                name: "\u{6587}\u{6863}".to_owned(),
+                ..DeskCategory::default()
+            }],
+            ..AppConfig::default()
+        };
+        let (progress, recorded) = recording_progress("archive");
+
+        let added = with_desktop_transfer_progress(Some(progress.clone()), || {
+            archive_paths_into_category(&store, &mut config, 0, paths)
+        })
+        .expect("archive items");
+        progress.complete(true);
+
+        assert_eq!(added, 3);
+        assert_eq!(config.desktop_categories[0].item_paths.len(), 3);
+        let recorded = recorded.lock().expect("progress log").clone();
+        let positions = recorded
+            .iter()
+            .filter(|payload| payload.status == "running" && !payload.current.is_empty())
+            .map(|payload| (payload.item_index, payload.current.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            positions,
+            vec![
+                (1, "a".to_owned()),
+                (2, "b".to_owned()),
+                (3, "c".to_owned()),
+            ]
+        );
+        assert!(recorded
+            .iter()
+            .all(|payload| payload.target == "\u{6587}\u{6863}" && payload.items_total == 3));
+        let last = recorded.last().expect("final payload");
+        assert_eq!(last.status, "finished");
+        assert_eq!(last.item_index, 3);
+        for name in names {
+            assert!(!desktop.join(name).exists());
+            assert!(organizer.join("\u{6587}\u{6863}").join(name).exists());
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn copying_payload(done: u64, total: u64, verified: u64) -> DesktopTransferProgressPayload {
+        DesktopTransferProgressPayload {
+            operation: "restart-recollect".to_owned(),
+            status: "running".to_owned(),
+            item_index: 3,
+            items_total: 107,
+            current: "\u{6cca}\u{9510}\u{79d1}\u{6280}".to_owned(),
+            current_path:
+                "D:\\DesktopOrganizer\\\u{6587}\u{6863}\\\u{6cca}\u{9510}\u{79d1}\u{6280}"
+                    .to_owned(),
+            copying: true,
+            bytes_done: done,
+            bytes_total: total,
+            verified_bytes: verified,
+            ..DesktopTransferProgressPayload::default()
+        }
+    }
+
+    const GB_1_2: u64 = 1_288_490_189;
+    const GB_3_4: u64 = 3_650_722_202;
+
+    #[test]
+    fn transfer_messages_carry_byte_detail_only_while_copying() {
+        let payload = copying_payload(GB_1_2, GB_3_4, 0);
+        assert_eq!(
+            desktop_transfer_bytes_detail(&payload).as_deref(),
+            Some("\u{5df2}\u{590d}\u{5236} 1.2 GB / 3.4 GB")
+        );
+        assert_eq!(
+            message_with_transfer_detail(
+                &restart_recollect_progress_message(3, 107, Path::new(&payload.current_path)),
+                &payload
+            ),
+            "\u{6b63}\u{5728}\u{6062}\u{590d}\u{6536}\u{7eb3}\u{5206}\u{7c7b} 3/107\u{ff1a}\u{6cca}\u{9510}\u{79d1}\u{6280}\u{ff08}\u{5df2}\u{590d}\u{5236} 1.2 GB / 3.4 GB\u{ff09}"
+        );
+        assert_eq!(
+            desktop_transfer_bytes_detail(&copying_payload(GB_3_4, GB_3_4, GB_1_2)).as_deref(),
+            Some("\u{5df2}\u{590d}\u{5236} 3.4 GB / 3.4 GB\u{ff0c}\u{5df2}\u{6821}\u{9a8c} 1.2 GB")
+        );
+        let idle = DesktopTransferProgressPayload {
+            copying: false,
+            ..copying_payload(0, 0, 0)
+        };
+        assert_eq!(desktop_transfer_bytes_detail(&idle), None);
+        assert_eq!(
+            message_with_transfer_detail("\u{6b63}\u{5728}\u{8fd8}\u{539f}", &idle),
+            "\u{6b63}\u{5728}\u{8fd8}\u{539f}"
+        );
+    }
+
+    #[test]
+    fn operation_relay_republishes_byte_detail_until_closed() {
+        let published = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = published.clone();
+        let relay = DesktopOperationProgressRelay::new(classify_progress_message, move |payload| {
+            sink.lock().expect("published").push(payload.message);
+        });
+        let idle = DesktopTransferProgressPayload {
+            copying: false,
+            ..copying_payload(0, 0, 0)
+        };
+        // Bytes before any item message have nothing to attach to.
+        relay.on_transfer(&copying_payload(1, 10, 0));
+        relay.publish_progress(
+            DesktopOperationPayload {
+                kind: "classify",
+                scope: "manual",
+                status: "progress",
+                message: classify_progress_message(12, 40, Path::new("C:\\Desktop\\a.txt")),
+                moved: 11,
+                skipped: 0,
+                restored: 0,
+                total: 40,
+                current_path: "C:\\Desktop\\a.txt".to_owned(),
+                category_counts: Vec::new(),
+            },
+            &idle,
+        );
+        let mut copying = copying_payload(GB_1_2, GB_3_4, 0);
+        copying.item_index = 12;
+        copying.items_total = 40;
+        relay.on_transfer(&copying);
+        // Identical text is not published twice; idle updates are ignored.
+        relay.on_transfer(&copying);
+        relay.on_transfer(&idle);
+        relay.close();
+        relay.on_transfer(&copying_payload(GB_3_4, GB_3_4, 0));
+
+        let published = published.lock().expect("published").clone();
+        assert_eq!(
+            published,
+            vec![
+                "\u{6b63}\u{5728}\u{6536}\u{7eb3} 12/40\u{ff1a}a".to_owned(),
+                "\u{6b63}\u{5728}\u{6536}\u{7eb3} 12/40\u{ff1a}\u{6cca}\u{9510}\u{79d1}\u{6280}\u{ff08}\u{5df2}\u{590d}\u{5236} 1.2 GB / 3.4 GB\u{ff09}".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn concurrent_copies_add_up_and_show_the_latest_item() {
+        let (progress, recorded) = recording_progress("classify");
+        progress.begin(2, "");
+        let first = progress.begin_copy(Path::new("C:\\Desktop\\first"), 100, 1);
+        let second = progress.begin_copy(Path::new("C:\\Desktop\\second"), 50, 1);
+        first.add_done(40, 0);
+        second.add_done(20, 0);
+        let snapshot = progress.snapshot();
+        assert_eq!((snapshot.bytes_done, snapshot.bytes_total), (60, 150));
+        assert_eq!(snapshot.current, "second");
+        first.finish(true);
+        drop(first);
+        let snapshot = progress.snapshot();
+        assert_eq!((snapshot.bytes_done, snapshot.bytes_total), (20, 50));
+        assert!(snapshot.copying);
+        drop(second);
+        assert!(!progress.snapshot().copying);
+        progress.complete(true);
+        assert_eq!(
+            recorded
+                .lock()
+                .expect("progress log")
+                .last()
+                .map(|payload| payload.status.clone()),
+            Some("finished".to_owned())
+        );
+    }
 }

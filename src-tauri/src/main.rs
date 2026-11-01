@@ -2483,10 +2483,23 @@ fn complete_runtime_migration_journal(
         set_runtime_migration_phase(persistence, journal, "copied")?;
     }
 
+    // After a rename the process may have kept running with the old root configured and put new
+    // items into a recreated old root. Merge them like a copy migration (never overwriting,
+    // conflicts are errors) so nothing is left unreferenced; failures keep the journal.
+    let merged_old_root =
+        journal.forward_only() && runtime_migration_old_root_has_content(journal)?;
+    if merged_old_root {
+        steps.copy_and_verify(journal)?;
+    }
+
     if runtime_migration_phase_index(&journal.phase) < runtime_migration_phase_index("rewritten") {
         before_rewrite();
         steps.rewrite_paths(journal)?;
         set_runtime_migration_phase(persistence, journal, "rewritten")?;
+    } else if merged_old_root {
+        // Config written after the earlier rewrite may hold old-root paths of the merged items.
+        // Rewriting prefixes again is a no-op for paths that already point at the new root.
+        steps.rewrite_paths(journal)?;
     }
 
     if runtime_migration_phase_index(&journal.phase) < runtime_migration_phase_index("switched") {
@@ -2495,11 +2508,11 @@ fn complete_runtime_migration_journal(
     }
 
     if runtime_migration_phase_index(&journal.phase) < runtime_migration_phase_index("cleaned") {
-        if journal.forward_only() {
-            // Nothing was copied, so there is no old content to delete. Whatever exists at the old
-            // root now (an empty folder recreated by a stale window) is left untouched.
-            note_runtime_migration_old_root_after_rename(journal);
+        if journal.forward_only() && !runtime_migration_old_root_has_content(journal)? {
+            // Nothing to delete: the old root is gone or an empty folder recreated by a stale
+            // window, which is left untouched.
         } else if let Err(error) = steps.cleanup_sources(journal) {
+            // Merged or copied items are removed only after their structure check passed.
             eprintln!("DustDesk 运行目录已安全切换，旧目录暂未完全清理：{error}");
         }
         set_runtime_migration_phase(persistence, journal, "cleaned")?;
@@ -2521,9 +2534,10 @@ fn resolve_runtime_migration_rename(
     let source_has_content = directory_has_entries(&source)?;
     let target_has_content = directory_has_entries(&target)?;
 
-    if !source_has_content && (target_has_content || !source_exists) {
-        // The rename already happened (the old root is gone or was recreated empty), or there is
-        // nothing to move. Roll forward.
+    // The journal was created with an empty new root, so content there means the rename happened
+    // (anything a stale window put into a recreated old root is merged later). A missing or empty
+    // old root with an empty new root means there is nothing to move.
+    if target_has_content || (!source_has_content && !source_exists) {
         append_desktop_diagnostic(
             "runtime_migration_rename_detected",
             &format!(
@@ -2544,13 +2558,9 @@ fn resolve_runtime_migration_rename(
                 .unwrap_or_default(),
         );
     });
-    let attempt = if target_has_content {
-        Err(format!("新目录不是空目录：{}", target.display()))
-    } else {
-        steps
-            .check_rename_eligible(journal)
-            .and_then(|()| steps.rename_root(&source, &target))
-    };
+    let attempt = steps
+        .check_rename_eligible(journal)
+        .and_then(|()| steps.rename_root(&source, &target));
     match attempt {
         Ok(()) => {
             // In memory first: once renamed, nothing may roll back, even if recording it fails.
@@ -2591,9 +2601,12 @@ fn directory_has_entries(path: &Path) -> Result<bool, String> {
     Ok(entries.next().is_some())
 }
 
-fn note_runtime_migration_old_root_after_rename(journal: &RuntimeMigrationJournal) {
+fn runtime_migration_old_root_has_content(
+    journal: &RuntimeMigrationJournal,
+) -> Result<bool, String> {
     let (source, _) = runtime_migration_primary_pair(journal);
-    if let Ok(true) = directory_has_entries(&source) {
+    let has_content = directory_has_entries(&source)?;
+    if has_content {
         append_desktop_diagnostic(
             "runtime_migration_old_root_not_empty",
             &format!(
@@ -2603,6 +2616,7 @@ fn note_runtime_migration_old_root_after_rename(journal: &RuntimeMigrationJourna
             ),
         );
     }
+    Ok(has_content)
 }
 
 /// Rename mode needs: organizer or launchers, both roots on one volume, neither a volume root nor
@@ -6618,6 +6632,10 @@ fn launchers_with_optional_icons(
 }
 
 fn repair_launchers(store: &AppStore, launchers: &mut models::LaunchData) -> Result<(), String> {
+    if runtime_migration_journal_pending() {
+        // Load read-only until the migration is finished; see `runtime_migration_journal_pending`.
+        return Ok(());
+    }
     let repaired = launcher_items_from_directory(store, &launchers.items)?;
     if !same_launcher_items(&launchers.items, &repaired) {
         launchers.items = repaired;
@@ -7153,6 +7171,32 @@ fn lock_runtime_migration_target(path: &Path) -> Result<File, String> {
     File::open(path).map_err(to_message)
 }
 
+/// `remove_dir` only, so a folder that still has content is never removed. Windows refuses to
+/// remove a read-only folder (common for customized folders with desktop.ini), so after an access
+/// error on an empty read-only folder its read-only attribute is cleared and removal retried.
+fn remove_empty_migrated_directory(path: &Path) -> io::Result<()> {
+    let error = match fs::remove_dir(path) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    if error.kind() != io::ErrorKind::PermissionDenied {
+        return Err(error);
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_dir()
+        || metadata_is_reparse_point(&metadata)
+        || !metadata.permissions().readonly()
+        || fs::read_dir(path)?.next().is_some()
+    {
+        return Err(error);
+    }
+    let mut permissions = metadata.permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    fs::set_permissions(path, permissions)?;
+    fs::remove_dir(path)
+}
+
 fn remove_verified_directory_contents(source: &Path, target: &Path) -> Result<(), String> {
     if same_path_for_move(source, target) || !source.exists() {
         return Ok(());
@@ -7198,7 +7242,7 @@ fn remove_verified_directory_contents(source: &Path, target: &Path) -> Result<()
         report_runtime_migration_progress(|progress| progress.add_done(removed.0, removed.1));
     }
 
-    match fs::remove_dir(source) {
+    match remove_empty_migrated_directory(source) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(format!(
@@ -8059,11 +8103,35 @@ fn repair_category_item_paths_for_desktop(
     repair_category_item_paths_with_desktop_roots(store, config, &[desktop.to_path_buf()])
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_RUNTIME_MIGRATION_PENDING: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// True while `runtime-migration.json` exists. Must be called under the storage lock. Paths may
+/// then point at a root whose data already moved (an interrupted rename), so snapshot repairs must
+/// not drop "missing" paths. An unreadable journal location counts as pending.
+fn runtime_migration_journal_pending() -> bool {
+    #[cfg(test)]
+    {
+        TEST_RUNTIME_MIGRATION_PENDING.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        !matches!(AppStore::load_runtime_migration_journal(), Ok(None))
+    }
+}
+
 fn repair_category_item_paths_with_desktop_roots(
     store: &AppStore,
     config: &mut AppConfig,
     desktop_roots: &[PathBuf],
 ) -> Result<(), String> {
+    if runtime_migration_journal_pending() {
+        // Load read-only until the migration is finished.
+        return Ok(());
+    }
     let organizer_root = store.organizer_root();
     let mut changed = recover_missing_categories_from_organizer(&organizer_root, config);
     let mut seen_paths = Vec::<String>::new();
@@ -17467,6 +17535,282 @@ mod runtime_migration_tests {
         assert!(persistence.stored().is_none(), "journal removed");
         assert!(take_full_content_comparisons().is_empty());
         assert_eq!(phases_of(&recorded), ["moving", "switching", "done"]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Simulates a rename that happened but was never recorded, after which a stale window
+    /// recreated the old root and organized new items into it.
+    fn renamed_then_old_root_refilled(
+        prefix: &str,
+    ) -> (PathBuf, PathBuf, PathBuf, BTreeMap<PathBuf, Vec<u8>>) {
+        let (root, source, target, original) = renamed_on_disk(prefix);
+        fs::create_dir_all(source.join("\u{5de5}\u{4f5c}")).expect("recreate old root");
+        fs::write(
+            source.join("\u{5de5}\u{4f5c}").join("late.lnk"),
+            b"late item",
+        )
+        .expect("write late item");
+        fs::write(source.join("late-top.txt"), b"late top").expect("write late top");
+        (root, source, target, original)
+    }
+
+    #[test]
+    fn unrecorded_rename_with_refilled_old_root_rolls_forward_and_merges() {
+        let (root, source, target, original) =
+            renamed_then_old_root_refilled("dustdesk-runtime-rename-refilled");
+        let persistence = FakeJournalPersistence::with_journal(&rename_journal(
+            "prepared", &source, &target, false,
+        ));
+        let steps = FakeSteps {
+            allow_rename: true,
+            real_copy: true,
+            real_cleanup: true,
+            ..FakeSteps::default()
+        };
+
+        let outcome = recover_pending_runtime_migration_with(&persistence, &steps)
+            .expect("recovery rolls forward");
+
+        assert_eq!(outcome, RuntimeMigrationOutcome::Completed);
+        assert_eq!(
+            steps.calls(),
+            vec!["ensure", "copy", "rewrite", "switch", "cleanup"]
+        );
+        let mut expected = original.clone();
+        expected.insert(
+            Path::new("\u{5de5}\u{4f5c}").join("late.lnk"),
+            b"late item".to_vec(),
+        );
+        expected.insert(PathBuf::from("late-top.txt"), b"late top".to_vec());
+        assert_eq!(tree_contents(&target), expected);
+        assert!(
+            !source.exists(),
+            "merged old root cleaned after verification"
+        );
+        assert!(persistence.stored().is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_merge_after_unrecorded_rename_keeps_journal_and_both_roots() {
+        let (root, source, target, original) =
+            renamed_then_old_root_refilled("dustdesk-runtime-rename-merge-fails");
+        let persistence = FakeJournalPersistence::with_journal(&rename_journal(
+            "prepared", &source, &target, false,
+        ));
+        let steps = FakeSteps {
+            allow_rename: true,
+            fail_at: Some("copy"),
+            real_cleanup: true,
+            ..FakeSteps::default()
+        };
+
+        let error = recover_pending_runtime_migration_with(&persistence, &steps)
+            .expect_err("merge failure is incomplete, not rolled back");
+
+        assert!(error.contains("\u{672a}\u{5b8c}\u{6210}"), "{error}");
+        assert_eq!(steps.calls(), vec!["ensure", "copy"]);
+        let stored = persistence.stored().expect("journal kept");
+        assert_eq!(stored.mode, "rename");
+        assert!(stored.renamed);
+        assert_eq!(tree_contents(&target), original);
+        assert_eq!(
+            fs::read(source.join("\u{5de5}\u{4f5c}").join("late.lnk")).expect("late item kept"),
+            b"late item"
+        );
+        assert_eq!(
+            fs::read(source.join("late-top.txt")).expect("late top kept"),
+            b"late top"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rewritten_rename_journal_merges_new_old_root_item_before_cleaning_it() {
+        let (root, source, target, original) = renamed_on_disk("dustdesk-runtime-rename-late");
+        fs::create_dir_all(&source).expect("recreate old root");
+        fs::write(source.join("new.txt"), b"organized later").expect("write new item");
+        let persistence = FakeJournalPersistence::with_journal(&rename_journal(
+            "rewritten",
+            &source,
+            &target,
+            true,
+        ));
+        let steps = FakeSteps {
+            real_copy: true,
+            real_cleanup: true,
+            ..FakeSteps::default()
+        };
+
+        let outcome =
+            recover_pending_runtime_migration_with(&persistence, &steps).expect("roll forward");
+
+        assert_eq!(outcome, RuntimeMigrationOutcome::Completed);
+        // Copied and verified, paths re-pointed, then cleaned only after the switch.
+        assert_eq!(
+            steps.calls(),
+            vec!["ensure", "copy", "rewrite", "switch", "cleanup"]
+        );
+        let mut expected = original.clone();
+        expected.insert(PathBuf::from("new.txt"), b"organized later".to_vec());
+        assert_eq!(tree_contents(&target), expected);
+        assert!(!source.exists());
+        assert!(persistence.stored().is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn changed_merged_copy_keeps_old_root_item() {
+        let (root, source, target, _) = renamed_on_disk("dustdesk-runtime-rename-late-check");
+        fs::create_dir_all(&source).expect("recreate old root");
+        fs::write(source.join("new.txt"), b"organized later").expect("write new item");
+        let journal = rename_journal("switched", &source, &target, true);
+        AppRuntimeMigrationSteps
+            .copy_and_verify(&journal)
+            .expect("merge copy");
+        fs::write(target.join("new.txt"), b"changed after merge!").expect("change copy");
+
+        cleanup_runtime_migration_sources(&journal).expect_err("structure check fails");
+
+        assert_eq!(
+            fs::read(source.join("new.txt")).expect("old item kept"),
+            b"organized later"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pending_migration_journal_makes_snapshot_repair_read_only() {
+        let root = test_dir("dustdesk-runtime-pending-repair");
+        let store = AppStore::for_test(
+            root.join("data"),
+            root.join("organizer"),
+            root.join("launchers"),
+        );
+        store.ensure_runtime_dirs().expect("dirs");
+        let missing = root
+            .join("organizer")
+            .join("docs")
+            .join("moved-away.txt")
+            .display()
+            .to_string();
+        let make_config = || AppConfig {
+            desktop_categories: vec![DeskCategory {
+                name: "docs".to_owned(),
+                item_paths: vec![missing.clone()],
+                ..DeskCategory::default()
+            }],
+            ..AppConfig::default()
+        };
+        let mut launchers = models::LaunchData::default();
+        launchers.items.push(LaunchItem {
+            name: "gone".to_owned(),
+            path: root
+                .join("launchers")
+                .join("gone.lnk")
+                .display()
+                .to_string(),
+            icon_data_url: None,
+        });
+
+        TEST_RUNTIME_MIGRATION_PENDING.with(|pending| pending.set(true));
+        let mut config = make_config();
+        let repair = repair_category_item_paths(&store, &mut config);
+        let mut kept_launchers = launchers.clone();
+        let launcher_repair = repair_launchers(&store, &mut kept_launchers);
+        TEST_RUNTIME_MIGRATION_PENDING.with(|pending| pending.set(false));
+        repair.expect("read-only repair");
+        launcher_repair.expect("read-only launcher repair");
+        assert_eq!(
+            config.desktop_categories[0].item_paths,
+            vec![missing.clone()]
+        );
+        assert_eq!(kept_launchers.items.len(), 1);
+        assert!(!store.config_path().exists(), "config.json not written");
+        assert!(!store.launch_path().exists(), "launch.json not written");
+
+        // Without a journal the same repair drops the missing path as before.
+        let mut config = make_config();
+        repair_category_item_paths(&store, &mut config).expect("normal repair");
+        assert!(config.desktop_categories[0].item_paths.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    fn set_test_attributes(path: &Path, attributes: u32) {
+        use windows_sys::Win32::Storage::FileSystem::SetFileAttributesW;
+        let wide = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        assert_ne!(unsafe { SetFileAttributesW(wide.as_ptr(), attributes) }, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn read_only_hidden_and_system_items_pass_target_lock_and_are_cleaned() {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_READONLY,
+            FILE_ATTRIBUTE_SYSTEM,
+        };
+
+        let root = test_dir("dustdesk-runtime-attributes");
+        let source = root.join("old");
+        let target = root.join("new");
+        // A small folder (per-file copy) and a large one (robocopy /COPY:DAT /DCOPY:DAT).
+        for (name, extra) in [
+            ("small", 0usize),
+            ("large", MAX_LOCKED_TRANSFER_TREE_ENTRIES + 5),
+        ] {
+            let dir = source.join(name);
+            let nested = dir.join("hidden-system");
+            fs::create_dir_all(&nested).expect("create dirs");
+            for index in 0..extra {
+                fs::write(dir.join(format!("filler-{index}.txt")), b"filler").expect("filler");
+            }
+            for (file, attributes) in [
+                ("read-only.txt", FILE_ATTRIBUTE_READONLY),
+                ("hidden.txt", FILE_ATTRIBUTE_HIDDEN),
+                ("system.txt", FILE_ATTRIBUTE_SYSTEM),
+                (
+                    "all.txt",
+                    FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM,
+                ),
+            ] {
+                fs::write(dir.join(file), file.as_bytes()).expect("write file");
+                set_test_attributes(&dir.join(file), attributes);
+                fs::write(nested.join(file), file.as_bytes()).expect("write nested file");
+                set_test_attributes(&nested.join(file), attributes);
+            }
+            set_test_attributes(
+                &nested,
+                FILE_ATTRIBUTE_DIRECTORY
+                    | FILE_ATTRIBUTE_READONLY
+                    | FILE_ATTRIBUTE_HIDDEN
+                    | FILE_ATTRIBUTE_SYSTEM,
+            );
+        }
+        fs::write(source.join("top-read-only.txt"), b"top").expect("write top");
+        set_test_attributes(&source.join("top-read-only.txt"), FILE_ATTRIBUTE_READONLY);
+        let original = tree_contents(&source);
+        let journal = organizer_journal("prepared", &source, &target);
+
+        AppRuntimeMigrationSteps
+            .copy_and_verify(&journal)
+            .expect("copy and confirm");
+        AppRuntimeMigrationSteps
+            .cleanup_sources(&journal)
+            .expect("verified cleanup");
+
+        assert_eq!(tree_contents(&target), original);
+        assert!(!source.exists(), "source cleaned");
+        let copied = fs::metadata(target.join("large").join("read-only.txt")).expect("copied");
+        assert!(copied.permissions().readonly(), "attributes were copied");
+        let _ = std::process::Command::new("attrib")
+            .args(["-r", "-h", "-s", "/s", "/d"])
+            .arg(root.join("*"))
+            .output();
         let _ = fs::remove_dir_all(root);
     }
 

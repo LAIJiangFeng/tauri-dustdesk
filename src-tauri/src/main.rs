@@ -7110,9 +7110,10 @@ fn verify_directory_contents_contained(source: &Path, target: &Path) -> Result<(
             progress.set_current(&entry.file_name().to_string_lossy())
         });
         let _source_lock = lock_transfer_source_tree(&source_path)?;
-        let _target_lock = lock_transfer_source_tree(&target_path)?;
-        // Every file was fully compared once by the copy step of this run, so a structure check
-        // (type, entry count, size, modified time) confirms nothing changed since.
+        let _target_lock = lock_runtime_migration_target(&target_path)?;
+        // New files were fully compared and new directory items structure checked before their
+        // commit, so a structure check (type, entry count, size, modified time) confirms nothing
+        // changed since.
         verify_copied_path_shape_with(&source_path, &target_path, &mut |len| {
             report_runtime_migration_progress(|progress| progress.add_done(len, 1));
         })
@@ -7120,6 +7121,36 @@ fn verify_directory_contents_contained(source: &Path, target: &Path) -> Result<(
     }
 
     Ok(())
+}
+
+/// Holds a migrated target item while it is checked, without reading its data. The handle asks for
+/// DELETE so its share mode is enforced: nobody can write, rename or delete the item until it is
+/// closed, while readers stay allowed. A data-access open of every freshly copied file would make
+/// real-time antivirus scan each one (about 20 ms per file measured), which dominated migrations
+/// of folders with many small files.
+#[cfg(windows)]
+fn lock_runtime_migration_target(path: &Path) -> Result<File, String> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ,
+    };
+
+    let file = fs::OpenOptions::new()
+        .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|error| format!("无法锁定迁移目标 {}：{error}", path.display()))?;
+    let metadata = file.metadata().map_err(to_message)?;
+    reject_transfer_reparse_point(path, &metadata)?;
+    Ok(file)
+}
+
+#[cfg(not(windows))]
+fn lock_runtime_migration_target(path: &Path) -> Result<File, String> {
+    let metadata = fs::symlink_metadata(path).map_err(to_message)?;
+    reject_transfer_reparse_point(path, &metadata)?;
+    File::open(path).map_err(to_message)
 }
 
 fn remove_verified_directory_contents(source: &Path, target: &Path) -> Result<(), String> {
@@ -7154,7 +7185,7 @@ fn remove_verified_directory_contents(source: &Path, target: &Path) -> Result<()
             progress.set_current(&entry.file_name().to_string_lossy())
         });
         let locked_source = lock_transfer_source_tree(&source_path)?;
-        let _locked_target = lock_transfer_source_tree(&target_path)?;
+        let _locked_target = lock_runtime_migration_target(&target_path)?;
         // Fast structure check before deleting: the target must exist with the same type, entry
         // counts, sizes and modified times; otherwise the source is kept.
         let mut removed = (0u64, 0u64);
@@ -17436,6 +17467,24 @@ mod runtime_migration_tests {
         assert!(persistence.stored().is_none(), "journal removed");
         assert!(take_full_content_comparisons().is_empty());
         assert_eq!(phases_of(&recorded), ["moving", "switching", "done"]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn target_lock_blocks_writers_and_deleters_but_allows_readers() {
+        let root = test_dir("dustdesk-runtime-target-lock");
+        let file = root.join("copied.txt");
+        fs::write(&file, b"copied").expect("write file");
+
+        let lock = lock_runtime_migration_target(&file).expect("lock target");
+        assert!(fs::OpenOptions::new().write(true).open(&file).is_err());
+        assert!(fs::remove_file(&file).is_err());
+        assert!(fs::rename(&file, root.join("moved.txt")).is_err());
+        assert_eq!(fs::read(&file).expect("readers allowed"), b"copied");
+        drop(lock);
+
+        fs::remove_file(&file).expect("unlocked");
         let _ = fs::remove_dir_all(root);
     }
 
